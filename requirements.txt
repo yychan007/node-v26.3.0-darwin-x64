@@ -1,0 +1,10 @@
+Flask
+Flask-Login
+Flask-SQLAlchemy
+gunicorn
+openpyxl
+pandas
+pdfplumber
+Pillow
+PyMuPDF
+python-docx
