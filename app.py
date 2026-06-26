@@ -205,8 +205,26 @@ login_manager.login_message_category = "warning"
 def inject_translation_context():
     return {
         "translation_enabled": translation.translation_enabled(),
-        "translation_provider_info": translation.provider_status(),
+        "translation_provider_info": get_translation_status(),
     }
+
+
+def get_translation_status():
+    status_fn = getattr(translation, "provider_status", None)
+    if callable(status_fn):
+        return status_fn()
+    provider_name = get_translation_provider()
+    return {
+        "enabled": translation.translation_enabled(),
+        "provider": provider_name,
+        "configured": True,
+        "model": "google-translate",
+    }
+
+
+def get_translation_provider():
+    provider_fn = getattr(translation, "translation_provider", None)
+    return provider_fn() if callable(provider_fn) else "google"
 
 # =========================================================
 # Semantic model lazy load
@@ -463,7 +481,7 @@ def store_cached_translation(text_hash, source_text, translated_text, provider=N
             text_hash=text_hash,
             source_text=source_text[:5000],
             translated_text=translated_text,
-            provider=provider or translation.translation_provider(),
+            provider=provider or get_translation_provider(),
         )
     )
     try:
@@ -516,13 +534,13 @@ def get_or_translate_page(doc, page_num):
             "page": page_num,
             "source": "",
             "translation": "",
-            "provider": translation.translation_provider(),
+            "provider": get_translation_provider(),
             "cached": False,
             "error": "No extractable text on this page.",
         }
 
     translated = translate_to_english(source)
-    provider = translation.translation_provider()
+    provider = get_translation_provider()
     if translated:
         if row:
             row.source_text = source[:20000]
@@ -2203,7 +2221,7 @@ def healthz():
             "storage_backend": storage.storage_backend_name(),
             "data_dir": str(DATA_DIR),
             "database_path": str(DATABASE_PATH),
-            "translation": translation.provider_status(),
+            "translation": get_translation_status(),
         }
     )
 
@@ -2213,7 +2231,7 @@ def healthz():
 def ai_translate_tool():
     source_text = ""
     translated_text = ""
-    provider_info = translation.provider_status()
+    provider_info = get_translation_status()
 
     if request.method == "POST":
         source_text = request.form.get("source_text", "").strip()
@@ -2243,7 +2261,7 @@ def api_translate_text():
         {
             "source": source_text,
             "translation": translated,
-            "provider": translation.translation_provider(),
+            "provider": get_translation_provider(),
         }
     )
 
