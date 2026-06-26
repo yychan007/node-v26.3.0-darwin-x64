@@ -143,7 +143,7 @@ INDEX_BATCH_SIZE = int(os.environ.get("INDEX_BATCH_SIZE", "50"))
 MAX_PDF_PAGES = env_int("MAX_PDF_PAGES", 100 if IS_PRODUCTION else 0)
 MAX_INDEX_FILE_MB = env_int("MAX_INDEX_FILE_MB", 40 if IS_PRODUCTION else 0)
 TEXT_PREVIEW_LIMIT = env_int("TEXT_PREVIEW_LIMIT", 150000)
-TRANSLATE_MAX_CELLS = env_int("TRANSLATE_MAX_CELLS", 180)
+TRANSLATE_MAX_CELLS = env_int("TRANSLATE_MAX_CELLS", 500)
 
 
 DEFAULT_DATA_DIR = BASE_DIR / "data"
@@ -490,7 +490,67 @@ def store_cached_translation(text_hash, source_text, translated_text, provider=N
         db.session.rollback()
 
 
+def get_document_full_text(doc):
+    text = (doc.text_preview or "").strip()
+    if text:
+        return text
+
+    ext = doc.extension.lower()
+    if ext not in {"pdf", "docx", "txt"}:
+        return ""
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return ""
+
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+            if ext == "docx":
+                text, _ = extract_text_from_docx(file_path)
+            elif ext == "txt":
+                text, _ = extract_text_from_txt(file_path)
+            elif ext == "pdf" and OCR_AVAILABLE:
+                with fitz.open(file_path) as pdf_doc:
+                    text = "\n".join(
+                        (pdf_doc.load_page(i).get_text("text") or "")
+                        for i in range(len(pdf_doc))
+                    )
+            else:
+                text = ""
+    except Exception as exc:
+        print(f"Full text extract error for doc {doc.id}: {exc}")
+        text = ""
+    return (text or "").strip()
+
+
+def split_text_into_virtual_pages(text, max_chars=3500):
+    text = (text or "").strip()
+    if not text:
+        return [""]
+    if len(text) <= max_chars:
+        return [text]
+
+    parts = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end < len(text):
+            split_at = text.rfind("\n\n", start, end)
+            if split_at <= start + 400:
+                split_at = text.rfind("\n", start, end)
+            if split_at > start + 400:
+                end = split_at + 1
+        parts.append(text[start:end].strip())
+        start = end
+    return [part for part in parts if part] or [""]
+
+
 def extract_single_page_text(doc, page_num):
+    ext = doc.extension.lower()
+    if ext in {"docx", "txt"}:
+        chunks = split_text_into_virtual_pages(get_document_full_text(doc))
+        if page_num < 1 or page_num > len(chunks):
+            return ""
+        return chunks[page_num - 1]
+
     offsets = load_page_offsets(doc)
     text = doc.text_preview or ""
     if offsets and text:
@@ -498,7 +558,7 @@ def extract_single_page_text(doc, page_num):
             if page == page_num:
                 return text[start:end].strip()
 
-    if doc.extension != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+    if ext != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         return ""
 
     if not OCR_AVAILABLE:
@@ -590,6 +650,16 @@ def count_pdf_pages(doc):
         return 0
 
 
+def count_document_pages(doc):
+    ext = doc.extension.lower()
+    if ext in {"docx", "txt"}:
+        return max(1, len(split_text_into_virtual_pages(get_document_full_text(doc))))
+    if ext == "pdf":
+        total = count_pdf_pages(doc)
+        return total if total > 0 else 0
+    return 0
+
+
 def _split_text_for_pages(text, max_chars=3200):
     text = text or ""
     if len(text) <= max_chars:
@@ -643,9 +713,9 @@ def build_translated_pdf_bytes(doc):
     if not translation.translation_enabled():
         raise RuntimeError("Translation is disabled.")
 
-    total_pages = count_pdf_pages(doc)
+    total_pages = count_document_pages(doc)
     if total_pages <= 0:
-        raise ValueError("Could not determine PDF page count.")
+        raise ValueError("Could not determine document page count.")
 
     export_limit = MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else total_pages
     pages_to_export = min(total_pages, export_limit)
@@ -668,7 +738,11 @@ def build_translated_pdf_bytes(doc):
             if not translation_text:
                 translation_text = "(No translation available for this page.)"
 
-            header = f"{source_name} - Page {page_num} (English)"
+            header = (
+                f"{source_name} - Page {page_num} (English)"
+                if doc.extension == "pdf"
+                else f"{source_name} - Section {page_num} (English)"
+            )
             _append_translation_text(pdf_out, header, translation_text)
 
         if pdf_out.page_count == 0:
@@ -873,7 +947,18 @@ def extract_text_from_docx(path):
     if not DOCX_AVAILABLE:
         return "", [(0, 0, 1)]
     doc = DocxDocument(path)
-    text = "\n".join(p.text for p in doc.paragraphs)
+    parts = []
+    for paragraph in doc.paragraphs:
+        value = (paragraph.text or "").strip()
+        if value:
+            parts.append(value)
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [(cell.text or "").strip() for cell in row.cells]
+            row_text = " | ".join(cell for cell in cells if cell)
+            if row_text:
+                parts.append(row_text)
+    text = "\n".join(parts)
     return text, [(0, len(text), 1)]
 
 def extract_text_from_csv(path):
@@ -881,17 +966,50 @@ def extract_text_from_csv(path):
         df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8")
     except UnicodeDecodeError:
         df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="latin1")
-    text = df.fillna("").astype(str).to_string(index=False)
+    df = clean_dataframe_for_display(df, max_rows=200)
+    text = df.to_string(index=False)
     return text, [(0, len(text), 1)], [("CSV", df)]
     
+def clean_dataframe_for_display(df, max_rows=50):
+    if df is None:
+        return pd.DataFrame()
+
+    cleaned = df.copy()
+    cleaned = cleaned.fillna("")
+    cleaned = cleaned.astype(str)
+    for bad in ("nan", "NaN", "None", "<NA>"):
+        cleaned = cleaned.replace(bad, "")
+
+    cleaned.columns = [
+        (str(col).strip() if not str(col).startswith("Unnamed:") else f"Column {idx + 1}")
+        for idx, col in enumerate(cleaned.columns)
+    ]
+
+    if not cleaned.empty:
+        row_keep = cleaned.apply(
+            lambda row: any(str(value).strip() for value in row), axis=1
+        )
+        cleaned = cleaned.loc[row_keep]
+        col_keep = cleaned.apply(
+            lambda col: any(str(value).strip() for value in col), axis=0
+        )
+        cleaned = cleaned.loc[:, col_keep]
+
+    return cleaned.head(max_rows).reset_index(drop=True)
+
+
 def extract_text_from_xlsx(path):
-    sheets = pd.read_excel(path, sheet_name=None)
+    workbook = pd.ExcelFile(path)
     all_parts = []
     tables = []
-    for sheet_name, df in sheets.items():
+    for sheet_name in workbook.sheet_names:
+        raw_df = pd.read_excel(workbook, sheet_name=sheet_name, header=None, dtype=object)
+        df = clean_dataframe_for_display(raw_df, max_rows=200)
+        if df.empty:
+            continue
         tables.append((sheet_name, df))
         all_parts.append(f"[Sheet: {sheet_name}]")
-        all_parts.append(df.fillna("").astype(str).to_string(index=False))
+        all_parts.append(df.to_string(index=False))
     text = "\n".join(all_parts)
     return text, [(0, len(text), 1)], tables
 
@@ -1164,12 +1282,23 @@ def create_default_admin():
         db.session.commit()
         print(f"Created initial admin user '{admin_username}'.")
 
+def build_table_html(df):
+    preview_df = clean_dataframe_for_display(df, max_rows=40)
+    if preview_df.empty:
+        return "", pd.DataFrame()
+    html_table = preview_df.to_html(
+        index=False, classes="data-table", border=0, na_rep=""
+    )
+    return html_table, preview_df
+
+
 def save_table_previews(doc_id, tables):
     for sheet_name, df in tables:
         if df is None:
             continue
-        preview_df = df.head(30).copy()
-        html_table = preview_df.to_html(index=False, classes="data-table", border=0)
+        html_table, preview_df = build_table_html(df)
+        if preview_df.empty:
+            continue
         html_table_en = ""
         if translation.translation_enabled():
             try:
@@ -1179,7 +1308,10 @@ def save_table_previews(doc_id, tables):
                     cache_set=store_cached_translation,
                     max_cells=TRANSLATE_MAX_CELLS,
                 )
-                html_table_en = en_df.to_html(index=False, classes="data-table", border=0)
+                en_df = clean_dataframe_for_display(en_df, max_rows=40)
+                html_table_en = en_df.to_html(
+                    index=False, classes="data-table", border=0, na_rep=""
+                )
             except Exception as exc:
                 print(f"Table translation skipped for sheet {sheet_name}: {exc}")
         csv_buf = io.StringIO()
@@ -1195,6 +1327,18 @@ def save_table_previews(doc_id, tables):
             preview_title=f"{sheet_name} preview"
         )
         db.session.add(row)
+
+
+def table_preview_needs_refresh(tables):
+    if not tables:
+        return True
+    for row in tables:
+        html = row.html_table or ""
+        if "NaN" in html or "Unnamed:" in html:
+            return True
+        if translation.translation_enabled() and not (row.html_table_en or "").strip():
+            return True
+    return False
 
 
 def regenerate_table_previews(doc_record):
@@ -1509,6 +1653,8 @@ def build_document_fallback_results(query, expanded_tokens, seen_keys, top_k=10)
             "snippet": get_text_snippet(doc.text_preview, expanded_tokens, query),
             "relevance": round(score, 2),
             "is_pdf": doc.extension.lower() == "pdf",
+            "is_docx": doc.extension.lower() == "docx",
+            "is_txt": doc.extension.lower() == "txt",
             "has_table": doc.extension.lower() in {"csv", "xlsx"},
             "ocr_used": doc.is_ocr,
             "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
@@ -1592,6 +1738,8 @@ def search_requirements(query, top_k=30):
             "snippet": get_result_snippet(row, expanded_tokens),
             "relevance": round(score, 2),
             "is_pdf": doc.extension.lower() == "pdf",
+            "is_docx": doc.extension.lower() == "docx",
+            "is_txt": doc.extension.lower() == "txt",
             "has_table": doc.extension.lower() in {"csv", "xlsx"},
             "ocr_used": doc.is_ocr,
             "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
@@ -1814,11 +1962,21 @@ HOME_TEMPLATE = """
 
                     <div class="meta">
                         {% if res.is_document_fallback %}
+                            {% if res.is_pdf %}
                             <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open PDF at page {{ res.page or 1 }}</a>
+                            {% elif res.is_docx %}
+                            <a href="{{ url_for('docx_viewer', document_id=res.document_id, page=1) }}" target="_blank">Open DOCX translation</a>
+                            {% elif res.is_txt %}
+                            <a href="{{ url_for('document_view', document_id=res.document_id, page=1) }}" target="_blank">Open TXT translation</a>
+                            {% endif %}
                         {% else %}
                             <a href="{{ url_for('requirement_detail', block_id=res.block_id) }}">Open full requirement</a>
                             {% if res.is_pdf %}
                                 | <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open PDF at page {{ res.page or 1 }}</a>
+                            {% elif res.is_docx %}
+                                | <a href="{{ url_for('docx_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open DOCX translation</a>
+                            {% elif res.is_txt %}
+                                | <a href="{{ url_for('document_view', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open TXT translation</a>
                             {% endif %}
                             {% if res.has_table %}
                                 | <a href="{{ url_for('table_preview', document_id=res.document_id) }}">Open table preview</a>
@@ -1878,6 +2036,10 @@ REQUIREMENT_TEMPLATE = """
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
         {% if block.document.extension == 'pdf' %}
             <a class="btn btn-purple" href="{{ url_for('pdf_viewer', document_id=block.document.id, page=block.page or 1) }}" target="_blank">Open PDF at page {{ block.page or 1 }}</a>
+        {% elif block.document.extension == 'docx' %}
+            <a class="btn btn-purple" href="{{ url_for('docx_viewer', document_id=block.document.id, page=1) }}" target="_blank">Open DOCX translation</a>
+        {% elif block.document.extension == 'txt' %}
+            <a class="btn btn-purple" href="{{ url_for('document_view', document_id=block.document.id, page=1) }}" target="_blank">Open TXT translation</a>
         {% endif %}
     </div>
 </div>
@@ -2029,6 +2191,12 @@ DOCS_TEMPLATE = """
                     {% if d.extension == 'pdf' %}
                     | <a href="{{ url_for('pdf_viewer', document_id=d.id, page=1) }}" target="_blank">View PDF</a>
                     | <a href="{{ url_for('export_translation_pdf', document_id=d.id) }}">Export EN PDF</a>
+                    {% elif d.extension == 'docx' %}
+                    | <a href="{{ url_for('docx_viewer', document_id=d.id, page=1) }}" target="_blank">View DOCX</a>
+                    | <a href="{{ url_for('export_translation_pdf', document_id=d.id) }}">Export EN PDF</a>
+                    {% elif d.extension == 'txt' %}
+                    | <a href="{{ url_for('document_view', document_id=d.id, page=1) }}" target="_blank">View TXT</a>
+                    | <a href="{{ url_for('export_translation_pdf', document_id=d.id) }}">Export EN PDF</a>
                     {% endif %}
                     {% if d.extension in ['csv','xlsx'] %}
                     | <a href="{{ url_for('table_preview', document_id=d.id) }}">Preview table</a>
@@ -2155,6 +2323,10 @@ REQUIREMENT_TEMPLATE = """
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
         {% if block.document.extension == 'pdf' %}
             <a class="btn btn-purple" href="{{ url_for('pdf_viewer', document_id=block.document.id, page=block.page or 1) }}" target="_blank">Open PDF at page {{ block.page or 1 }}</a>
+        {% elif block.document.extension == 'docx' %}
+            <a class="btn btn-purple" href="{{ url_for('docx_viewer', document_id=block.document.id, page=1) }}" target="_blank">Open DOCX translation</a>
+        {% elif block.document.extension == 'txt' %}
+            <a class="btn btn-purple" href="{{ url_for('document_view', document_id=block.document.id, page=1) }}" target="_blank">Open TXT translation</a>
         {% endif %}
     </div>
 </div>
@@ -2162,21 +2334,59 @@ REQUIREMENT_TEMPLATE = """
 </html>
 """
 
-PDF_TEMPLATE = """
+TRANSLATABLE_EXTENSIONS = {"pdf", "docx", "txt"}
+
+
+def build_document_view_context(doc, page=1):
+    ext = doc.extension.lower()
+    if ext not in TRANSLATABLE_EXTENSIONS:
+        return None
+
+    file_available = storage.document_exists(doc.stored_filename, DOC_FOLDER)
+    total_pages = count_document_pages(doc)
+    if total_pages <= 0:
+        total_pages = 1
+    page = max(1, min(page, total_pages))
+
+    original_text = ""
+    if ext in {"docx", "txt"}:
+        chunks = split_text_into_virtual_pages(get_document_full_text(doc))
+        original_text = chunks[page - 1] if chunks else ""
+
+    return {
+        "document_id": doc.id,
+        "filename": doc.original_filename,
+        "extension": ext,
+        "page": page,
+        "total_pages": total_pages,
+        "view_mode": "pdf" if ext == "pdf" else "text",
+        "file_available": file_available,
+        "pdf_available": file_available and ext == "pdf",
+        "pdf_url": url_for("serve_document", document_id=doc.id) if ext == "pdf" and file_available else "",
+        "download_url": url_for("serve_document", document_id=doc.id) if file_available else "",
+        "original_text": original_text,
+        "translation_enabled": translation.translation_enabled(),
+        "page_label": "Page" if ext == "pdf" else "Section",
+        "viewer_route": "document_view",
+    }
+
+
+DOCUMENT_VIEWER_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>PDF Viewer</title>
+<title>Document Viewer</title>
 """ + BASE_CSS + """
 <style>
 body { margin:0; }
 .toolbar { padding:12px 16px; background:white; border-bottom:1px solid #ddd; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
 .viewer-layout { display:flex; height: calc(100vh - 60px); }
-.pdf-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; position:relative; }
+.original-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; position:relative; overflow:auto; }
 .translation-pane { flex: 1 1 42%; min-width: 280px; overflow:auto; background:#f8fafc; padding:16px; }
 iframe { width:100%; height:100%; border:none; }
-.pdf-missing { padding:24px; color:#842029; background:#f8d7da; border:1px solid #f5c2c7; margin:16px; border-radius:8px; line-height:1.6; }
+.file-missing { padding:24px; color:#842029; background:#f8d7da; border:1px solid #f5c2c7; margin:16px; border-radius:8px; line-height:1.6; }
+.original-text-box { margin:16px; padding:16px; background:white; border:1px solid #e2e8f0; border-radius:8px; white-space:pre-wrap; line-height:1.55; }
 .translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; white-space:pre-wrap; line-height:1.55; margin-bottom:14px; }
 .translation-box h4 { margin:0 0 8px 0; color:#334155; }
 .translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
@@ -2188,43 +2398,60 @@ iframe { width:100%; height:100%; border:none; }
     <div class="toolbar">
         <div>
             <strong>{{ filename }}</strong>
-            | Page {{ page }} / {{ total_pages }}
+            | {{ page_label }} {{ page }} / {{ total_pages }}
         </div>
         <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
             <div class="page-nav">
                 {% if page > 1 %}
-                <a class="btn btn-gray btn-small" href="{{ url_for('pdf_viewer', document_id=document_id, page=page-1) }}">Prev</a>
+                <a class="btn btn-gray btn-small" href="{{ url_for(viewer_route, document_id=document_id, page=page-1) }}">Prev</a>
                 {% endif %}
                 {% if page < total_pages %}
-                <a class="btn btn-gray btn-small" href="{{ url_for('pdf_viewer', document_id=document_id, page=page+1) }}">Next</a>
+                <a class="btn btn-gray btn-small" href="{{ url_for(viewer_route, document_id=document_id, page=page+1) }}">Next</a>
                 {% endif %}
             </div>
+            {% if download_url %}
+            <a class="btn btn-gray btn-small" href="{{ download_url }}">Download original</a>
+            {% endif %}
             {% if translation_enabled %}
-            <button class="btn btn-green btn-small" id="reload-translation">Refresh all</button>
-            <button class="btn btn-purple btn-small" id="export-translation" disabled>Export page (.txt)</button>
-            <a class="btn btn-orange btn-small" href="{{ url_for('export_translation_pdf', document_id=document_id) }}">Export full PDF (EN)</a>
+            <button class="btn btn-green btn-small" id="reload-translation">Refresh</button>
+            <button class="btn btn-purple btn-small" id="export-translation" disabled>Export this page (.txt)</button>
+            <a class="btn btn-orange btn-small" href="{{ url_for('export_translation_pdf', document_id=document_id) }}">Export full EN PDF</a>
             {% endif %}
             <a href="{{ url_for('home') }}">Back</a>
         </div>
     </div>
     <div class="viewer-layout">
-        <div class="pdf-pane">
-            {% if pdf_available %}
-            <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+        <div class="original-pane">
+            {% if view_mode == 'pdf' %}
+                {% if pdf_available %}
+                <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+                {% else %}
+                <div class="file-missing">
+                    <strong>Original PDF not found on server.</strong><br>
+                    Re-upload the file in <strong>Documents</strong>, then click <strong>Reindex</strong>.
+                </div>
+                {% endif %}
             {% else %}
-            <div class="pdf-missing">
-                <strong>Original PDF not found on server.</strong><br>
-                The file may have been lost after a restart before Supabase Storage was configured.<br>
-                Please go to <strong>Documents</strong>, re-upload this PDF, then click <strong>Reindex</strong>.
-                <br><br>
-                English translations on the right may still work from cached index data.
-            </div>
+                <div style="padding:16px;">
+                    <h3 style="margin-top:0;">Original (Dutch)</h3>
+                    {% if original_text %}
+                    <div class="original-text-box">{{ original_text }}</div>
+                    {% else %}
+                    <div class="file-missing">
+                        <strong>Original text not available.</strong><br>
+                        Re-upload the file and click <strong>Reindex</strong>.
+                    </div>
+                    {% endif %}
+                </div>
             {% endif %}
         </div>
         {% if translation_enabled %}
         <div class="translation-pane">
-            <div class="translation-status" id="translation-status">Loading all translations...</div>
-            <div id="translated-pages"></div>
+            <div class="translation-status" id="translation-status">Loading translation for {{ page_label|lower }} {{ page }}...</div>
+            <div class="translation-box">
+                <h4>English translation — {{ page_label }} {{ page }} / {{ total_pages }}</h4>
+                <div id="translated-text">...</div>
+            </div>
         </div>
         {% endif %}
     </div>
@@ -2233,68 +2460,40 @@ iframe { width:100%; height:100%; border:none; }
     const documentId = {{ document_id }};
     const pageNum = {{ page }};
     const totalPages = {{ total_pages }};
+    const pageLabel = {{ page_label|tojson }};
     const fileBase = {{ filename|tojson }};
     const statusEl = document.getElementById("translation-status");
-    const pagesEl = document.getElementById("translated-pages");
+    const translatedEl = document.getElementById("translated-text");
     const exportBtn = document.getElementById("export-translation");
     let currentTranslation = "";
 
-    function escapeHtml(value) {
-        return (value || "")
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
-    }
-
-    function renderPageBlock(page, translation, provider, cached) {
-        const box = document.createElement("div");
-        box.className = "translation-box";
-        box.id = "translation-page-" + page;
-        if (page === pageNum) {
-            box.style.boxShadow = "0 0 0 2px #6f42c1";
-        }
-        const tag = cached ? "cached" : "new";
-        box.innerHTML =
-            "<h4>Page " + page + " / " + totalPages + " (" + provider + ", " + tag + ")</h4>" +
-            "<div class='page-text'>" + escapeHtml(translation || "(Translation unavailable)") + "</div>";
-        return box;
-    }
-
-    async function loadAllTranslations() {
-        statusEl.textContent = "Loading translations for all pages...";
-        pagesEl.innerHTML = "";
-        exportBtn.disabled = true;
+    async function loadCurrentTranslation() {
+        statusEl.textContent = `Translating ${pageLabel.toLowerCase()} ${pageNum} of ${totalPages}...`;
+        translatedEl.textContent = "...";
         currentTranslation = "";
+        exportBtn.disabled = true;
 
         try {
-            const resp = await fetch(`/api/document/${documentId}/translate-all`);
+            const resp = await fetch(`/api/document/${documentId}/translate-page?page=${pageNum}`);
             const data = await resp.json();
             if (!resp.ok) {
-                throw new Error(data.error || "Failed to load translations");
+                throw new Error(data.error || "Translation request failed");
             }
 
-            pagesEl.innerHTML = "";
-            for (const item of data.pages) {
-                pagesEl.appendChild(
-                    renderPageBlock(item.page, item.translation, item.provider || "unknown", item.cached)
-                );
-                if (item.page === pageNum) {
-                    currentTranslation = item.translation || "";
-                }
-            }
-
-            const loaded = data.loaded_pages || data.pages.length;
-            statusEl.textContent = data.truncated
-                ? `Loaded ${loaded} of ${data.total_pages} pages (server limit). Use Export full PDF for file download.`
-                : `Loaded all ${loaded} pages. Current highlight: page ${pageNum}.`;
-
-            const currentBlock = document.getElementById("translation-page-" + pageNum);
-            if (currentBlock) {
-                currentBlock.scrollIntoView({ behavior: "smooth", block: "start" });
+            currentTranslation = data.translation || "";
+            translatedEl.textContent = currentTranslation || "(Translation unavailable)";
+            const provider = data.provider || "unknown";
+            statusEl.textContent = data.cached
+                ? `${pageLabel} ${pageNum} — cached (${provider}). Use Next to translate the following page.`
+                : `${pageLabel} ${pageNum} — translated with ${provider}. Use Next for the next page.`;
+            if (data.error) {
+                statusEl.textContent = data.error;
             }
             exportBtn.disabled = !currentTranslation.trim();
         } catch (err) {
             statusEl.textContent = "Translation error: " + err.message;
+            translatedEl.textContent = "";
+            exportBtn.disabled = true;
         }
     }
 
@@ -2307,16 +2506,16 @@ iframe { width:100%; height:100%; border:none; }
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = `${safeName}_page_${pageNum}_en.txt`;
+        link.download = `${safeName}_${pageLabel.toLowerCase()}_${pageNum}_en.txt`;
         document.body.appendChild(link);
         link.click();
         link.remove();
         URL.revokeObjectURL(url);
     }
 
-    document.getElementById("reload-translation").addEventListener("click", loadAllTranslations);
+    document.getElementById("reload-translation").addEventListener("click", loadCurrentTranslation);
     exportBtn.addEventListener("click", exportTranslation);
-    loadAllTranslations();
+    loadCurrentTranslation();
     </script>
     {% endif %}
 </body>
@@ -2371,7 +2570,12 @@ TABLE_TEMPLATE = """
 <body>
 <div class="container">
     <h2>Table preview - {{ doc.original_filename }}</h2>
-    <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
+    <div style="margin:12px 0; display:flex; gap:8px; flex-wrap:wrap;">
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
+        {% if current_user.is_authenticated and current_user.is_admin %}
+        <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
+        {% endif %}
+    </div>
 
     {% if tables %}
         {% for t in tables %}
@@ -2517,7 +2721,7 @@ def api_translate_all(document_id):
     if not translation.translation_enabled():
         return jsonify({"error": "translation is disabled"}), 503
 
-    total_pages = count_pdf_pages(doc)
+    total_pages = count_document_pages(doc)
     if total_pages <= 0:
         return jsonify({"error": "No pages found for this document."}), 404
 
@@ -2550,14 +2754,18 @@ def api_translate_all(document_id):
 @login_required
 def export_translation_pdf(document_id):
     doc = db.session.get(DocumentRecord, document_id)
-    if not doc or doc.extension != "pdf":
+    if not doc or doc.extension.lower() not in TRANSLATABLE_EXTENSIONS:
         abort(404)
 
     if not translation.translation_enabled():
         flash("Translation is disabled.")
+        if doc.extension == "docx":
+            return redirect(url_for("docx_viewer", document_id=document_id, page=1))
+        if doc.extension == "txt":
+            return redirect(url_for("document_view", document_id=document_id, page=1))
         return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
 
-    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER) and doc.extension == "pdf":
         flash("Source PDF not found. Re-upload the file and try again.")
         return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
 
@@ -2566,6 +2774,8 @@ def export_translation_pdf(document_id):
     except Exception as exc:
         print(f"Translated PDF export error for document {document_id}: {exc}")
         flash(f"Export failed: {exc}")
+        if doc.extension == "docx":
+            return redirect(url_for("docx_viewer", document_id=document_id, page=1))
         return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
 
     base_name = secure_filename(
@@ -2777,7 +2987,7 @@ def table_preview(document_id):
 
     tables = TablePreview.query.filter_by(document_id=document_id).all()
     error_msg = ""
-    if not tables and doc.extension.lower() in {"csv", "xlsx"}:
+    if doc.extension.lower() in {"csv", "xlsx"} and table_preview_needs_refresh(tables):
         try:
             tables = regenerate_table_previews(doc)
             if not tables:
@@ -2795,41 +3005,99 @@ def table_preview(document_id):
         TABLE_TEMPLATE, doc=doc, tables=tables, error_msg=error_msg
     )
 
+
+@app.route("/table/<int:document_id>/refresh")
+@login_required
+def refresh_table_preview(document_id):
+    if not is_admin():
+        abort(403)
+
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc:
+        flash("Document not found.")
+        return redirect(url_for("home"))
+
+    if doc.extension.lower() not in {"csv", "xlsx"}:
+        flash("This document does not contain a spreadsheet table.")
+        return redirect(url_for("home"))
+
+    try:
+        tables = regenerate_table_previews(doc)
+        if tables:
+            flash(f"Table refreshed with translation ({len(tables)} sheet(s)).")
+        else:
+            flash("No readable table data found in this spreadsheet.")
+    except FileNotFoundError:
+        flash("Source file not found. Re-upload the spreadsheet and try again.")
+    except Exception as exc:
+        flash(f"Table refresh failed: {exc}")
+
+    return redirect(url_for("table_preview", document_id=document_id))
+
+@app.route("/document-view/<int:document_id>")
+def document_view(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc:
+        abort(404)
+    page = request.args.get("page", 1, type=int)
+    context = build_document_view_context(doc, page=page)
+    if not context:
+        abort(404)
+    return render_template_string(DOCUMENT_VIEWER_TEMPLATE, **context)
+
+
 @app.route("/pdf/<int:document_id>")
 def pdf_viewer(document_id):
     doc = db.session.get(DocumentRecord, document_id)
     if not doc or doc.extension != "pdf":
         abort(404)
-
     page = request.args.get("page", 1, type=int)
-    pdf_available = storage.document_exists(doc.stored_filename, DOC_FOLDER)
-    total_pages = count_pdf_pages(doc)
-    if total_pages <= 0:
-        total_pages = 1
-    page = max(1, min(page, total_pages))
-    pdf_url = url_for("serve_pdf", document_id=document_id) if pdf_available else ""
-    return render_template_string(
-        PDF_TEMPLATE,
-        document_id=document_id,
-        filename=doc.original_filename,
-        page=page,
-        total_pages=total_pages,
-        pdf_url=pdf_url,
-        pdf_available=pdf_available,
-        translation_enabled=translation.translation_enabled(),
-    )
+    context = build_document_view_context(doc, page=page)
+    if not context:
+        abort(404)
+    context["viewer_route"] = "pdf_viewer"
+    return render_template_string(DOCUMENT_VIEWER_TEMPLATE, **context)
 
-@app.route("/serve-pdf/<int:document_id>")
-def serve_pdf(document_id):
+
+@app.route("/docx/<int:document_id>")
+def docx_viewer(document_id):
     doc = db.session.get(DocumentRecord, document_id)
-    if not doc or doc.extension != "pdf":
+    if not doc or doc.extension != "docx":
+        abort(404)
+    page = request.args.get("page", 1, type=int)
+    context = build_document_view_context(doc, page=page)
+    if not context:
+        abort(404)
+    context["viewer_route"] = "docx_viewer"
+    return render_template_string(DOCUMENT_VIEWER_TEMPLATE, **context)
+
+
+@app.route("/serve-document/<int:document_id>")
+def serve_document(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc or doc.extension.lower() not in TRANSLATABLE_EXTENSIONS:
         abort(404)
 
     if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         abort(404)
 
-    pdf_bytes = storage.read_document_bytes(doc.stored_filename, DOC_FOLDER)
-    return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf")
+    file_bytes = storage.read_document_bytes(doc.stored_filename, DOC_FOLDER)
+    mime_map = {
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "txt": "text/plain",
+    }
+    return send_file(
+        io.BytesIO(file_bytes),
+        mimetype=mime_map.get(doc.extension.lower(), "application/octet-stream"),
+        as_attachment=False,
+        download_name=doc.original_filename,
+    )
+
+
+@app.route("/serve-pdf/<int:document_id>")
+def serve_pdf(document_id):
+    return serve_document(document_id)
 
 @app.route("/page-image/<int:document_id>")
 def page_image(document_id):
