@@ -2032,7 +2032,7 @@ body { margin:0; }
 .pdf-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; }
 .translation-pane { flex: 1 1 42%; min-width: 280px; overflow:auto; background:#f8fafc; padding:16px; }
 iframe { width:100%; height:100%; border:none; }
-.translation-box { background:white; border:1px solid #e2e8f0; border-radius:8px; padding:14px; margin-bottom:14px; white-space:pre-wrap; line-height:1.55; }
+.translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; white-space:pre-wrap; line-height:1.55; }
 .translation-box h4 { margin:0 0 8px 0; color:#334155; }
 .translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
 .btn-small { padding:6px 10px; font-size:13px; }
@@ -2044,6 +2044,7 @@ iframe { width:100%; height:100%; border:none; }
         <div style="display:flex; gap:8px; align-items:center;">
             {% if translation_enabled %}
             <button class="btn btn-green btn-small" id="reload-translation">Refresh translation</button>
+            <button class="btn btn-purple btn-small" id="export-translation" disabled>Export English (.txt)</button>
             {% endif %}
             <a href="{{ url_for('home') }}">Back</a>
         </div>
@@ -2054,12 +2055,8 @@ iframe { width:100%; height:100%; border:none; }
         </div>
         {% if translation_enabled %}
         <div class="translation-pane">
-            <div class="translation-status" id="translation-status">Loading AI translation for page {{ page }}...</div>
+            <div class="translation-status" id="translation-status">Loading translation for page {{ page }}...</div>
             <div class="translation-box">
-                <h4>Original</h4>
-                <div id="source-text">...</div>
-            </div>
-            <div class="translation-box" style="border-left:4px solid #28a745;">
                 <h4>English translation</h4>
                 <div id="translated-text">...</div>
             </div>
@@ -2070,22 +2067,25 @@ iframe { width:100%; height:100%; border:none; }
     <script>
     const documentId = {{ document_id }};
     const pageNum = {{ page }};
+    const fileBase = {{ filename|tojson }};
     const statusEl = document.getElementById("translation-status");
-    const sourceEl = document.getElementById("source-text");
     const translatedEl = document.getElementById("translated-text");
+    const exportBtn = document.getElementById("export-translation");
+    let currentTranslation = "";
 
     async function loadTranslation() {
         statusEl.textContent = "Translating page " + pageNum + "...";
-        sourceEl.textContent = "...";
         translatedEl.textContent = "...";
+        currentTranslation = "";
+        exportBtn.disabled = true;
         try {
             const resp = await fetch(`/api/document/${documentId}/translate-page?page=${pageNum}`);
             const data = await resp.json();
             if (!resp.ok) {
                 throw new Error(data.error || "Translation request failed");
             }
-            sourceEl.textContent = data.source || "(No text on this page)";
-            translatedEl.textContent = data.translation || "(Translation unavailable)";
+            currentTranslation = data.translation || "";
+            translatedEl.textContent = currentTranslation || "(Translation unavailable)";
             const provider = data.provider || "unknown";
             statusEl.textContent = data.cached
                 ? `Cached translation (${provider})`
@@ -2093,13 +2093,32 @@ iframe { width:100%; height:100%; border:none; }
             if (data.error) {
                 statusEl.textContent = data.error;
             }
+            exportBtn.disabled = !currentTranslation.trim();
         } catch (err) {
             statusEl.textContent = "Translation error: " + err.message;
             translatedEl.textContent = "";
+            exportBtn.disabled = true;
         }
     }
 
+    function exportTranslation() {
+        if (!currentTranslation.trim()) {
+            return;
+        }
+        const safeName = fileBase.replace(/\\.[^.]+$/, "") || "document";
+        const blob = new Blob([currentTranslation], { type: "text/plain;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${safeName}_page_${pageNum}_en.txt`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+    }
+
     document.getElementById("reload-translation").addEventListener("click", loadTranslation);
+    exportBtn.addEventListener("click", exportTranslation);
     loadTranslation();
     </script>
     {% endif %}
