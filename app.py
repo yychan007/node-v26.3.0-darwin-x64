@@ -2173,21 +2173,34 @@ PDF_TEMPLATE = """
 body { margin:0; }
 .toolbar { padding:12px 16px; background:white; border-bottom:1px solid #ddd; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
 .viewer-layout { display:flex; height: calc(100vh - 60px); }
-.pdf-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; }
+.pdf-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; position:relative; }
 .translation-pane { flex: 1 1 42%; min-width: 280px; overflow:auto; background:#f8fafc; padding:16px; }
 iframe { width:100%; height:100%; border:none; }
-.translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; white-space:pre-wrap; line-height:1.55; }
+.pdf-missing { padding:24px; color:#842029; background:#f8d7da; border:1px solid #f5c2c7; margin:16px; border-radius:8px; line-height:1.6; }
+.translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; white-space:pre-wrap; line-height:1.55; margin-bottom:14px; }
 .translation-box h4 { margin:0 0 8px 0; color:#334155; }
 .translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
 .btn-small { padding:6px 10px; font-size:13px; }
+.page-nav { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
 </style>
 </head>
 <body>
     <div class="toolbar">
-        <div><strong>{{ filename }}</strong> | Page {{ page }}</div>
-        <div style="display:flex; gap:8px; align-items:center;">
+        <div>
+            <strong>{{ filename }}</strong>
+            | Page {{ page }} / {{ total_pages }}
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <div class="page-nav">
+                {% if page > 1 %}
+                <a class="btn btn-gray btn-small" href="{{ url_for('pdf_viewer', document_id=document_id, page=page-1) }}">Prev</a>
+                {% endif %}
+                {% if page < total_pages %}
+                <a class="btn btn-gray btn-small" href="{{ url_for('pdf_viewer', document_id=document_id, page=page+1) }}">Next</a>
+                {% endif %}
+            </div>
             {% if translation_enabled %}
-            <button class="btn btn-green btn-small" id="reload-translation">Refresh translation</button>
+            <button class="btn btn-green btn-small" id="reload-translation">Refresh all</button>
             <button class="btn btn-purple btn-small" id="export-translation" disabled>Export page (.txt)</button>
             <a class="btn btn-orange btn-small" href="{{ url_for('export_translation_pdf', document_id=document_id) }}">Export full PDF (EN)</a>
             {% endif %}
@@ -2196,15 +2209,22 @@ iframe { width:100%; height:100%; border:none; }
     </div>
     <div class="viewer-layout">
         <div class="pdf-pane">
+            {% if pdf_available %}
             <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+            {% else %}
+            <div class="pdf-missing">
+                <strong>Original PDF not found on server.</strong><br>
+                The file may have been lost after a restart before Supabase Storage was configured.<br>
+                Please go to <strong>Documents</strong>, re-upload this PDF, then click <strong>Reindex</strong>.
+                <br><br>
+                English translations on the right may still work from cached index data.
+            </div>
+            {% endif %}
         </div>
         {% if translation_enabled %}
         <div class="translation-pane">
-            <div class="translation-status" id="translation-status">Loading translation for page {{ page }}...</div>
-            <div class="translation-box">
-                <h4>English translation</h4>
-                <div id="translated-text">...</div>
-            </div>
+            <div class="translation-status" id="translation-status">Loading all translations...</div>
+            <div id="translated-pages"></div>
         </div>
         {% endif %}
     </div>
@@ -2212,37 +2232,69 @@ iframe { width:100%; height:100%; border:none; }
     <script>
     const documentId = {{ document_id }};
     const pageNum = {{ page }};
+    const totalPages = {{ total_pages }};
     const fileBase = {{ filename|tojson }};
     const statusEl = document.getElementById("translation-status");
-    const translatedEl = document.getElementById("translated-text");
+    const pagesEl = document.getElementById("translated-pages");
     const exportBtn = document.getElementById("export-translation");
     let currentTranslation = "";
 
-    async function loadTranslation() {
-        statusEl.textContent = "Translating page " + pageNum + "...";
-        translatedEl.textContent = "...";
-        currentTranslation = "";
+    function escapeHtml(value) {
+        return (value || "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+    }
+
+    function renderPageBlock(page, translation, provider, cached) {
+        const box = document.createElement("div");
+        box.className = "translation-box";
+        box.id = "translation-page-" + page;
+        if (page === pageNum) {
+            box.style.boxShadow = "0 0 0 2px #6f42c1";
+        }
+        const tag = cached ? "cached" : "new";
+        box.innerHTML =
+            "<h4>Page " + page + " / " + totalPages + " (" + provider + ", " + tag + ")</h4>" +
+            "<div class='page-text'>" + escapeHtml(translation || "(Translation unavailable)") + "</div>";
+        return box;
+    }
+
+    async function loadAllTranslations() {
+        statusEl.textContent = "Loading translations for all pages...";
+        pagesEl.innerHTML = "";
         exportBtn.disabled = true;
+        currentTranslation = "";
+
         try {
-            const resp = await fetch(`/api/document/${documentId}/translate-page?page=${pageNum}`);
+            const resp = await fetch(`/api/document/${documentId}/translate-all`);
             const data = await resp.json();
             if (!resp.ok) {
-                throw new Error(data.error || "Translation request failed");
+                throw new Error(data.error || "Failed to load translations");
             }
-            currentTranslation = data.translation || "";
-            translatedEl.textContent = currentTranslation || "(Translation unavailable)";
-            const provider = data.provider || "unknown";
-            statusEl.textContent = data.cached
-                ? `Cached translation (${provider})`
-                : `Generated with ${provider}`;
-            if (data.error) {
-                statusEl.textContent = data.error;
+
+            pagesEl.innerHTML = "";
+            for (const item of data.pages) {
+                pagesEl.appendChild(
+                    renderPageBlock(item.page, item.translation, item.provider || "unknown", item.cached)
+                );
+                if (item.page === pageNum) {
+                    currentTranslation = item.translation || "";
+                }
+            }
+
+            const loaded = data.loaded_pages || data.pages.length;
+            statusEl.textContent = data.truncated
+                ? `Loaded ${loaded} of ${data.total_pages} pages (server limit). Use Export full PDF for file download.`
+                : `Loaded all ${loaded} pages. Current highlight: page ${pageNum}.`;
+
+            const currentBlock = document.getElementById("translation-page-" + pageNum);
+            if (currentBlock) {
+                currentBlock.scrollIntoView({ behavior: "smooth", block: "start" });
             }
             exportBtn.disabled = !currentTranslation.trim();
         } catch (err) {
             statusEl.textContent = "Translation error: " + err.message;
-            translatedEl.textContent = "";
-            exportBtn.disabled = true;
         }
     }
 
@@ -2262,9 +2314,9 @@ iframe { width:100%; height:100%; border:none; }
         URL.revokeObjectURL(url);
     }
 
-    document.getElementById("reload-translation").addEventListener("click", loadTranslation);
+    document.getElementById("reload-translation").addEventListener("click", loadAllTranslations);
     exportBtn.addEventListener("click", exportTranslation);
-    loadTranslation();
+    loadAllTranslations();
     </script>
     {% endif %}
 </body>
@@ -2455,6 +2507,43 @@ def api_translate_page(document_id):
     if result.get("error") and not result.get("translation"):
         return jsonify(result), 404
     return jsonify(result)
+
+
+@app.route("/api/document/<int:document_id>/translate-all")
+def api_translate_all(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc:
+        return jsonify({"error": "Document not found"}), 404
+    if not translation.translation_enabled():
+        return jsonify({"error": "translation is disabled"}), 503
+
+    total_pages = count_pdf_pages(doc)
+    if total_pages <= 0:
+        return jsonify({"error": "No pages found for this document."}), 404
+
+    export_limit = MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else total_pages
+    pages_to_load = min(total_pages, export_limit)
+    results = []
+    for page_num in range(1, pages_to_load + 1):
+        result = get_or_translate_page(doc, page_num)
+        results.append(
+            {
+                "page": page_num,
+                "translation": result.get("translation") or "",
+                "provider": result.get("provider") or get_translation_provider(),
+                "cached": bool(result.get("cached")),
+                "error": result.get("error", ""),
+            }
+        )
+
+    return jsonify(
+        {
+            "total_pages": total_pages,
+            "loaded_pages": pages_to_load,
+            "truncated": pages_to_load < total_pages,
+            "pages": results,
+        }
+    )
 
 
 @app.route("/document/<int:document_id>/export-translation-pdf")
@@ -2713,13 +2802,20 @@ def pdf_viewer(document_id):
         abort(404)
 
     page = request.args.get("page", 1, type=int)
-    pdf_url = url_for("serve_pdf", document_id=document_id)
+    pdf_available = storage.document_exists(doc.stored_filename, DOC_FOLDER)
+    total_pages = count_pdf_pages(doc)
+    if total_pages <= 0:
+        total_pages = 1
+    page = max(1, min(page, total_pages))
+    pdf_url = url_for("serve_pdf", document_id=document_id) if pdf_available else ""
     return render_template_string(
         PDF_TEMPLATE,
         document_id=document_id,
         filename=doc.original_filename,
         page=page,
+        total_pages=total_pages,
         pdf_url=pdf_url,
+        pdf_available=pdf_available,
         translation_enabled=translation.translation_enabled(),
     )
 
