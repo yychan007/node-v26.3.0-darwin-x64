@@ -79,6 +79,8 @@ def should_skip_translation(text):
     value = (text or "").strip()
     if not value or len(value) < 2:
         return True
+    if value.lower() in {"nan", "none", "null", "na", "n/a"}:
+        return True
     if re.fullmatch(r"[\d\W_]+", value):
         return True
     if re.fullmatch(r"[A-Za-z0-9._\-/ ]{1,12}", value):
