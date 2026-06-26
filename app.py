@@ -47,6 +47,9 @@ from pathlib import Path
 import pdfplumber
 import pandas as pd
 
+import storage
+import translation
+
 from flask import (
     Flask, request, render_template_string, redirect, url_for,
     send_file, flash, abort, session, jsonify
@@ -127,7 +130,20 @@ def env_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name, default):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return int(raw)
+
+
 SEMANTIC_SEARCH_ENABLED = env_flag("ENABLE_SEMANTIC_SEARCH", default=False)
+OCR_ENABLED = env_flag("ENABLE_OCR", default=False)
+INDEX_BATCH_SIZE = int(os.environ.get("INDEX_BATCH_SIZE", "50"))
+MAX_PDF_PAGES = env_int("MAX_PDF_PAGES", 100 if IS_PRODUCTION else 0)
+MAX_INDEX_FILE_MB = env_int("MAX_INDEX_FILE_MB", 40 if IS_PRODUCTION else 0)
+TEXT_PREVIEW_LIMIT = env_int("TEXT_PREVIEW_LIMIT", 150000)
+TRANSLATE_MAX_CELLS = env_int("TRANSLATE_MAX_CELLS", 180)
 
 
 DEFAULT_DATA_DIR = BASE_DIR / "data"
@@ -145,6 +161,14 @@ for path in (DATA_DIR, DOC_FOLDER, PREVIEW_FOLDER, DATABASE_PATH.parent):
 def build_database_uri():
     database_url = os.environ.get("DATABASE_URL", "").strip()
     if database_url:
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace(
+                "postgres://", "postgresql+psycopg://", 1
+            )
+        elif database_url.startswith("postgresql://"):
+            database_url = database_url.replace(
+                "postgresql://", "postgresql+psycopg://", 1
+            )
         return database_url
     return f"sqlite:///{DATABASE_PATH}"
 
@@ -175,6 +199,14 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
 login_manager.login_message_category = "warning"
+
+
+@app.context_processor
+def inject_translation_context():
+    return {
+        "translation_enabled": translation.translation_enabled(),
+        "translation_provider_info": translation.provider_status(),
+    }
 
 # =========================================================
 # Semantic model lazy load
@@ -230,8 +262,9 @@ MULTI_LANG_SYNONYMS = {
     "requirement": ["requirement", "requirements", "req", "eis", "eisen"],
     "req": ["req", "requirement", "eis"],
     "eis": ["eis", "requirement", "req"],
-    "kabel": ["kabel", "cable"],
-    "cable": ["cable", "kabel"],
+    "kabel": ["kabel", "cable", "cables"],
+    "cable": ["cable", "cables", "kabel", "kabels"],
+    "cables": ["cables", "cable", "kabel", "kabels"],
     "bescherming": ["bescherming", "protection"],
     "protection": ["protection", "bescherming"],
     "installatie": ["installatie", "installation"],
@@ -280,6 +313,7 @@ class DocumentRecord(db.Model):
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
     is_ocr = db.Column(db.Boolean, default=False)
     text_preview = db.Column(db.Text, default="")
+    page_offsets_json = db.Column(db.Text, default="")
     status = db.Column(db.String(50), default="indexed")
 
     requirements = db.relationship("RequirementBlock", backref="document", cascade="all, delete-orphan")
@@ -296,6 +330,7 @@ class RequirementBlock(db.Model):
     title = db.Column(db.String(500), default="")
     section = db.Column(db.String(300), default="")
     page = db.Column(db.Integer, default=1)
+    char_start = db.Column(db.Integer, default=0)
     category = db.Column(db.String(120), default="General")
     definition = db.Column(db.Text, default="")
     summary = db.Column(db.Text, default="")
@@ -316,8 +351,36 @@ class TablePreview(db.Model):
     page = db.Column(db.Integer, default=1)
     table_format = db.Column(db.String(20), default="csv")
     html_table = db.Column(db.Text, default="")
+    html_table_en = db.Column(db.Text, default="")
     csv_text = db.Column(db.Text, default="")
     preview_title = db.Column(db.String(255), default="")
+
+
+class TranslationCache(db.Model):
+    __tablename__ = "translation_cache"
+
+    text_hash = db.Column(db.String(64), primary_key=True)
+    source_text = db.Column(db.Text, default="")
+    translated_text = db.Column(db.Text, default="")
+    provider = db.Column(db.String(32), default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class DocumentPageTranslation(db.Model):
+    __tablename__ = "document_page_translations"
+    __table_args__ = (
+        db.UniqueConstraint("document_id", "page", name="uq_document_page_translation"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(
+        db.Integer, db.ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    page = db.Column(db.Integer, nullable=False)
+    source_text = db.Column(db.Text, default="")
+    translated_text = db.Column(db.Text, default="")
+    provider = db.Column(db.String(32), default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 @login_manager.user_loader
@@ -352,7 +415,12 @@ def preprocess(text):
 def expand_query_tokens(tokens):
     out = []
     for t in tokens:
-        out.extend(MULTI_LANG_SYNONYMS.get(t, [t]))
+        variants = list(MULTI_LANG_SYNONYMS.get(t, [t]))
+        if len(t) > 3 and t.endswith("s"):
+            variants.append(t[:-1])
+        elif len(t) > 2 and not t.endswith("s"):
+            variants.append(t + "s")
+        out.extend(variants)
     return list(dict.fromkeys(out))
 
 def detect_category(text, title=""):
@@ -371,7 +439,139 @@ def detect_category(text, title=""):
         return "Cabinet grounding"
     if "definitie" in combined or "definition" in combined:
         return "Definition"
+    if "cable" in combined or "kabel" in combined:
+        return "Cables"
     return "General"
+
+def strip_html(text):
+    return re.sub(r"<[^>]+>", "", text or "")
+
+
+def get_cached_translation(text_hash):
+    row = TranslationCache.query.get(text_hash)
+    return row.translated_text if row else None
+
+
+def store_cached_translation(text_hash, source_text, translated_text, provider=None):
+    if not translated_text:
+        return
+    row = TranslationCache.query.get(text_hash)
+    if row:
+        return
+    db.session.add(
+        TranslationCache(
+            text_hash=text_hash,
+            source_text=source_text[:5000],
+            translated_text=translated_text,
+            provider=provider or translation.translation_provider(),
+        )
+    )
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def extract_single_page_text(doc, page_num):
+    offsets = load_page_offsets(doc)
+    text = doc.text_preview or ""
+    if offsets and text:
+        for start, end, page in offsets:
+            if page == page_num:
+                return text[start:end].strip()
+
+    if doc.extension != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return ""
+
+    if not OCR_AVAILABLE:
+        return ""
+
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+            with fitz.open(file_path) as pdf_doc:
+                if page_num < 1 or page_num > len(pdf_doc):
+                    return ""
+                return (pdf_doc.load_page(page_num - 1).get_text("text") or "").strip()
+    except Exception as exc:
+        print(f"Page text extract error for doc {doc.id} page {page_num}: {exc}")
+        return ""
+
+
+def get_or_translate_page(doc, page_num):
+    row = DocumentPageTranslation.query.filter_by(
+        document_id=doc.id, page=page_num
+    ).first()
+    if row and row.translated_text:
+        return {
+            "page": page_num,
+            "source": row.source_text,
+            "translation": row.translated_text,
+            "provider": row.provider,
+            "cached": True,
+        }
+
+    source = extract_single_page_text(doc, page_num)
+    if not source:
+        return {
+            "page": page_num,
+            "source": "",
+            "translation": "",
+            "provider": translation.translation_provider(),
+            "cached": False,
+            "error": "No extractable text on this page.",
+        }
+
+    translated = translate_to_english(source)
+    provider = translation.translation_provider()
+    if translated:
+        if row:
+            row.source_text = source[:20000]
+            row.translated_text = translated
+            row.provider = provider
+        else:
+            db.session.add(
+                DocumentPageTranslation(
+                    document_id=doc.id,
+                    page=page_num,
+                    source_text=source[:20000],
+                    translated_text=translated,
+                    provider=provider,
+                )
+            )
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    return {
+        "page": page_num,
+        "source": source,
+        "translation": translated,
+        "provider": provider,
+        "cached": False,
+    }
+
+
+def translate_to_english(text):
+    return translation.translate_text(
+        text,
+        cache_get=get_cached_translation,
+        cache_set=store_cached_translation,
+    )
+
+
+def build_english_snippet(snippet_html):
+    plain = strip_html(snippet_html)
+    translated = translate_to_english(plain)
+    if not translated or translated == plain:
+        return ""
+    return highlight_terms(translated, [])
+
+
+def enrich_result_with_translation(result_dict):
+    result_dict["snippet_en"] = build_english_snippet(result_dict.get("snippet", ""))
+    return result_dict
+
 
 def strip_html(text):
     return re.sub(r"<[^>]+>", "", text or "")
@@ -386,10 +586,51 @@ def highlight_terms(text, terms):
     return safe
 
 def get_page_number(page_offsets, char_pos):
+    if not page_offsets:
+        return 1
     for start, end, page_num in page_offsets:
-        if start <= char_pos <= end:
+        if start <= char_pos < end:
             return page_num
+    if char_pos >= page_offsets[-1][0]:
+        return page_offsets[-1][2]
     return 1
+
+
+def load_page_offsets(doc):
+    raw = getattr(doc, "page_offsets_json", None) or ""
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+        return [(int(a), int(b), int(c)) for a, b, c in data]
+    except Exception:
+        return []
+
+
+def find_hit_position(text, expanded_tokens, query=""):
+    text_lower = (text or "").lower()
+    q = (query or "").lower().strip()
+    if q and q in text_lower:
+        return text_lower.find(q)
+
+    hit_pos = -1
+    for term in expanded_tokens:
+        pos = text_lower.find(term.lower())
+        if pos != -1 and (hit_pos == -1 or pos < hit_pos):
+            hit_pos = pos
+    return hit_pos
+
+
+def resolve_result_page(doc, char_start, body_text, expanded_tokens, query, fallback_page=1):
+    offsets = load_page_offsets(doc)
+    if not offsets:
+        return fallback_page or 1
+
+    hit_in_body = find_hit_position(body_text, expanded_tokens, query)
+    anchor = (char_start or 0) + hit_in_body if hit_in_body >= 0 else (char_start or 0)
+    if anchor < 0:
+        return fallback_page or 1
+    return get_page_number(offsets, anchor)
 
 def file_ext(filename):
     return filename.rsplit(".", 1)[1].lower() if "." in filename else ""
@@ -427,14 +668,60 @@ def get_page_image(document_path, page_num=1):
 # =========================================================
 # Text extraction
 # =========================================================
+def ensure_indexable_file(path):
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Stored file not found: {file_path}")
+
+    if MAX_INDEX_FILE_MB > 0:
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_INDEX_FILE_MB:
+            raise ValueError(
+                f"File is {size_mb:.1f} MB; this server limits indexing to "
+                f"{MAX_INDEX_FILE_MB} MB. Split the PDF or upgrade the hosting plan."
+            )
+
+
+def extract_text_from_pdf_fitz(path, max_pages=0):
+    if not OCR_AVAILABLE:
+        return None
+
+    full_text = ""
+    page_offsets = []
+    current = 0
+
+    try:
+        with fitz.open(path) as doc:
+            total_pages = len(doc)
+            page_limit = total_pages if max_pages <= 0 else min(total_pages, max_pages)
+            for page_num in range(page_limit):
+                page = doc.load_page(page_num)
+                text = page.get_text("text") or ""
+                start = current
+                full_text += text + "\n"
+                current += len(text) + 1
+                page_offsets.append((start, current, page_num + 1))
+        return full_text, page_offsets
+    except Exception as e:
+        print(f"PyMuPDF extract error: {path} -> {e}")
+        return None
+
+
 def extract_text_from_pdf(path):
+    fitz_result = extract_text_from_pdf_fitz(path, MAX_PDF_PAGES)
+    if fitz_result is not None:
+        return fitz_result
+
     full_text = ""
     page_offsets = []
     current = 0
 
     try:
         with pdfplumber.open(path) as pdf:
-            for page_num, page in enumerate(pdf.pages, start=1):
+            pages = pdf.pages
+            if MAX_PDF_PAGES > 0:
+                pages = pages[:MAX_PDF_PAGES]
+            for page_num, page in enumerate(pages, start=1):
                 text = page.extract_text() or ""
                 start = current
                 full_text += text + "\n"
@@ -506,11 +793,13 @@ def extract_text_by_extension(path):
 
     if ext == "pdf":
         text, page_offsets = extract_text_from_pdf(path)
-        ocr_text, ocr_offsets = ocr_pdf(path)
-
         used_ocr = False
         merged_text = text
 
+        if not OCR_ENABLED:
+            return merged_text, page_offsets, [], used_ocr
+
+        ocr_text, ocr_offsets = ocr_pdf(path)
         if ocr_text.strip():
             used_ocr = True
             merged_text = text + "\n\n[OCR_LAYER]\n" + ocr_text if text.strip() else ocr_text
@@ -562,7 +851,68 @@ def find_definition_nearby(lines, start_index):
                 return parts[1].strip()
     return ""
 
+def normalize_requirement_text(content):
+    """Repair common PDF line-break splits inside requirement IDs."""
+    text = content or ""
+    text = re.sub(
+        r"([A-Z]{1,10}-Req-)\s+(\d+(?:\.\d+)?)",
+        r"\1\2",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"([A-Z]{1,10}-Req-\d+(?:\.\d+)?)\s+-\s+",
+        r"\1 - ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+SECTION_HEADER_REGEX = re.compile(r"(?m)^(\d+(?:\.\d+)+)\s+(.+)$")
+
+
+def parse_section_blocks(content, page_offsets):
+    matches = list(SECTION_HEADER_REGEX.finditer(content))
+    if not matches:
+        return []
+
+    blocks = []
+    for i, match in enumerate(matches):
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        block_text = content[start:end].strip()
+        if len(block_text) < 40:
+            continue
+
+        section_num = match.group(1)
+        section_title = match.group(2).strip()
+        page = get_page_number(page_offsets, start)
+        lines = [line.strip() for line in block_text.splitlines() if line.strip()]
+        summary = ""
+        for line in lines[1:6]:
+            if len(line) > 25:
+                summary = line
+                break
+
+        blocks.append({
+            "requirement_id": f"Section-{section_num}",
+            "title": section_title,
+            "section": f"{section_num} {section_title}",
+            "page": page,
+            "char_start": start,
+            "category": detect_category(block_text, section_title),
+            "definition": "",
+            "summary": summary,
+            "full_text": block_text,
+            "token_blob": " ".join(preprocess(block_text)),
+        })
+
+    return blocks
+
+
 def parse_requirement_blocks(content, page_offsets):
+    content = normalize_requirement_text(content)
     matches = list(REQ_ID_REGEX.finditer(content))
     blocks = []
 
@@ -611,6 +961,7 @@ def parse_requirement_blocks(content, page_offsets):
                 "title": title,
                 "section": section,
                 "page": page,
+                "char_start": start,
                 "category": category,
                 "definition": definition,
                 "summary": summary,
@@ -618,6 +969,10 @@ def parse_requirement_blocks(content, page_offsets):
                 "token_blob": " ".join(preprocess(block_text)),
             })
         return blocks
+
+    section_blocks = parse_section_blocks(content, page_offsets)
+    if section_blocks:
+        return section_blocks
 
     # Fallback: paragraph blocks
     parts = re.split(r"\n\s*\n+", content)
@@ -640,6 +995,7 @@ def parse_requirement_blocks(content, page_offsets):
             "title": title,
             "section": "",
             "page": page,
+            "char_start": pos,
             "category": category,
             "definition": "",
             "summary": lines[1][:500] if len(lines) > 1 else title,
@@ -684,6 +1040,15 @@ def save_table_previews(doc_id, tables):
             continue
         preview_df = df.head(30).copy()
         html_table = preview_df.to_html(index=False, classes="data-table", border=0)
+        html_table_en = ""
+        if translation.translation_enabled():
+            en_df = translation.translate_dataframe_values(
+                preview_df,
+                cache_get=get_cached_translation,
+                cache_set=store_cached_translation,
+                max_cells=TRANSLATE_MAX_CELLS,
+            )
+            html_table_en = en_df.to_html(index=False, classes="data-table", border=0)
         csv_buf = io.StringIO()
         preview_df.to_csv(csv_buf, index=False)
         row = TablePreview(
@@ -692,6 +1057,7 @@ def save_table_previews(doc_id, tables):
             page=1,
             table_format="xlsx" if sheet_name != "CSV" else "csv",
             html_table=html_table,
+            html_table_en=html_table_en,
             csv_text=csv_buf.getvalue(),
             preview_title=f"{sheet_name} preview"
         )
@@ -703,11 +1069,21 @@ def remove_existing_blocks(doc_id):
     db.session.commit()
 
 def index_document_record(doc_record):
-    full_path = os.path.join(DOC_FOLDER, doc_record.stored_filename)
-    text, page_offsets, tables, used_ocr = extract_text_by_extension(full_path)
+    if not storage.document_exists(doc_record.stored_filename, DOC_FOLDER):
+        raise FileNotFoundError(
+            f"Stored file not found: {doc_record.stored_filename}. "
+            "The upload may have been lost after a service restart."
+        )
+
+    with storage.open_document_local_path(
+        doc_record.stored_filename, DOC_FOLDER
+    ) as full_path:
+        ensure_indexable_file(full_path)
+        text, page_offsets, tables, used_ocr = extract_text_by_extension(full_path)
 
     doc_record.is_ocr = used_ocr
-    doc_record.text_preview = text[:2000]
+    doc_record.text_preview = text[:TEXT_PREVIEW_LIMIT]
+    doc_record.page_offsets_json = json.dumps(page_offsets)
     doc_record.status = "indexed"
     db.session.commit()
 
@@ -715,11 +1091,12 @@ def index_document_record(doc_record):
 
     blocks = parse_requirement_blocks(text, page_offsets)
     seen_hashes = set()
+    pending = 0
 
     for b in blocks:
         th = hashlib.sha256(
-    b["full_text"].encode("utf-8", errors="ignore")
-).hexdigest()
+            b["full_text"].encode("utf-8", errors="ignore")
+        ).hexdigest()
         if th in seen_hashes:
             continue
         seen_hashes.add(th)
@@ -730,6 +1107,7 @@ def index_document_record(doc_record):
             title=b["title"],
             section=b["section"],
             page=b["page"],
+            char_start=b.get("char_start", 0),
             category=b["category"],
             definition=b["definition"],
             summary=b["summary"],
@@ -739,6 +1117,10 @@ def index_document_record(doc_record):
             semantic_text=" ".join([b["title"], b["summary"], b["definition"], b["full_text"][:2000]]),
         )
         db.session.add(row)
+        pending += 1
+        if pending >= INDEX_BATCH_SIZE:
+            db.session.commit()
+            pending = 0
 
     save_table_previews(doc_record.id, tables)
     db.session.commit()
@@ -788,16 +1170,26 @@ def lexical_score(block, query, expanded_tokens):
     if q and q == req_id:
         score += 30
     if q and q in title:
-        score += 16
+        score += 20
+    if q and len(q.split()) > 1 and q in title:
+        score += 15
     if q and q in summary:
         score += 12
     if q and q in definition:
         score += 12
     if q and q in section:
-        score += 8
+        score += 10
     if q and q in category:
         score += 6
     if q and q in full_text:
+        score += 10
+    if q and len(q.split()) > 1 and q in full_text:
+        score += 12
+
+    query_tokens = preprocess(query)
+    if len(query_tokens) > 1 and all(t in full_text for t in query_tokens):
+        score += 10
+    if len(query_tokens) > 1 and all(t in title for t in query_tokens):
         score += 8
 
     for term in set(expanded_tokens):
@@ -863,60 +1255,108 @@ def get_result_snippet(block, expanded_tokens):
             snippet = snippet + "..."
 
     return highlight_terms(snippet, expanded_tokens)
-    
 
-    # First: exact/near filename matches
-    direct_docs = DocumentRecord.query.all()
-    matched_doc_ids = []
 
-    for d in direct_docs:
-        original_name = (d.original_filename or "").lower()
-        stored_name = (d.stored_filename or "").lower()
-        base_name = original_name.rsplit(".", 1)[0] if "." in original_name else original_name
+def get_text_snippet(text, expanded_tokens, query=""):
+    text = text or ""
+    text_lower = text.lower()
+    hit_pos = find_hit_position(text, expanded_tokens, query)
 
-        if q in {original_name, stored_name, base_name}:
-            matched_doc_ids.append(d.id)
+    window = 900
+    if hit_pos == -1:
+        snippet = text[:window]
+        if len(text) > window:
+            snippet += "..."
+    else:
+        start = max(0, hit_pos - 250)
+        end = min(len(text), hit_pos + 650)
+        snippet = text[start:end]
+        if start > 0:
+            snippet = "..." + snippet
+        if end < len(text):
+            snippet += "..."
 
-    rows = RequirementBlock.query.all()
+    return highlight_terms(snippet, expanded_tokens)
 
-    scored = []
-    for row in rows:
-        score = lexical_score(row, query, expanded_tokens)
 
-        if row.document_id in matched_doc_ids:
-            score += 120
+def score_document_text(doc, query, expanded_tokens):
+    q = query.lower().strip()
+    text = doc.text_preview or ""
+    if not text.strip():
+        return 0
 
-        score += semantic_score(query, row)
+    text_lower = text.lower()
+    filename = (doc.original_filename or "").lower()
+    base_name = filename.rsplit(".", 1)[0] if "." in filename else filename
+    score = 0.0
 
-        if score > 0:
-            scored.append((row, score))
+    if q and q in text_lower:
+        score += 18
+    if q and q in filename:
+        score += 25
+    if q and q in base_name:
+        score += 20
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    matched_terms = 0
+    for term in set(expanded_tokens):
+        if term.lower() in text_lower:
+            matched_terms += 1
+            score += 5
+        if term.lower() in filename or term.lower() in base_name:
+            score += 4
+
+    query_tokens = preprocess(query)
+    if len(query_tokens) > 1 and all(t in text_lower for t in query_tokens):
+        score += 14
+
+    return score
+
+
+def build_document_fallback_results(query, expanded_tokens, seen_keys, top_k=10):
     results = []
+    for doc in DocumentRecord.query.all():
+        score = score_document_text(doc, query, expanded_tokens)
+        if score <= 0:
+            continue
 
-    for row, score in scored[:top_k]:
-        doc = row.document
-        results.append({
-            "block_id": row.id,
+        page = resolve_result_page(
+            doc,
+            0,
+            doc.text_preview,
+            expanded_tokens,
+            query,
+            1,
+        )
+        key = (doc.id, page, doc.original_filename)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        results.append(enrich_result_with_translation({
+            "block_id": None,
             "document_id": doc.id,
             "filename": doc.original_filename,
             "stored_filename": doc.stored_filename,
-            "page": row.page,
-            "requirement_id": row.requirement_id,
-            "title": row.title,
-            "section": row.section,
-            "category": row.category,
-            "definition": row.definition,
-            "summary": row.summary,
-            "full_text": row.full_text,
-            "snippet": get_result_snippet(row, expanded_tokens),
+            "page": page,
+            "requirement_id": "",
+            "title": doc.original_filename,
+            "section": "Document match",
+            "category": "Document",
+            "definition": "",
+            "summary": (doc.text_preview or "")[:240],
+            "full_text": doc.text_preview or "",
+            "snippet": get_text_snippet(doc.text_preview, expanded_tokens, query),
             "relevance": round(score, 2),
             "is_pdf": doc.extension.lower() == "pdf",
             "has_table": doc.extension.lower() in {"csv", "xlsx"},
             "ocr_used": doc.is_ocr,
-        })
+            "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
+            "is_document_fallback": True,
+        }))
 
-    return results, expanded_tokens
+    results.sort(key=lambda r: r["relevance"], reverse=True)
+    return results[:top_k]
+
 
 def grouped_search_summary(results):
     category_counts = Counter(r["category"] for r in results if r.get("category"))
@@ -962,15 +1402,25 @@ def search_requirements(query, top_k=30):
 
     scored.sort(key=lambda x: x[1], reverse=True)
     results = []
+    seen_keys = set()
 
     for row, score in scored[:top_k]:
         doc = row.document
-        results.append({
+        seen_keys.add((doc.id, row.page or 1, row.requirement_id or row.title))
+        display_page = resolve_result_page(
+            doc,
+            row.char_start or 0,
+            row.full_text,
+            expanded_tokens,
+            query,
+            row.page,
+        )
+        results.append(enrich_result_with_translation({
             "block_id": row.id,
             "document_id": doc.id,
             "filename": doc.original_filename,
             "stored_filename": doc.stored_filename,
-            "page": row.page,
+            "page": display_page,
             "requirement_id": row.requirement_id,
             "title": row.title,
             "section": row.section,
@@ -984,22 +1434,31 @@ def search_requirements(query, top_k=30):
             "has_table": doc.extension.lower() in {"csv", "xlsx"},
             "ocr_used": doc.is_ocr,
             "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
-        })
+            "is_document_fallback": False,
+        }))
 
-    return results, expanded_tokens
-   
+    if len(results) < top_k:
+        fallback = build_document_fallback_results(
+            query, expanded_tokens, seen_keys, top_k=top_k - len(results)
+        )
+        results.extend(fallback)
+
+    results.sort(key=lambda r: r["relevance"], reverse=True)
+    return results[:top_k], expanded_tokens
+
 
 def search_documents(query, top_k=10):
     q = query.lower().strip()
-    docs = DocumentRecord.query.all()
+    query_tokens = preprocess(query)
+    expanded_tokens = expand_query_tokens(query_tokens)
     scored = []
 
-    for d in docs:
-        filename = (d.original_filename or "").lower()
-        stored = (d.stored_filename or "").lower()
+    for doc in DocumentRecord.query.all():
+        score = score_document_text(doc, query, expanded_tokens)
+        filename = (doc.original_filename or "").lower()
+        stored = (doc.stored_filename or "").lower()
         base = filename.rsplit(".", 1)[0] if "." in filename else filename
 
-        score = 0
         if q == filename:
             score += 100
         if q == stored:
@@ -1014,7 +1473,7 @@ def search_documents(query, top_k=10):
             score += 35
 
         if score > 0:
-            scored.append((d, score))
+            scored.append((doc, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:top_k]
@@ -1080,6 +1539,9 @@ HOME_TEMPLATE = """
         <div class="actions">
             {% if current_user.is_authenticated %}
                 <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
+                {% if translation_enabled %}
+                <a class="btn btn-green" href="{{ url_for('ai_translate_tool') }}">AI Translate</a>
+                {% endif %}
                 {% if current_user.is_admin %}
                     <a class="btn btn-purple" href="{{ url_for('upload_files') }}">Upload</a>
                     <a class="btn btn-orange" href="{{ url_for('admin_documents') }}">Documents</a>
@@ -1113,6 +1575,12 @@ HOME_TEMPLATE = """
         <strong>Requirement blocks:</strong> {{ block_count }} |
         <strong>Tables:</strong> {{ table_count }}
     </div>
+
+    {% if doc_count == 0 %}
+        <div class="warning">
+            No documents are indexed yet. Log in as admin, upload PDF files, then use <strong>Reindex</strong> in Documents.
+        </div>
+    {% endif %}
 
     {% if query %}
         <div class="summary-box">
@@ -1172,15 +1640,28 @@ HOME_TEMPLATE = """
                         <div><strong>Section:</strong> {{ res.section }}</div>
                     {% endif %}
 
-                    <div class="snippet">{{ res.snippet|safe }}</div>
+                    <div class="snippet">
+                        <strong>Table 1 / Dutch (Original)</strong>
+                        <div>{{ res.snippet|safe }}</div>
+                    </div>
+                    {% if res.snippet_en %}
+                    <div class="snippet" style="margin-top:10px; border-left:4px solid #28a745;">
+                        <strong>Table 2 / English (Translation)</strong>
+                        <div>{{ res.snippet_en|safe }}</div>
+                    </div>
+                    {% endif %}
 
                     <div class="meta">
-                        <a href="{{ url_for('requirement_detail', block_id=res.block_id) }}">Open full requirement</a>
-                        {% if res.is_pdf %}
-                            | <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open PDF at page {{ res.page or 1 }}</a>
-                        {% endif %}
-                        {% if res.has_table %}
-                            | <a href="{{ url_for('table_preview', document_id=res.document_id) }}">Open table preview</a>
+                        {% if res.is_document_fallback %}
+                            <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open PDF at page {{ res.page or 1 }}</a>
+                        {% else %}
+                            <a href="{{ url_for('requirement_detail', block_id=res.block_id) }}">Open full requirement</a>
+                            {% if res.is_pdf %}
+                                | <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open PDF at page {{ res.page or 1 }}</a>
+                            {% endif %}
+                            {% if res.has_table %}
+                                | <a href="{{ url_for('table_preview', document_id=res.document_id) }}">Open table preview</a>
+                            {% endif %}
                         {% endif %}
                     </div>
                 </div>
@@ -1501,7 +1982,12 @@ REQUIREMENT_TEMPLATE = """
     </div>
 
     <h3>Full requirement text</h3>
+    <div class="summary-box"><strong>Dutch / Original</strong></div>
     <div class="full-block">{{ block.full_text }}</div>
+    {% if block.full_text_en %}
+    <div class="summary-box" style="margin-top:16px;"><strong>English (Translation)</strong></div>
+    <div class="full-block">{{ block.full_text_en }}</div>
+    {% endif %}
 
     <div style="margin-top:16px;">
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
@@ -1523,21 +2009,119 @@ PDF_TEMPLATE = """
 """ + BASE_CSS + """
 <style>
 body { margin:0; }
-.toolbar { padding:12px 16px; background:white; border-bottom:1px solid #ddd; display:flex; justify-content:space-between; align-items:center; }
-.viewer-container { height: calc(100vh - 60px); }
+.toolbar { padding:12px 16px; background:white; border-bottom:1px solid #ddd; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+.viewer-layout { display:flex; height: calc(100vh - 60px); }
+.pdf-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; }
+.translation-pane { flex: 1 1 42%; min-width: 280px; overflow:auto; background:#f8fafc; padding:16px; }
 iframe { width:100%; height:100%; border:none; }
+.translation-box { background:white; border:1px solid #e2e8f0; border-radius:8px; padding:14px; margin-bottom:14px; white-space:pre-wrap; line-height:1.55; }
+.translation-box h4 { margin:0 0 8px 0; color:#334155; }
+.translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
+.btn-small { padding:6px 10px; font-size:13px; }
 </style>
 </head>
 <body>
     <div class="toolbar">
         <div><strong>{{ filename }}</strong> | Page {{ page }}</div>
-        <div>
+        <div style="display:flex; gap:8px; align-items:center;">
+            {% if translation_enabled %}
+            <button class="btn btn-green btn-small" id="reload-translation">Refresh translation</button>
+            {% endif %}
             <a href="{{ url_for('home') }}">Back</a>
         </div>
     </div>
-    <div class="viewer-container">
-        <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+    <div class="viewer-layout">
+        <div class="pdf-pane">
+            <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+        </div>
+        {% if translation_enabled %}
+        <div class="translation-pane">
+            <div class="translation-status" id="translation-status">Loading AI translation for page {{ page }}...</div>
+            <div class="translation-box">
+                <h4>Original</h4>
+                <div id="source-text">...</div>
+            </div>
+            <div class="translation-box" style="border-left:4px solid #28a745;">
+                <h4>English translation</h4>
+                <div id="translated-text">...</div>
+            </div>
+        </div>
+        {% endif %}
     </div>
+    {% if translation_enabled %}
+    <script>
+    const documentId = {{ document_id }};
+    const pageNum = {{ page }};
+    const statusEl = document.getElementById("translation-status");
+    const sourceEl = document.getElementById("source-text");
+    const translatedEl = document.getElementById("translated-text");
+
+    async function loadTranslation() {
+        statusEl.textContent = "Translating page " + pageNum + "...";
+        sourceEl.textContent = "...";
+        translatedEl.textContent = "...";
+        try {
+            const resp = await fetch(`/api/document/${documentId}/translate-page?page=${pageNum}`);
+            const data = await resp.json();
+            if (!resp.ok) {
+                throw new Error(data.error || "Translation request failed");
+            }
+            sourceEl.textContent = data.source || "(No text on this page)";
+            translatedEl.textContent = data.translation || "(Translation unavailable)";
+            const provider = data.provider || "unknown";
+            statusEl.textContent = data.cached
+                ? `Cached translation (${provider})`
+                : `Generated with ${provider}`;
+            if (data.error) {
+                statusEl.textContent = data.error;
+            }
+        } catch (err) {
+            statusEl.textContent = "Translation error: " + err.message;
+            translatedEl.textContent = "";
+        }
+    }
+
+    document.getElementById("reload-translation").addEventListener("click", loadTranslation);
+    loadTranslation();
+    </script>
+    {% endif %}
+</body>
+</html>
+"""
+
+AI_TRANSLATE_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AI Translation Tool</title>
+""" + BASE_CSS + """
+</head>
+<body>
+<div class="container">
+    <h2>AI Translation Tool</h2>
+    <p class="small">
+        Provider: <strong>{{ provider_info.provider }}</strong>
+        | Model: <strong>{{ provider_info.model }}</strong>
+        | Status: <strong>{{ "Ready" if provider_info.configured else "Not configured" }}</strong>
+    </p>
+
+    <form method="post">
+        <label><strong>Source text (Dutch / mixed)</strong></label>
+        <textarea name="source_text" rows="10" style="width:100%; margin-top:8px;">{{ source_text }}</textarea>
+        <div style="margin-top:12px;">
+            <button class="btn btn-green" type="submit">Translate to English</button>
+            <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
+        </div>
+    </form>
+
+    {% if translated_text %}
+    <div class="summary-box" style="margin-top:18px;">
+        <strong>English translation</strong>
+        <div class="full-block" style="margin-top:10px;">{{ translated_text }}</div>
+    </div>
+    {% endif %}
+</div>
 </body>
 </html>
 """
@@ -1560,7 +2144,14 @@ TABLE_TEMPLATE = """
             <div class="result-item">
                 <div class="filename">{{ t.preview_title }}</div>
                 <div class="meta">Format: {{ t.table_format }} | Sheet: {{ t.sheet_name }}</div>
+                <h3>Table 1 - Dutch (Original)</h3>
                 <div class="data-table">{{ t.html_table|safe }}</div>
+                {% if t.html_table_en %}
+                <h3 style="margin-top:18px;">Table 2 - English (Translation)</h3>
+                <div class="data-table">{{ t.html_table_en|safe }}</div>
+                {% else %}
+                <div class="notice" style="margin-top:12px;">English translation not available yet. Reindex the document to generate it.</div>
+                {% endif %}
             </div>
         {% endfor %}
     {% else %}
@@ -1609,10 +2200,67 @@ def healthz():
         {
             "status": "ok",
             "environment": APP_ENV,
+            "storage_backend": storage.storage_backend_name(),
             "data_dir": str(DATA_DIR),
             "database_path": str(DATABASE_PATH),
+            "translation": translation.provider_status(),
         }
     )
+
+
+@app.route("/ai-translate", methods=["GET", "POST"])
+@login_required
+def ai_translate_tool():
+    source_text = ""
+    translated_text = ""
+    provider_info = translation.provider_status()
+
+    if request.method == "POST":
+        source_text = request.form.get("source_text", "").strip()
+        if source_text:
+            translated_text = translate_to_english(source_text)
+
+    return render_template_string(
+        AI_TRANSLATE_TEMPLATE,
+        source_text=source_text,
+        translated_text=translated_text,
+        provider_info=provider_info,
+    )
+
+
+@app.route("/api/translate", methods=["POST"])
+@login_required
+def api_translate_text():
+    payload = request.get_json(silent=True) or {}
+    source_text = (payload.get("text") or "").strip()
+    if not source_text:
+        return jsonify({"error": "text is required"}), 400
+    if not translation.translation_enabled():
+        return jsonify({"error": "translation is disabled"}), 503
+
+    translated = translate_to_english(source_text)
+    return jsonify(
+        {
+            "source": source_text,
+            "translation": translated,
+            "provider": translation.translation_provider(),
+        }
+    )
+
+
+@app.route("/api/document/<int:document_id>/translate-page")
+def api_translate_page(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc:
+        return jsonify({"error": "Document not found"}), 404
+    if not translation.translation_enabled():
+        return jsonify({"error": "translation is disabled"}), 503
+
+    page = request.args.get("page", 1, type=int)
+    result = get_or_translate_page(doc, page)
+    if result.get("error") and not result.get("translation"):
+        return jsonify(result), 404
+    return jsonify(result)
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -1704,17 +2352,15 @@ def upload_files():
                 skipped_count += 1
                 continue
 
-            # Move to permanent storage
             stored_filename = f"{uuid.uuid4().hex}.{ext}"
-            final_path = os.path.join(DOC_FOLDER, stored_filename)
-            os.rename(temp_path, final_path)
+            size_bytes = storage.save_document(stored_filename, temp_path, DOC_FOLDER)
 
             doc = DocumentRecord(
                 original_filename=original_filename,
                 stored_filename=stored_filename,
                 extension=ext,
                 file_hash=file_hash,
-                size_bytes=os.path.getsize(final_path),
+                size_bytes=size_bytes,
                 uploaded_by=current_user.id,
             )
             db.session.add(doc)
@@ -1756,8 +2402,11 @@ def reindex_document(document_id):
 
     try:
         index_document_record(doc)
-        flash(f"Reindexed: {doc.original_filename}")
+        block_count = RequirementBlock.query.filter_by(document_id=doc.id).count()
+        flash(f"Reindexed: {doc.original_filename} ({block_count} requirement blocks)")
     except Exception as e:
+        db.session.rollback()
+        print(f"Reindex error for document {document_id}: {e}")
         flash(f"Reindex error: {str(e)}")
 
     return redirect(url_for("admin_documents"))
@@ -1773,10 +2422,7 @@ def delete_document(document_id):
         flash("Document not found.")
         return redirect(url_for("admin_documents"))
 
-    # Delete physical file
-    file_path = os.path.join(DOC_FOLDER, doc.stored_filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
+    storage.delete_document(doc.stored_filename, DOC_FOLDER)
 
     # DB cascade will remove requirements & tables
     db.session.delete(doc)
@@ -1789,9 +2435,21 @@ def requirement_detail(block_id):
     block = db.session.get(RequirementBlock, block_id)
     if not block:
         abort(404)
+    block_view = {
+        "requirement_id": block.requirement_id,
+        "title": block.title,
+        "section": block.section,
+        "page": block.page,
+        "category": block.category,
+        "definition": block.definition,
+        "summary": block.summary,
+        "full_text": block.full_text,
+        "full_text_en": translate_to_english(block.full_text),
+        "document": block.document,
+    }
     return render_template_string(
         REQUIREMENT_TEMPLATE,
-        block=block,
+        block=block_view,
         pdf2image_available=PDF2IMAGE_AVAILABLE
     )
 
@@ -1814,9 +2472,11 @@ def pdf_viewer(document_id):
     pdf_url = url_for("serve_pdf", document_id=document_id)
     return render_template_string(
         PDF_TEMPLATE,
+        document_id=document_id,
         filename=doc.original_filename,
         page=page,
-        pdf_url=pdf_url
+        pdf_url=pdf_url,
+        translation_enabled=translation.translation_enabled(),
     )
 
 @app.route("/serve-pdf/<int:document_id>")
@@ -1825,11 +2485,11 @@ def serve_pdf(document_id):
     if not doc or doc.extension != "pdf":
         abort(404)
 
-    file_path = os.path.join(DOC_FOLDER, doc.stored_filename)
-    if not os.path.exists(file_path):
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         abort(404)
 
-    return send_file(file_path, mimetype="application/pdf")
+    pdf_bytes = storage.read_document_bytes(doc.stored_filename, DOC_FOLDER)
+    return send_file(io.BytesIO(pdf_bytes), mimetype="application/pdf")
 
 @app.route("/page-image/<int:document_id>")
 def page_image(document_id):
@@ -1837,10 +2497,10 @@ def page_image(document_id):
     if not doc or doc.extension != "pdf":
         abort(404)
     page = request.args.get("page", 1, type=int)
-    file_path = os.path.join(DOC_FOLDER, doc.stored_filename)
-    if not os.path.exists(file_path):
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         abort(404)
-    image_data = get_page_image(file_path, page)
+    with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+        image_data = get_page_image(file_path, page)
     if image_data is None:
         # fallback: return a 1x1 transparent PNG (or 404)
         from flask import Response
@@ -1988,9 +2648,7 @@ def bulk_delete_documents():
             continue
 
         try:
-            file_path = os.path.join(DOC_FOLDER, doc.stored_filename)
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            storage.delete_document(doc.stored_filename, DOC_FOLDER)
 
             db.session.delete(doc)
             db.session.commit()
@@ -2007,11 +2665,42 @@ def bulk_delete_documents():
 
 
 
+def ensure_schema():
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(db.engine)
+    doc_cols = {col["name"] for col in inspector.get_columns("documents")}
+    if "page_offsets_json" not in doc_cols:
+        db.session.execute(text("ALTER TABLE documents ADD COLUMN page_offsets_json TEXT"))
+        db.session.commit()
+
+    block_cols = {col["name"] for col in inspector.get_columns("requirement_blocks")}
+    if "char_start" not in block_cols:
+        db.session.execute(text("ALTER TABLE requirement_blocks ADD COLUMN char_start INTEGER DEFAULT 0"))
+        db.session.commit()
+
+    table_cols = {col["name"] for col in inspector.get_columns("table_previews")}
+    if "html_table_en" not in table_cols:
+        db.session.execute(text("ALTER TABLE table_previews ADD COLUMN html_table_en TEXT"))
+        db.session.commit()
+
+    cache_cols = set()
+    if "translation_cache" in inspector.get_table_names():
+        cache_cols = {col["name"] for col in inspector.get_columns("translation_cache")}
+    if cache_cols and "provider" not in cache_cols:
+        db.session.execute(text("ALTER TABLE translation_cache ADD COLUMN provider VARCHAR(32)"))
+        db.session.commit()
+
+    if "document_page_translations" not in inspector.get_table_names():
+        db.create_all()
+
+
 # =========================================================
 # App initialization
 # =========================================================
 with app.app_context():
     db.create_all()
+    ensure_schema()
     create_default_admin()
 
 def _running_in_notebook():
