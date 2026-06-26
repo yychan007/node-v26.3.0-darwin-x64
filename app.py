@@ -550,11 +550,14 @@ def split_text_into_virtual_pages(text, max_chars=3500):
     return [part for part in parts if part] or [""]
 
 
-def extract_single_page_text(doc, page_num):
+def extract_page_text_from_preview(doc, page_num):
+    if page_num < 1:
+        return ""
+
     ext = doc.extension.lower()
     if ext in {"docx", "txt"}:
         chunks = split_text_into_virtual_pages(get_document_full_text(doc))
-        if page_num < 1 or page_num > len(chunks):
+        if page_num > len(chunks):
             return ""
         return chunks[page_num - 1]
 
@@ -564,6 +567,24 @@ def extract_single_page_text(doc, page_num):
         for start, end, page in offsets:
             if page == page_num:
                 return text[start:end].strip()
+    return ""
+
+
+def pdf_source_file_missing(doc):
+    return (
+        doc.extension.lower() == "pdf"
+        and not storage.document_exists(doc.stored_filename, DOC_FOLDER)
+    )
+
+
+def extract_single_page_text(doc, page_num):
+    ext = doc.extension.lower()
+    preview_text = extract_page_text_from_preview(doc, page_num)
+    if preview_text:
+        return preview_text
+
+    if ext in {"docx", "txt"}:
+        return ""
 
     if ext != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         return ""
@@ -609,6 +630,13 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
 
     source = extract_single_page_text(doc, page_num)
     if not source:
+        if pdf_source_file_missing(doc):
+            error = (
+                "Source PDF not found on server. "
+                "Re-upload the file in Documents, then click Reindex."
+            )
+        else:
+            error = "No extractable text on this page."
         return {
             "page": page_num,
             "lang": target_lang,
@@ -616,7 +644,7 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
             "translation": "",
             "provider": get_translation_provider(),
             "cached": False,
-            "error": "No extractable text on this page.",
+            "error": error,
         }
 
     translated = translate_to_language(source, target_lang)
@@ -2479,6 +2507,8 @@ def build_document_view_context(doc, page=1):
     if ext in {"docx", "txt"}:
         chunks = split_text_into_virtual_pages(get_document_full_text(doc))
         original_text = chunks[page - 1] if chunks else ""
+    elif ext == "pdf" and not file_available:
+        original_text = extract_page_text_from_preview(doc, page)
 
     return {
         "document_id": doc.id,
@@ -2489,6 +2519,7 @@ def build_document_view_context(doc, page=1):
         "view_mode": "pdf" if ext == "pdf" else "text",
         "file_available": file_available,
         "pdf_available": file_available and ext == "pdf",
+        "pdf_file_missing": pdf_source_file_missing(doc) if ext == "pdf" else False,
         "pdf_url": url_for("serve_document", document_id=doc.id) if ext == "pdf" and file_available else "",
         "download_url": url_for("serve_document", document_id=doc.id) if file_available else "",
         "original_text": original_text,
@@ -2552,6 +2583,16 @@ iframe { width:100%; height:100%; border:none; }
             {% if view_mode == 'pdf' %}
                 {% if pdf_available %}
                 <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+                {% elif original_text %}
+                <div style="padding:16px;">
+                    <h3 style="margin-top:0;">Original text — {{ page_label }} {{ page }}</h3>
+                    <div class="notice" style="margin-bottom:12px;">
+                        <strong>PDF file not found on server.</strong>
+                        Re-upload in <strong>Documents</strong> and click <strong>Reindex</strong> to restore the PDF preview.
+                        Showing indexed text below.
+                    </div>
+                    <div class="original-text-box">{{ original_text }}</div>
+                </div>
                 {% else %}
                 <div class="file-missing">
                     <strong>Original PDF not found on server.</strong><br>
@@ -2594,6 +2635,23 @@ iframe { width:100%; height:100%; border:none; }
     const exportBtn = document.getElementById("export-translation");
     let currentTranslation = "";
 
+    async function readJsonResponse(resp) {
+        const raw = await resp.text();
+        if (!raw.trim()) {
+            throw new Error(`Empty server response (${resp.status}).`);
+        }
+        try {
+            return JSON.parse(raw);
+        } catch (parseErr) {
+            const preview = raw.replace(/\\s+/g, " ").slice(0, 160);
+            throw new Error(
+                preview.startsWith("<")
+                    ? `Server returned HTML instead of JSON (${resp.status}). Try logging in again or redeploying the app.`
+                    : `Invalid server response (${resp.status}).`
+            );
+        }
+    }
+
     async function loadCurrentTranslation() {
         statusEl.textContent = `Translating ${pageLabel.toLowerCase()} ${pageNum} of ${totalPages}...`;
         translatedEl.textContent = "...";
@@ -2602,7 +2660,7 @@ iframe { width:100%; height:100%; border:none; }
 
         try {
             const resp = await fetch(`/api/document/${documentId}/translate-page?page=${pageNum}`);
-            const data = await resp.json();
+            const data = await readJsonResponse(resp);
             if (!resp.ok) {
                 throw new Error(data.error || "Translation request failed");
             }
@@ -2840,7 +2898,19 @@ def api_translate_page(document_id):
 
     page = request.args.get("page", 1, type=int)
     target_lang = normalize_translation_lang(request.args.get("lang", "en"))
-    result = get_or_translate_page(doc, page, target_lang=target_lang)
+    try:
+        result = get_or_translate_page(doc, page, target_lang=target_lang)
+    except Exception as exc:
+        print(f"Translate page API error for doc {document_id} page {page}: {exc}")
+        return jsonify(
+            {
+                "page": page,
+                "lang": target_lang,
+                "translation": "",
+                "error": f"Translation failed: {exc}",
+            }
+        ), 500
+
     if result.get("error") and not result.get("translation"):
         return jsonify(result), 404
     return jsonify(result)

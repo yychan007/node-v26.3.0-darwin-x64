@@ -5,16 +5,22 @@ import re
 import urllib.error
 import urllib.request
 
-_translator = None
+_translators = {}
 _enabled = None
 
-SYSTEM_PROMPT = (
-    "You are a professional technical translator for electrical engineering and "
-    "building standards documents (often Dutch NEN/IEC standards). "
-    "Translate accurately into English. Preserve requirement IDs, section numbers, "
-    "table references, units, and normative wording. "
-    "Return only the translation without explanations."
-)
+LANGUAGE_LABELS = {
+    "en": "English",
+}
+
+SYSTEM_PROMPTS = {
+    "en": (
+        "You are a professional technical translator for electrical engineering and "
+        "building standards documents (often Dutch NEN/IEC standards). "
+        "Translate accurately into English. Preserve requirement IDs, section numbers, "
+        "table references, units, and normative wording. "
+        "Return only the translation without explanations."
+    ),
+}
 
 
 def translation_enabled():
@@ -23,6 +29,20 @@ def translation_enabled():
         value = os.environ.get("ENABLE_TRANSLATION", "true").strip().lower()
         _enabled = value in {"1", "true", "yes", "on"}
     return _enabled
+
+
+def target_languages():
+    raw = os.environ.get("TRANSLATION_TARGET_LANGS", "en").strip()
+    langs = []
+    for part in raw.split(","):
+        code = part.strip().lower()
+        if code in LANGUAGE_LABELS and code not in langs:
+            langs.append(code)
+    return langs or ["en"]
+
+
+def language_label(code):
+    return LANGUAGE_LABELS.get(code, code.upper())
 
 
 def translation_provider():
@@ -45,11 +65,14 @@ def provider_configured():
 
 def provider_status():
     provider = translation_provider()
+    langs = target_languages()
     return {
         "enabled": translation_enabled(),
         "provider": provider,
         "configured": provider_configured(),
         "model": _provider_model(provider),
+        "target_languages": langs,
+        "target_language_labels": [language_label(code) for code in langs],
     }
 
 
@@ -64,15 +87,25 @@ def _provider_model(provider):
     return "google-translate"
 
 
-def _get_google_translator():
-    global _translator
-    if _translator is None:
+def _normalize_target_lang(target_lang):
+    code = (target_lang or "en").strip().lower() or "en"
+    if code not in LANGUAGE_LABELS:
+        return "en"
+    return code
+
+
+def _system_prompt_for(target_lang):
+    return SYSTEM_PROMPTS.get(_normalize_target_lang(target_lang), SYSTEM_PROMPTS["en"])
+
+
+def _get_google_translator(target_lang):
+    target = _normalize_target_lang(target_lang)
+    if target not in _translators:
         from deep_translator import GoogleTranslator
 
         source = os.environ.get("TRANSLATION_SOURCE_LANG", "auto").strip() or "auto"
-        target = os.environ.get("TRANSLATION_TARGET_LANG", "en").strip() or "en"
-        _translator = GoogleTranslator(source=source, target=target)
-    return _translator
+        _translators[target] = GoogleTranslator(source=source, target=target)
+    return _translators[target]
 
 
 def should_skip_translation(text):
@@ -112,7 +145,7 @@ def _http_json_post(url, headers, payload, timeout=90):
         return json.loads(response.read().decode("utf-8"))
 
 
-def _translate_openai(text):
+def _translate_openai(text, target_lang):
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -122,7 +155,7 @@ def _translate_openai(text):
         "model": model,
         "temperature": 0.2,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": _system_prompt_for(target_lang)},
             {"role": "user", "content": text},
         ],
     }
@@ -137,7 +170,7 @@ def _translate_openai(text):
     return (result["choices"][0]["message"]["content"] or "").strip()
 
 
-def _translate_anthropic(text):
+def _translate_anthropic(text, target_lang):
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set.")
@@ -147,7 +180,7 @@ def _translate_anthropic(text):
         "model": model,
         "max_tokens": 4096,
         "temperature": 0.2,
-        "system": SYSTEM_PROMPT,
+        "system": _system_prompt_for(target_lang),
         "messages": [{"role": "user", "content": text}],
     }
     result = _http_json_post(
@@ -166,30 +199,39 @@ def _translate_anthropic(text):
     return "\n".join(parts).strip()
 
 
-def _translate_google(text):
-    translator = _get_google_translator()
+def _translate_google(text, target_lang):
+    translator = _get_google_translator(target_lang)
     return translator.translate(text)
 
 
-def _translate_chunk(text):
+def _translate_chunk(text, target_lang):
     provider = translation_provider()
     if provider == "openai" and provider_configured():
-        return _translate_openai(text)
+        return _translate_openai(text, target_lang)
     if provider == "anthropic" and provider_configured():
-        return _translate_anthropic(text)
-    return _translate_google(text)
+        return _translate_anthropic(text, target_lang)
+    return _translate_google(text, target_lang)
 
 
-def translate_text(text, cache_get=None, cache_set=None, cache_provider=None):
+def translate_text(
+    text,
+    target_lang="en",
+    cache_get=None,
+    cache_set=None,
+    cache_provider=None,
+):
     if not translation_enabled():
         return ""
 
+    target_lang = _normalize_target_lang(target_lang)
     text = (text or "").strip()
     if not text or should_skip_translation(text):
         return text
 
     provider = translation_provider()
-    cache_key = hashlib.sha256(f"{provider}:{text}".encode("utf-8")).hexdigest()
+    cache_key = hashlib.sha256(
+        f"{provider}:{target_lang}:{text}".encode("utf-8")
+    ).hexdigest()
     if cache_get:
         cached = cache_get(cache_key)
         if cached is not None:
@@ -205,16 +247,16 @@ def translate_text(text, cache_get=None, cache_set=None, cache_provider=None):
                 translated_parts.append(chunk)
                 continue
             try:
-                translated_parts.append(_translate_chunk(chunk))
+                translated_parts.append(_translate_chunk(chunk, target_lang))
             except Exception as exc:
-                print(f"Primary translation error ({provider}): {exc}")
+                print(f"Primary translation error ({provider}, {target_lang}): {exc}")
                 if provider != "google":
-                    translated_parts.append(_translate_google(chunk))
+                    translated_parts.append(_translate_google(chunk, target_lang))
                 else:
                     raise
         translated = "\n".join(part for part in translated_parts if part).strip()
     except Exception as exc:
-        print(f"Translation error: {exc}")
+        print(f"Translation error ({target_lang}): {exc}")
         return ""
 
     if cache_set and translated:
@@ -222,7 +264,13 @@ def translate_text(text, cache_get=None, cache_set=None, cache_provider=None):
     return translated
 
 
-def translate_dataframe_values(df, cache_get=None, cache_set=None, max_cells=180):
+def translate_dataframe_values(
+    df,
+    target_lang="en",
+    cache_get=None,
+    cache_set=None,
+    max_cells=180,
+):
     if df is None:
         return df
 
@@ -235,6 +283,11 @@ def translate_dataframe_values(df, cache_get=None, cache_set=None, max_cells=180
             value = translated.at[idx, col]
             if should_skip_translation(value):
                 continue
-            translated.at[idx, col] = translate_text(value, cache_get, cache_set)
+            translated.at[idx, col] = translate_text(
+                value,
+                target_lang=target_lang,
+                cache_get=cache_get,
+                cache_set=cache_set,
+            )
             seen += 1
     return translated

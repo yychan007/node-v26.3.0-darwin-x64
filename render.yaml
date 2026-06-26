@@ -2,27 +2,61 @@ services:
   - type: web
     name: technical-standards-search-portal
     runtime: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app:app
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: gunicorn -w 1 --timeout 120 -b 0.0.0.0:$PORT app:app
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: APP_ENV
         value: production
       - key: DATA_DIR
-        value: /data
-      - key: DATABASE_PATH
-        value: /data/search_portal.db
+        value: /tmp/appdata
       - key: ADMIN_AUTO_CREATE
         value: "true"
       - key: ENABLE_SEMANTIC_SEARCH
         value: "false"
+      - key: ENABLE_OCR
+        value: "false"
+      - key: ENABLE_TRANSLATION
+        value: "true"
+      - key: TRANSLATION_PROVIDER
+        value: google
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-3-5-haiku-latest
+      - key: MAX_PDF_PAGES
+        value: "100"
+      - key: MAX_INDEX_FILE_MB
+        value: "40"
       - key: ADMIN_USERNAME
         value: admin
       - key: APP_SECRET_KEY
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
-    disks:
-      - name: technical-standards-data
-        mountPath: /data
-        sizeGB: 1
+      - key: DATABASE_URL
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: SUPABASE_S3_ENDPOINT
+        sync: false
+      - key: SUPABASE_S3_ACCESS_KEY_ID
+        sync: false
+      - key: SUPABASE_S3_SECRET_ACCESS_KEY
+        sync: false
+      - key: SUPABASE_S3_BUCKET_NAME
+        sync: false
+      - key: SUPABASE_S3_REGION
+        value: eu-central-1
