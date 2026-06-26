@@ -570,6 +570,118 @@ def get_or_translate_page(doc, page_num):
     }
 
 
+def count_pdf_pages(doc):
+    offsets = load_page_offsets(doc)
+    if offsets:
+        return max(page for _, _, page in offsets)
+
+    if doc.extension != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return 0
+
+    if not OCR_AVAILABLE:
+        return 0
+
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+            with fitz.open(file_path) as pdf_doc:
+                return len(pdf_doc)
+    except Exception as exc:
+        print(f"PDF page count error for doc {doc.id}: {exc}")
+        return 0
+
+
+def _split_text_for_pages(text, max_chars=3200):
+    text = text or ""
+    if len(text) <= max_chars:
+        return [text] if text else [""]
+
+    parts = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end < len(text):
+            split_at = text.rfind("\n", start, end)
+            if split_at > start + 400:
+                end = split_at + 1
+        parts.append(text[start:end])
+        start = end
+    return parts
+
+
+def _append_translation_text(pdf_doc, header, text):
+    page_width, page_height = fitz.paper_size("a4")
+    margin_x = 50
+    margin_top = 70
+    margin_bottom = 50
+    body_rect = fitz.Rect(
+        margin_x, margin_top, page_width - margin_x, page_height - margin_bottom
+    )
+    chunks = _split_text_for_pages(text)
+
+    for index, chunk in enumerate(chunks):
+        page = pdf_doc.new_page(width=page_width, height=page_height)
+        if index == 0 and header:
+            page.insert_text(
+                (margin_x, 42),
+                header,
+                fontsize=11,
+                fontname="helv",
+            )
+        page.insert_textbox(
+            body_rect,
+            chunk,
+            fontsize=10,
+            fontname="helv",
+            align=fitz.TEXT_ALIGN_LEFT,
+        )
+
+
+def build_translated_pdf_bytes(doc):
+    if not OCR_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required to export translated PDFs.")
+
+    if not translation.translation_enabled():
+        raise RuntimeError("Translation is disabled.")
+
+    total_pages = count_pdf_pages(doc)
+    if total_pages <= 0:
+        raise ValueError("Could not determine PDF page count.")
+
+    export_limit = MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else total_pages
+    pages_to_export = min(total_pages, export_limit)
+    truncated = pages_to_export < total_pages
+
+    pdf_out = fitz.open()
+    source_name = doc.original_filename or doc.stored_filename
+
+    try:
+        if truncated:
+            notice = (
+                f"English translation export for {source_name}\n"
+                f"Pages 1-{pages_to_export} of {total_pages}\n\n"
+            )
+            _append_translation_text(pdf_out, "Export notice", notice)
+
+        for page_num in range(1, pages_to_export + 1):
+            result = get_or_translate_page(doc, page_num)
+            translation_text = (result.get("translation") or "").strip()
+            if not translation_text:
+                translation_text = "(No translation available for this page.)"
+
+            header = f"{source_name} - Page {page_num} (English)"
+            _append_translation_text(pdf_out, header, translation_text)
+
+        if pdf_out.page_count == 0:
+            raise ValueError("No translated pages were generated.")
+
+        buffer = io.BytesIO()
+        pdf_out.save(buffer, garbage=4, deflate=True)
+        buffer.seek(0)
+        return buffer.getvalue()
+    finally:
+        pdf_out.close()
+
+
 def translate_to_english(text):
     return translation.translate_text(
         text,
@@ -1060,13 +1172,16 @@ def save_table_previews(doc_id, tables):
         html_table = preview_df.to_html(index=False, classes="data-table", border=0)
         html_table_en = ""
         if translation.translation_enabled():
-            en_df = translation.translate_dataframe_values(
-                preview_df,
-                cache_get=get_cached_translation,
-                cache_set=store_cached_translation,
-                max_cells=TRANSLATE_MAX_CELLS,
-            )
-            html_table_en = en_df.to_html(index=False, classes="data-table", border=0)
+            try:
+                en_df = translation.translate_dataframe_values(
+                    preview_df,
+                    cache_get=get_cached_translation,
+                    cache_set=store_cached_translation,
+                    max_cells=TRANSLATE_MAX_CELLS,
+                )
+                html_table_en = en_df.to_html(index=False, classes="data-table", border=0)
+            except Exception as exc:
+                print(f"Table translation skipped for sheet {sheet_name}: {exc}")
         csv_buf = io.StringIO()
         preview_df.to_csv(csv_buf, index=False)
         row = TablePreview(
@@ -1080,6 +1195,34 @@ def save_table_previews(doc_id, tables):
             preview_title=f"{sheet_name} preview"
         )
         db.session.add(row)
+
+
+def regenerate_table_previews(doc_record):
+    ext = doc_record.extension.lower()
+    if ext not in {"csv", "xlsx"}:
+        return []
+
+    if not storage.document_exists(doc_record.stored_filename, DOC_FOLDER):
+        raise FileNotFoundError(
+            f"Stored file not found: {doc_record.stored_filename}"
+        )
+
+    with storage.open_document_local_path(
+        doc_record.stored_filename, DOC_FOLDER
+    ) as full_path:
+        ensure_indexable_file(full_path)
+        if ext == "xlsx":
+            _, _, tables = extract_text_from_xlsx(full_path)
+        else:
+            _, _, tables = extract_text_from_csv(full_path)
+
+    if not tables:
+        return []
+
+    TablePreview.query.filter_by(document_id=doc_record.id).delete()
+    save_table_previews(doc_record.id, tables)
+    db.session.commit()
+    return TablePreview.query.filter_by(document_id=doc_record.id).all()
 
 def remove_existing_blocks(doc_id):
     RequirementBlock.query.filter_by(document_id=doc_id).delete()
@@ -1885,6 +2028,7 @@ DOCS_TEMPLATE = """
                     <a href="{{ url_for('delete_document', document_id=d.id) }}" onclick="return confirm('Delete this document?');">Delete</a>
                     {% if d.extension == 'pdf' %}
                     | <a href="{{ url_for('pdf_viewer', document_id=d.id, page=1) }}" target="_blank">View PDF</a>
+                    | <a href="{{ url_for('export_translation_pdf', document_id=d.id) }}">Export EN PDF</a>
                     {% endif %}
                     {% if d.extension in ['csv','xlsx'] %}
                     | <a href="{{ url_for('table_preview', document_id=d.id) }}">Preview table</a>
@@ -2044,7 +2188,8 @@ iframe { width:100%; height:100%; border:none; }
         <div style="display:flex; gap:8px; align-items:center;">
             {% if translation_enabled %}
             <button class="btn btn-green btn-small" id="reload-translation">Refresh translation</button>
-            <button class="btn btn-purple btn-small" id="export-translation" disabled>Export English (.txt)</button>
+            <button class="btn btn-purple btn-small" id="export-translation" disabled>Export page (.txt)</button>
+            <a class="btn btn-orange btn-small" href="{{ url_for('export_translation_pdf', document_id=document_id) }}">Export full PDF (EN)</a>
             {% endif %}
             <a href="{{ url_for('home') }}">Back</a>
         </div>
@@ -2193,6 +2338,18 @@ TABLE_TEMPLATE = """
         {% endfor %}
     {% else %}
         <div class="warning">No table preview available.</div>
+        {% if error_msg %}
+        <div class="notice" style="margin-top:12px;">{{ error_msg }}</div>
+        {% else %}
+        <div class="notice" style="margin-top:12px;">
+            The table was not indexed yet, or the source file was lost after a server restart.
+            {% if current_user.is_authenticated and current_user.is_admin %}
+            Go to <a href="{{ url_for('admin_documents') }}">Documents</a> and click <strong>Reindex</strong> for this file.
+            {% else %}
+            Ask an admin to reindex this document.
+            {% endif %}
+        </div>
+        {% endif %}
     {% endif %}
 
 
@@ -2298,6 +2455,39 @@ def api_translate_page(document_id):
     if result.get("error") and not result.get("translation"):
         return jsonify(result), 404
     return jsonify(result)
+
+
+@app.route("/document/<int:document_id>/export-translation-pdf")
+@login_required
+def export_translation_pdf(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc or doc.extension != "pdf":
+        abort(404)
+
+    if not translation.translation_enabled():
+        flash("Translation is disabled.")
+        return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
+
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        flash("Source PDF not found. Re-upload the file and try again.")
+        return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
+
+    try:
+        pdf_bytes = build_translated_pdf_bytes(doc)
+    except Exception as exc:
+        print(f"Translated PDF export error for document {document_id}: {exc}")
+        flash(f"Export failed: {exc}")
+        return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
+
+    base_name = secure_filename(
+        Path(doc.original_filename).stem or f"document_{document_id}"
+    )
+    return send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"{base_name}_english.pdf",
+    )
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -2497,7 +2687,24 @@ def table_preview(document_id):
         abort(404)
 
     tables = TablePreview.query.filter_by(document_id=document_id).all()
-    return render_template_string(TABLE_TEMPLATE, doc=doc, tables=tables)
+    error_msg = ""
+    if not tables and doc.extension.lower() in {"csv", "xlsx"}:
+        try:
+            tables = regenerate_table_previews(doc)
+            if not tables:
+                error_msg = "The spreadsheet has no readable sheets or table data."
+        except FileNotFoundError:
+            error_msg = (
+                "Source file not found. It may have been lost after a restart. "
+                "Configure Supabase Storage and upload the file again."
+            )
+        except Exception as exc:
+            print(f"Table preview regeneration error for document {document_id}: {exc}")
+            error_msg = f"Could not build table preview: {exc}"
+
+    return render_template_string(
+        TABLE_TEMPLATE, doc=doc, tables=tables, error_msg=error_msg
+    )
 
 @app.route("/pdf/<int:document_id>")
 def pdf_viewer(document_id):
