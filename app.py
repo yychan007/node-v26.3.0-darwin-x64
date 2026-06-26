@@ -46,6 +46,9 @@ from pathlib import Path
 
 import pdfplumber
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.utils import get_column_letter
 
 import storage
 import translation
@@ -3245,6 +3248,58 @@ def html_table_to_dataframe(html):
         return None
 
 
+_EXCEL_THIN_BORDER = Border(
+    left=Side(style="thin", color="000000"),
+    right=Side(style="thin", color="000000"),
+    top=Side(style="thin", color="000000"),
+    bottom=Side(style="thin", color="000000"),
+)
+_EXCEL_WRAP_ALIGN = Alignment(wrap_text=True, vertical="top")
+
+
+def _format_excel_table_block(ws, min_row, max_row, min_col, max_col):
+    for row in range(min_row, max_row + 1):
+        for col in range(min_col, max_col + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.border = _EXCEL_THIN_BORDER
+            cell.alignment = _EXCEL_WRAP_ALIGN
+
+
+def _auto_fit_excel_columns(ws, min_col, max_col, min_row, max_row):
+    for col in range(min_col, max_col + 1):
+        max_len = 10
+        for row in range(min_row, max_row + 1):
+            value = ws.cell(row=row, column=col).value
+            if value is not None:
+                max_len = max(max_len, len(str(value)))
+        ws.column_dimensions[get_column_letter(col)].width = min(max(max_len + 2, 12), 55)
+
+
+def _append_dataframe_to_sheet(ws, df, start_row, title=None):
+    row_cursor = start_row
+    if title:
+        title_cell = ws.cell(row=row_cursor, column=1, value=title)
+        title_cell.font = Font(bold=True, size=12)
+        row_cursor += 1
+
+    if df is None or df.empty:
+        return row_cursor
+
+    data_start = row_cursor
+    ncols = len(df.columns)
+    for row_offset, row_values in enumerate(df.values):
+        for col_offset, value in enumerate(row_values, start=1):
+            cell_value = "" if value in (None, "nan", "NaN", "None", "<NA>") else value
+            ws.cell(row=row_cursor + row_offset, column=col_offset, value=cell_value)
+
+    data_end = row_cursor + len(df) - 1
+    if ncols > 0:
+        _format_excel_table_block(ws, data_start, data_end, 1, ncols)
+        _auto_fit_excel_columns(ws, 1, ncols, data_start, data_end)
+
+    return data_end + 3
+
+
 @app.route("/table/<int:document_id>/export-xlsx")
 def export_table_xlsx(document_id):
     doc = db.session.get(DocumentRecord, document_id)
@@ -3256,44 +3311,41 @@ def export_table_xlsx(document_id):
         flash("No table data to export.")
         return redirect(url_for("table_preview", document_id=document_id))
 
-    xlsx_buffer = io.BytesIO()
-    used_names = set()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = safe_excel_sheet_name(
+        Path(doc.original_filename).stem or f"document_{document_id}"
+    )
+
+    row_cursor = 1
+    wrote_content = False
     single_table = len(tables) == 1
-    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
-        wrote_sheet = False
-        for index, table_row in enumerate(tables, start=1):
-            nl_df = html_table_to_dataframe(table_row.html_table)
-            en_df = html_table_to_dataframe(table_row.html_table_en)
 
-            if single_table:
-                nl_sheet = "Table 1 Dutch"
-                en_sheet = "Table 2 English"
-            else:
-                base = safe_excel_sheet_name(
-                    table_row.sheet_name or table_row.preview_title or f"Table {index}"
-                )
-                nl_sheet = f"{base} Dutch"
-                en_sheet = f"{base} English"
+    for index, table_row in enumerate(tables, start=1):
+        if not single_table:
+            section = table_row.sheet_name or table_row.preview_title or f"Table {index}"
+            section_cell = ws.cell(row=row_cursor, column=1, value=section)
+            section_cell.font = Font(bold=True, size=13)
+            row_cursor += 2
 
-            if nl_df is not None and not nl_df.empty:
-                nl_df.to_excel(
-                    writer,
-                    sheet_name=safe_excel_sheet_name(nl_sheet, used_names),
-                    index=False,
-                )
-                wrote_sheet = True
-            if en_df is not None and not en_df.empty:
-                en_df.to_excel(
-                    writer,
-                    sheet_name=safe_excel_sheet_name(en_sheet, used_names),
-                    index=False,
-                )
-                wrote_sheet = True
+        nl_df = html_table_to_dataframe(table_row.html_table)
+        if nl_df is not None and not nl_df.empty:
+            nl_title = "Table 1 - Dutch (Original)" if single_table else f"{section} - Dutch (Original)"
+            row_cursor = _append_dataframe_to_sheet(ws, nl_df, row_cursor, nl_title)
+            wrote_content = True
 
-    if not wrote_sheet:
+        en_df = html_table_to_dataframe(table_row.html_table_en)
+        if en_df is not None and not en_df.empty:
+            en_title = "Table 2 - English (Translation)" if single_table else f"{section} - English (Translation)"
+            row_cursor = _append_dataframe_to_sheet(ws, en_df, row_cursor, en_title)
+            wrote_content = True
+
+    if not wrote_content:
         flash("No table content available to export.")
         return redirect(url_for("table_preview", document_id=document_id))
 
+    xlsx_buffer = io.BytesIO()
+    wb.save(xlsx_buffer)
     xlsx_buffer.seek(0)
     base_name = secure_filename(Path(doc.original_filename).stem or f"document_{document_id}")
     return send_file(
