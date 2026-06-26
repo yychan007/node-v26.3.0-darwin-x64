@@ -1004,7 +1004,7 @@ def extract_text_from_xlsx(path):
     tables = []
     for sheet_name in workbook.sheet_names:
         raw_df = pd.read_excel(workbook, sheet_name=sheet_name, header=None, dtype=object)
-        df = clean_dataframe_for_display(raw_df, max_rows=200)
+        df = normalize_excel_sheet(raw_df)
         if df.empty:
             continue
         tables.append((sheet_name, df))
@@ -1012,6 +1012,55 @@ def extract_text_from_xlsx(path):
         all_parts.append(df.to_string(index=False))
     text = "\n".join(all_parts)
     return text, [(0, len(text), 1)], tables
+
+
+def normalize_excel_sheet(raw_df, max_rows=200):
+    if raw_df is None or raw_df.empty:
+        return pd.DataFrame()
+
+    sheet = raw_df.fillna("").astype(str)
+    for bad in ("nan", "NaN", "None", "<NA>"):
+        sheet = sheet.replace(bad, "")
+
+    header_row_idx = None
+    for idx in range(min(len(sheet), 25)):
+        row_values = [str(value).strip() for value in sheet.iloc[idx].tolist()]
+        non_empty = [value for value in row_values if value]
+        if len(non_empty) >= 2:
+            header_row_idx = idx
+            break
+
+    if header_row_idx is None:
+        return clean_dataframe_for_display(sheet, max_rows=max_rows)
+
+    headers = []
+    for col_idx, value in enumerate(sheet.iloc[header_row_idx].tolist()):
+        label = str(value).strip()
+        headers.append(label or f"Column {col_idx + 1}")
+
+    body = sheet.iloc[header_row_idx + 1 :].copy()
+    body = body.iloc[:, : len(headers)]
+    body.columns = headers
+    body = clean_dataframe_for_display(body, max_rows=max_rows)
+    if body.empty:
+        return body
+
+    title_lines = []
+    for idx in range(header_row_idx):
+        row_text = " ".join(
+            str(value).strip()
+            for value in sheet.iloc[idx].tolist()
+            if str(value).strip()
+        )
+        if row_text:
+            title_lines.append(row_text)
+
+    if title_lines:
+        title_row = {col: "" for col in body.columns}
+        title_row[body.columns[0]] = " | ".join(title_lines)
+        body = pd.concat([pd.DataFrame([title_row]), body], ignore_index=True)
+
+    return body.head(max_rows)
 
 def ocr_pdf(path):
     if not TESSERACT_AVAILABLE:
@@ -1329,16 +1378,58 @@ def save_table_previews(doc_id, tables):
         db.session.add(row)
 
 
-def table_preview_needs_refresh(tables):
+def table_preview_needs_regenerate(tables):
     if not tables:
         return True
     for row in tables:
         html = row.html_table or ""
         if "NaN" in html or "Unnamed:" in html:
             return True
-        if translation.translation_enabled() and not (row.html_table_en or "").strip():
+    return False
+
+
+def table_preview_needs_translation(tables):
+    if not translation.translation_enabled():
+        return False
+    for row in tables:
+        if not (row.html_table_en or "").strip():
             return True
     return False
+
+
+def refresh_table_translations_from_cache(tables):
+    updated = False
+    for row in tables:
+        if (row.html_table_en or "").strip() and "NaN" not in (row.html_table or ""):
+            continue
+        if not (row.csv_text or "").strip():
+            continue
+        try:
+            df = pd.read_csv(
+                io.StringIO(row.csv_text), dtype=str, keep_default_na=False
+            )
+            html_table, preview_df = build_table_html(df)
+            if preview_df.empty:
+                continue
+            row.html_table = html_table
+            row.html_table_en = ""
+            if translation.translation_enabled():
+                en_df = translation.translate_dataframe_values(
+                    preview_df,
+                    cache_get=get_cached_translation,
+                    cache_set=store_cached_translation,
+                    max_cells=TRANSLATE_MAX_CELLS,
+                )
+                en_df = clean_dataframe_for_display(en_df, max_rows=40)
+                row.html_table_en = en_df.to_html(
+                    index=False, classes="data-table", border=0, na_rep=""
+                )
+            updated = True
+        except Exception as exc:
+            print(f"Cached table translation failed for preview {row.id}: {exc}")
+    if updated:
+        db.session.commit()
+    return updated
 
 
 def regenerate_table_previews(doc_record):
@@ -1908,10 +1999,6 @@ HOME_TEMPLATE = """
         <h3>Results for "{{ query }}"</h3>
 
 <div style="margin:12px 0 18px 0;">
-    <a href="{{ url_for('export_search_csv', q=query) }}"
-       style="display:inline-block; padding:10px 16px; background:#198754; color:#fff; text-decoration:none; border-radius:8px; font-weight:700; margin-right:8px;">
-        Export CSV
-    </a>
     <a href="{{ url_for('export_search_xlsx', q=query) }}"
        style="display:inline-block; padding:10px 16px; background:#0d6efd; color:#fff; text-decoration:none; border-radius:8px; font-weight:700;">
         Export Excel
@@ -1935,7 +2022,6 @@ HOME_TEMPLATE = """
                         File: <strong>{{ res.filename }}</strong>
                         | Page: <strong>{{ res.page or '?' }}</strong>
                         | Category: <strong>{{ res.category }}</strong>
-                        | Relevance: <strong>{{ res.relevance }}</strong>
                         {% if res.ocr_used %}| <strong>OCR used</strong>{% endif %}
                     </div>
 
@@ -2575,6 +2661,9 @@ TABLE_TEMPLATE = """
         {% if current_user.is_authenticated and current_user.is_admin %}
         <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
         {% endif %}
+        {% if tables %}
+        <a class="btn btn-purple" href="{{ url_for('export_table_xlsx', document_id=doc.id) }}">Export Excel</a>
+        {% endif %}
     </div>
 
     {% if tables %}
@@ -2987,19 +3076,35 @@ def table_preview(document_id):
 
     tables = TablePreview.query.filter_by(document_id=document_id).all()
     error_msg = ""
-    if doc.extension.lower() in {"csv", "xlsx"} and table_preview_needs_refresh(tables):
+    file_available = storage.document_exists(doc.stored_filename, DOC_FOLDER)
+
+    if (
+        file_available
+        and doc.extension.lower() in {"csv", "xlsx"}
+        and table_preview_needs_regenerate(tables)
+    ):
         try:
             tables = regenerate_table_previews(doc)
             if not tables:
                 error_msg = "The spreadsheet has no readable sheets or table data."
         except FileNotFoundError:
-            error_msg = (
-                "Source file not found. It may have been lost after a restart. "
-                "Configure Supabase Storage and upload the file again."
-            )
+            file_available = False
         except Exception as exc:
             print(f"Table preview regeneration error for document {document_id}: {exc}")
             error_msg = f"Could not build table preview: {exc}"
+
+    if tables and table_preview_needs_translation(tables):
+        refresh_table_translations_from_cache(tables)
+        tables = TablePreview.query.filter_by(document_id=document_id).all()
+
+    if not tables and not file_available:
+        error_msg = (
+            f"Source file '{doc.original_filename}' was not found in storage. "
+            "Please go to Documents, delete this entry, upload the Excel file again, "
+            "then click Reindex."
+        )
+    elif not tables and file_available:
+        error_msg = error_msg or "No readable table data was found in this spreadsheet."
 
     return render_template_string(
         TABLE_TEMPLATE, doc=doc, tables=tables, error_msg=error_msg
@@ -3115,69 +3220,72 @@ def page_image(document_id):
         return Response(status=404)
     return send_file(io.BytesIO(image_data[0]), mimetype=image_data[1])
 
-@app.route("/export-search-csv")
-def export_search_csv():
-    query = request.args.get("q", "").strip()
-    if not query:
-        flash("Please enter a search query first.")
-        return redirect(url_for("home"))
+def safe_excel_sheet_name(name, used_names=None):
+    value = re.sub(r"[\\/*?:\[\]]+", "_", str(name or "Sheet")).strip(" .")
+    if not value:
+        value = "Sheet"
+    value = value[:31]
+    if used_names is not None:
+        base = value
+        suffix = 1
+        while value in used_names:
+            tail = f"_{suffix}"
+            value = f"{base[:31 - len(tail)]}{tail}"
+            suffix += 1
+        used_names.add(value)
+    return value
 
-    results, expanded_terms = search_requirements(query, top_k=1000)
 
-    output = io.StringIO()
-    writer = csv.writer(output)
+@app.route("/table/<int:document_id>/export-xlsx")
+def export_table_xlsx(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc:
+        abort(404)
 
-    writer.writerow([
-        "query",
-        "expanded_terms",
-        "relevance",
-        "requirement_id",
-        "title",
-        "summary",
-        "section",
-        "category",
-        "definition",
-        "page",
-        "filename",
-        "full_text",
-        "snippet",
-        "is_pdf",
-        "has_table",
-        "ocr_used"
-    ])
+    tables = TablePreview.query.filter_by(document_id=document_id).all()
+    if not tables:
+        flash("No table data to export.")
+        return redirect(url_for("table_preview", document_id=document_id))
 
-    for res in results:
-        writer.writerow([
-            query,
-            ", ".join(expanded_terms),
-            res.get("relevance", ""),
-            res.get("requirement_id", ""),
-            res.get("title", ""),
-            res.get("summary", ""),
-            res.get("section", ""),
-            res.get("category", ""),
-            res.get("definition", ""),
-            res.get("page", ""),
-            res.get("filename", ""),
-            res.get("full_text", ""),
-            re.sub(r"<[^>]+>", "", res.get("snippet", "")),  # remove highlight html
-            "yes" if res.get("is_pdf") else "no",
-            "yes" if res.get("has_table") else "no",
-            "yes" if res.get("ocr_used") else "no",
-        ])
+    xlsx_buffer = io.BytesIO()
+    used_names = set()
+    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
+        for table_row in tables:
+            base = safe_excel_sheet_name(
+                table_row.sheet_name or table_row.preview_title or "Sheet"
+            )
+            if table_row.csv_text:
+                nl_df = pd.read_csv(
+                    io.StringIO(table_row.csv_text),
+                    dtype=str,
+                    keep_default_na=False,
+                )
+                nl_df.to_excel(
+                    writer,
+                    sheet_name=safe_excel_sheet_name(f"{base}_NL", used_names),
+                    index=False,
+                )
+            if table_row.html_table_en:
+                try:
+                    en_dfs = pd.read_html(io.StringIO(table_row.html_table_en))
+                    if en_dfs:
+                        en_dfs[0].astype(str).to_excel(
+                            writer,
+                            sheet_name=safe_excel_sheet_name(f"{base}_EN", used_names),
+                            index=False,
+                        )
+                except Exception as exc:
+                    print(f"Table EN export parse error: {exc}")
 
-    csv_bytes = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-    output.close()
-
-    safe_query = re.sub(r"[^a-zA-Z0-9_-]+", "_", query)[:80] or "search"
-    filename = f"search_results_{safe_query}.csv"
-
+    xlsx_buffer.seek(0)
+    base_name = secure_filename(Path(doc.original_filename).stem or f"document_{document_id}")
     return send_file(
-        csv_bytes,
-        mimetype="text/csv; charset=utf-8",
+        xlsx_buffer,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
-        download_name=filename
+        download_name=f"{base_name}_tables.xlsx",
     )
+
 
 @app.route("/export-search-xlsx")
 def export_search_xlsx():
@@ -3193,7 +3301,6 @@ def export_search_xlsx():
         rows.append({
             "query": query,
             "expanded_terms": ", ".join(expanded_terms),
-            "relevance": res.get("relevance", ""),
             "requirement_id": res.get("requirement_id", ""),
             "title": res.get("title", ""),
             "summary": res.get("summary", ""),
@@ -3204,6 +3311,7 @@ def export_search_xlsx():
             "filename": res.get("filename", ""),
             "full_text": res.get("full_text", ""),
             "snippet": re.sub(r"<[^>]+>", "", res.get("snippet", "")),
+            "snippet_en": re.sub(r"<[^>]+>", "", res.get("snippet_en", "")),
             "is_pdf": "yes" if res.get("is_pdf") else "no",
             "has_table": "yes" if res.get("has_table") else "no",
             "ocr_used": "yes" if res.get("ocr_used") else "no",
