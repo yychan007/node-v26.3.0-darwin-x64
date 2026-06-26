@@ -8,3 +8,6 @@ pdfplumber
 Pillow
 PyMuPDF
 python-docx
+boto3
+psycopg[binary]>=3.1.18
+deep-translator
