@@ -1998,13 +1998,6 @@ HOME_TEMPLATE = """
 
         <h3>Results for "{{ query }}"</h3>
 
-<div style="margin:12px 0 18px 0;">
-    <a href="{{ url_for('export_search_xlsx', q=query) }}"
-       style="display:inline-block; padding:10px 16px; background:#0d6efd; color:#fff; text-decoration:none; border-radius:8px; font-weight:700;">
-        Export Excel
-    </a>
-</div>
-
         {% if results %}
             {% for res in results %}
                 <div class="result-item">
@@ -3236,6 +3229,22 @@ def safe_excel_sheet_name(name, used_names=None):
     return value
 
 
+def html_table_to_dataframe(html):
+    if not (html or "").strip():
+        return None
+    try:
+        frames = pd.read_html(io.StringIO(html))
+        if not frames:
+            return None
+        df = frames[0].fillna("").astype(str)
+        for bad in ("nan", "NaN", "None", "<NA>"):
+            df = df.replace(bad, "")
+        return df
+    except Exception as exc:
+        print(f"HTML table parse error: {exc}")
+        return None
+
+
 @app.route("/table/<int:document_id>/export-xlsx")
 def export_table_xlsx(document_id):
     doc = db.session.get(DocumentRecord, document_id)
@@ -3249,33 +3258,41 @@ def export_table_xlsx(document_id):
 
     xlsx_buffer = io.BytesIO()
     used_names = set()
+    single_table = len(tables) == 1
     with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
-        for table_row in tables:
-            base = safe_excel_sheet_name(
-                table_row.sheet_name or table_row.preview_title or "Sheet"
-            )
-            if table_row.csv_text:
-                nl_df = pd.read_csv(
-                    io.StringIO(table_row.csv_text),
-                    dtype=str,
-                    keep_default_na=False,
+        wrote_sheet = False
+        for index, table_row in enumerate(tables, start=1):
+            nl_df = html_table_to_dataframe(table_row.html_table)
+            en_df = html_table_to_dataframe(table_row.html_table_en)
+
+            if single_table:
+                nl_sheet = "Table 1 Dutch"
+                en_sheet = "Table 2 English"
+            else:
+                base = safe_excel_sheet_name(
+                    table_row.sheet_name or table_row.preview_title or f"Table {index}"
                 )
+                nl_sheet = f"{base} Dutch"
+                en_sheet = f"{base} English"
+
+            if nl_df is not None and not nl_df.empty:
                 nl_df.to_excel(
                     writer,
-                    sheet_name=safe_excel_sheet_name(f"{base}_NL", used_names),
+                    sheet_name=safe_excel_sheet_name(nl_sheet, used_names),
                     index=False,
                 )
-            if table_row.html_table_en:
-                try:
-                    en_dfs = pd.read_html(io.StringIO(table_row.html_table_en))
-                    if en_dfs:
-                        en_dfs[0].astype(str).to_excel(
-                            writer,
-                            sheet_name=safe_excel_sheet_name(f"{base}_EN", used_names),
-                            index=False,
-                        )
-                except Exception as exc:
-                    print(f"Table EN export parse error: {exc}")
+                wrote_sheet = True
+            if en_df is not None and not en_df.empty:
+                en_df.to_excel(
+                    writer,
+                    sheet_name=safe_excel_sheet_name(en_sheet, used_names),
+                    index=False,
+                )
+                wrote_sheet = True
+
+    if not wrote_sheet:
+        flash("No table content available to export.")
+        return redirect(url_for("table_preview", document_id=document_id))
 
     xlsx_buffer.seek(0)
     base_name = secure_filename(Path(doc.original_filename).stem or f"document_{document_id}")
@@ -3286,55 +3303,6 @@ def export_table_xlsx(document_id):
         download_name=f"{base_name}_tables.xlsx",
     )
 
-
-@app.route("/export-search-xlsx")
-def export_search_xlsx():
-    query = request.args.get("q", "").strip()
-    if not query:
-        flash("Please enter a search query first.")
-        return redirect(url_for("home"))
-
-    results, expanded_terms = search_requirements(query, top_k=5000)
-
-    rows = []
-    for res in results:
-        rows.append({
-            "query": query,
-            "expanded_terms": ", ".join(expanded_terms),
-            "requirement_id": res.get("requirement_id", ""),
-            "title": res.get("title", ""),
-            "summary": res.get("summary", ""),
-            "section": res.get("section", ""),
-            "category": res.get("category", ""),
-            "definition": res.get("definition", ""),
-            "page": res.get("page", ""),
-            "filename": res.get("filename", ""),
-            "full_text": res.get("full_text", ""),
-            "snippet": re.sub(r"<[^>]+>", "", res.get("snippet", "")),
-            "snippet_en": re.sub(r"<[^>]+>", "", res.get("snippet_en", "")),
-            "is_pdf": "yes" if res.get("is_pdf") else "no",
-            "has_table": "yes" if res.get("has_table") else "no",
-            "ocr_used": "yes" if res.get("ocr_used") else "no",
-            "is_image": "yes" if res.get("is_image") else "no",
-        })
-
-    df = pd.DataFrame(rows)
-
-    xlsx_buffer = io.BytesIO()
-    with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="search_results")
-
-    xlsx_buffer.seek(0)
-
-    safe_query = re.sub(r"[^a-zA-Z0-9_-]+", "_", query)[:80] or "search"
-    filename = f"search_results_{safe_query}.xlsx"
-
-    return send_file(
-        xlsx_buffer,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        as_attachment=True,
-        download_name=filename
-    )
 
 @app.route("/delete-multiple", methods=["POST"])
 @login_required
