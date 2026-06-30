@@ -2118,8 +2118,10 @@ BASE_CSS = """
 <style>
 body { font-family: Arial, sans-serif; margin: 24px; background:#f5f7fb; color:#222; }
 .container { max-width: 1280px; margin:auto; background:#fff; padding:24px; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.08); }
-.topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
-.actions { display:flex; gap:8px; flex-wrap:wrap; }
+.topbar { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:nowrap; }
+.topbar-brand { flex:1 1 auto; min-width:0; }
+.topbar-brand h1 { margin:0 0 6px 0; line-height:1.2; }
+.actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; align-items:flex-start; flex:0 0 auto; margin-left:auto; }
 input[type=text], input[type=password], input[type=file], select { padding:10px; font-size:15px; }
 input[type=text] { width:68%; min-width:280px; }
 button, .btn { padding:10px 16px; border:none; border-radius:6px; text-decoration:none; color:white; cursor:pointer; display:inline-block; }
@@ -2231,7 +2233,12 @@ a:hover { text-decoration:underline; }
 .page-img-preview { max-width:200px; max-height:200px; border:1px solid #ccc; margin-right:16px; float:left; cursor:pointer; transition: transform 0.2s; }
 .page-img-preview:hover { transform: scale(1.02); }
 .clearfix::after { content:""; display:table; clear:both; }
-@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } input[type=text] { width:100%; } }
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+  input[type=text] { width:100%; }
+  .topbar { flex-wrap:wrap; }
+  .actions { width:100%; justify-content:flex-end; }
+}
 </style>
 """
 
@@ -2246,7 +2253,7 @@ HOME_TEMPLATE = """
 <body>
 <div class="container">
     <div class="topbar">
-        <div>
+        <div class="topbar-brand">
             <h1>Technical Standards Search Portal</h1>
             <div class="small">Requirement-level search for PDF, TXT, CSV, XLSX, DOCX</div>
         </div>
