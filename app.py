@@ -350,6 +350,7 @@ class RequirementBlock(db.Model):
     requirement_id = db.Column(db.String(120), index=True)
     title = db.Column(db.String(500), default="")
     section = db.Column(db.String(300), default="")
+    major_section = db.Column(db.String(300), default="")
     page = db.Column(db.Integer, default=1)
     char_start = db.Column(db.Integer, default=0)
     category = db.Column(db.String(120), default="General")
@@ -1300,7 +1301,55 @@ def normalize_requirement_text(content):
     return text
 
 
-SECTION_HEADER_REGEX = re.compile(r"(?m)^(\d+(?:\.\d+)+)\s+(.+)$")
+SECTION_HEADER_REGEX = re.compile(
+    r"(?m)^(\d+(?:\.\d+)*)\s+(.+)$"
+)
+
+
+def clean_section_title(title):
+    value = (title or "").strip()
+    value = re.sub(r"\.{2,}.*$", "", value).strip()
+    value = re.sub(r"\s+\d+$", "", value).strip()
+    return value
+
+
+def parse_document_sections(content):
+    sections = []
+    for match in SECTION_HEADER_REGEX.finditer(content or ""):
+        num = match.group(1).strip()
+        title = clean_section_title(match.group(2))
+        if not title or len(title) < 3 or len(title) > 200:
+            continue
+        if title.lower().startswith(("page ", "pagina ")):
+            continue
+        sections.append(
+            {
+                "char_start": match.start(),
+                "num": num,
+                "title": title,
+                "label": f"{num} {title}",
+            }
+        )
+    return sections
+
+
+def get_major_section_for_position(sections, char_pos):
+    major = ""
+    for sec in sections:
+        if sec["char_start"] > char_pos:
+            break
+        if re.fullmatch(r"\d+", sec["num"]):
+            major = sec["label"]
+    return major
+
+
+def get_nearest_section_for_position(sections, char_pos):
+    nearest = ""
+    for sec in sections:
+        if sec["char_start"] > char_pos:
+            break
+        nearest = sec["label"]
+    return nearest
 
 
 def parse_section_blocks(content, page_offsets):
@@ -1317,7 +1366,7 @@ def parse_section_blocks(content, page_offsets):
             continue
 
         section_num = match.group(1)
-        section_title = match.group(2).strip()
+        section_title = clean_section_title(match.group(2))
         page = get_page_number(page_offsets, start)
         lines = [line.strip() for line in block_text.splitlines() if line.strip()]
         summary = ""
@@ -1344,6 +1393,7 @@ def parse_section_blocks(content, page_offsets):
 
 def parse_requirement_blocks(content, page_offsets):
     content = normalize_requirement_text(content)
+    doc_sections = parse_document_sections(content)
     matches = list(REQ_ID_REGEX.finditer(content))
     blocks = []
 
@@ -1358,7 +1408,8 @@ def parse_requirement_blocks(content, page_offsets):
             lines = [line.strip() for line in block_text.splitlines() if line.strip()]
             title = ""
             summary = ""
-            section = ""
+            section = get_nearest_section_for_position(doc_sections, start)
+            major_section = get_major_section_for_position(doc_sections, start)
             definition = ""
 
             if len(lines) >= 2:
@@ -1369,8 +1420,8 @@ def parse_requirement_blocks(content, page_offsets):
 
             for idx, line in enumerate(lines):
                 low = line.lower()
-                if re.match(r"^\d+(\.\d+)*\s+", line):
-                    section = line
+                if not section and re.match(r"^\d+(?:\.\d+)*\s+", line):
+                    section = clean_section_title(line)
                     break
                 if low.startswith(("de ", "het ", "een ", "opdrachtnemer ", "the ")):
                     summary = line
@@ -1391,6 +1442,7 @@ def parse_requirement_blocks(content, page_offsets):
                 "requirement_id": req_id,
                 "title": title,
                 "section": section,
+                "major_section": major_section,
                 "page": page,
                 "char_start": start,
                 "category": category,
@@ -1650,6 +1702,7 @@ def index_document_record(doc_record):
             requirement_id=b["requirement_id"],
             title=b["title"],
             section=b["section"],
+            major_section=b.get("major_section", ""),
             page=b["page"],
             char_start=b.get("char_start", 0),
             category=b["category"],
@@ -1701,8 +1754,9 @@ def lexical_score(block, query, active_terms, exact_terms=None):
     full_text = (block.full_text or "").lower()
     req_id = (block.requirement_id or "").lower()
     section = (block.section or "").lower()
+    major_section = (getattr(block, "major_section", "") or "").lower()
     category = (block.category or "").lower()
-    combined = " ".join([title, summary, definition, full_text, req_id, section, category])
+    combined = " ".join([title, summary, definition, full_text, req_id, section, major_section, category])
 
     matched_active = any(term_matches_text(term, combined) for term in active_terms)
     if not matched_active and not any(
@@ -1748,10 +1802,12 @@ def lexical_score(block, query, active_terms, exact_terms=None):
             score += 22
         if term_matches_text(term, full_text):
             score += 30
-        if term_matches_text(term, req_id):
-            score += 25
         if term_matches_text(term, section):
             score += 18
+        if term_matches_text(term, major_section):
+            score += 24
+        if term_matches_text(term, req_id):
+            score += 25
         if term_matches_text(term, category):
             score += 10
 
@@ -1760,6 +1816,8 @@ def lexical_score(block, query, active_terms, exact_terms=None):
         score += 30
     if q and q in section:
         score += 10
+    if q and q in major_section:
+        score += 14
     if q and q in category:
         score += 6
 
@@ -2045,6 +2103,7 @@ def search_requirements(query, top_k=30, active_terms=None):
             "requirement_id": row.requirement_id,
             "title": row.title,
             "section": row.section,
+            "major_section": getattr(row, "major_section", "") or "",
             "category": row.category,
             "definition": row.definition,
             "summary": row.summary,
@@ -2411,6 +2470,9 @@ HOME_TEMPLATE = """
                     <div class="meta">
                         File: <strong>{{ res.filename }}</strong>
                         | Page: <strong>{{ res.page or '?' }}</strong>
+                        {% if res.major_section or res.section %}
+                        | Section: <strong>{{ res.major_section or res.section }}</strong>
+                        {% endif %}
                         | Category: <strong>{{ res.category }}</strong>
                         {% if res.ocr_used %}| <strong>OCR used</strong>{% endif %}
                     </div>
@@ -2421,7 +2483,9 @@ HOME_TEMPLATE = """
                     {% if res.summary %}
                         <div><strong>Summary:</strong> {{ res.summary }}</div>
                     {% endif %}
-                    {% if res.section %}
+                    {% if res.section and res.major_section and res.section != res.major_section %}
+                        <div><strong>Subsection:</strong> {{ res.section }}</div>
+                    {% elif res.section and not res.major_section %}
                         <div><strong>Section:</strong> {{ res.section }}</div>
                     {% endif %}
 
@@ -2488,7 +2552,8 @@ REQUIREMENT_TEMPLATE = """
         <div><strong>Document:</strong> {{ block.document.original_filename }}</div>
         <div><strong>Page:</strong> {{ block.page }}</div>
         <div><strong>Category:</strong> {{ block.category }}</div>
-        {% if block.section %}<div><strong>Section:</strong> {{ block.section }}</div>{% endif %}
+        {% if block.major_section %}<div><strong>Section:</strong> {{ block.major_section }}</div>{% endif %}
+        {% if block.section and block.section != block.major_section %}<div><strong>Subsection:</strong> {{ block.section }}</div>{% endif %}
         {% if block.definition %}<div><strong>Definition:</strong> {{ block.definition }}</div>{% endif %}
         {% if block.summary %}<div><strong>Summary:</strong> {{ block.summary }}</div>{% endif %}
     </div>
@@ -2795,7 +2860,8 @@ REQUIREMENT_TEMPLATE = """
         <div><strong>Document:</strong> {{ block.document.original_filename }}</div>
         <div><strong>Page:</strong> {{ block.page }}</div>
         <div><strong>Category:</strong> {{ block.category }}</div>
-        {% if block.section %}<div><strong>Section:</strong> {{ block.section }}</div>{% endif %}
+        {% if block.major_section %}<div><strong>Section:</strong> {{ block.major_section }}</div>{% endif %}
+        {% if block.section and block.section != block.major_section %}<div><strong>Subsection:</strong> {{ block.section }}</div>{% endif %}
         {% if block.definition %}<div><strong>Definition:</strong> {{ block.definition }}</div>{% endif %}
         {% if block.summary %}<div><strong>Summary:</strong> {{ block.summary }}</div>{% endif %}
     </div>
@@ -3558,6 +3624,7 @@ def requirement_detail(block_id):
         "requirement_id": block.requirement_id,
         "title": block.title,
         "section": block.section,
+        "major_section": getattr(block, "major_section", "") or "",
         "page": block.page,
         "category": block.category,
         "definition": block.definition,
@@ -4017,6 +4084,9 @@ def ensure_schema():
     block_cols = {col["name"] for col in inspector.get_columns("requirement_blocks")}
     if "char_start" not in block_cols:
         db.session.execute(text("ALTER TABLE requirement_blocks ADD COLUMN char_start INTEGER DEFAULT 0"))
+        db.session.commit()
+    if "major_section" not in block_cols:
+        db.session.execute(text("ALTER TABLE requirement_blocks ADD COLUMN major_section VARCHAR(300)"))
         db.session.commit()
 
     table_cols = {col["name"] for col in inspector.get_columns("table_previews")}
