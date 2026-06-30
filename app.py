@@ -39,6 +39,7 @@ import uuid
 import hashlib
 import secrets
 import zipfile
+import tempfile
 import mimetypes
 from datetime import datetime
 from collections import defaultdict, Counter
@@ -1357,6 +1358,7 @@ def parse_section_blocks(content, page_offsets):
     if not matches:
         return []
 
+    doc_sections = parse_document_sections(content)
     blocks = []
     for i, match in enumerate(matches):
         start = match.start()
@@ -1379,6 +1381,7 @@ def parse_section_blocks(content, page_offsets):
             "requirement_id": f"Section-{section_num}",
             "title": section_title,
             "section": f"{section_num} {section_title}",
+            "major_section": get_major_section_for_position(doc_sections, start),
             "page": page,
             "char_start": start,
             "category": detect_category(block_text, section_title),
@@ -1458,6 +1461,7 @@ def parse_requirement_blocks(content, page_offsets):
         return section_blocks
 
     # Fallback: paragraph blocks
+    doc_sections = parse_document_sections(content)
     parts = re.split(r"\n\s*\n+", content)
     cursor = 0
     for part in parts:
@@ -1476,7 +1480,8 @@ def parse_requirement_blocks(content, page_offsets):
         blocks.append({
             "requirement_id": "",
             "title": title,
-            "section": "",
+            "section": get_nearest_section_for_position(doc_sections, pos),
+            "major_section": get_major_section_for_position(doc_sections, pos),
             "page": page,
             "char_start": pos,
             "category": category,
@@ -1665,6 +1670,14 @@ def remove_existing_blocks(doc_id):
     db.session.commit()
 
 def index_document_record(doc_record):
+    try:
+        _index_document_record_impl(doc_record)
+    except Exception as exc:
+        db.session.rollback()
+        raise
+
+
+def _index_document_record_impl(doc_record):
     if not storage.document_exists(doc_record.stored_filename, DOC_FOLDER):
         raise FileNotFoundError(
             f"Stored file not found: {doc_record.stored_filename}. "
@@ -2319,9 +2332,6 @@ HOME_TEMPLATE = """
         <div class="actions">
             {% if current_user.is_authenticated %}
                 <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
-                {% if translation_enabled %}
-                <a class="btn btn-green" href="{{ url_for('ai_translate_tool') }}">AI Translate</a>
-                {% endif %}
                 {% if current_user.is_admin %}
                     <a class="btn btn-purple" href="{{ url_for('upload_files') }}">Upload</a>
                     <a class="btn btn-orange" href="{{ url_for('admin_documents') }}">Documents</a>
@@ -3464,26 +3474,48 @@ def upload_files():
         abort(403)
 
     if request.method == "POST":
-        files = request.files.getlist("files")
-        if not files or all(f.filename == "" for f in files):
-            flash("No files selected.")
+        try:
+            return _handle_upload_post()
+        except Exception as exc:
+            db.session.rollback()
+            print(f"Upload route error: {exc}")
+            flash(f"Upload failed: {exc}")
             return redirect(url_for("upload_files"))
 
-        uploaded_count = 0
-        skipped_count = 0
-        restored_count = 0
+    return render_template_string(
+        UPLOAD_TEMPLATE,
+        allowed_extensions=", ".join(sorted(ALLOWED_EXTENSIONS)),
+        storage_backend=storage.storage_backend_name(),
+        storage_persistent=storage.object_storage_enabled(),
+    )
 
-        for file in files:
-            if not file or file.filename == "":
-                continue
-            if not allowed_file(file.filename):
-                flash(f"File type not allowed: {file.filename}")
-                continue
 
-            original_filename = secure_filename(file.filename)
-            ext = file_ext(original_filename)
+def _handle_upload_post():
+    files = request.files.getlist("files")
+    if not files or all(f.filename == "" for f in files):
+        flash("No files selected.")
+        return redirect(url_for("upload_files"))
 
-            temp_path = os.path.join(DOC_FOLDER, f"temp_{uuid.uuid4().hex}.{ext}")
+    uploaded_count = 0
+    skipped_count = 0
+    restored_count = 0
+
+    for file in files:
+        if not file or file.filename == "":
+            continue
+        if not allowed_file(file.filename):
+            flash(f"File type not allowed: {file.filename}")
+            continue
+
+        original_filename = secure_filename(file.filename)
+        if not original_filename:
+            flash("Invalid filename.")
+            continue
+        ext = file_ext(original_filename)
+
+        temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
+        os.close(temp_fd)
+        try:
             file.save(temp_path)
             file_hash = sha256_of_file(temp_path)
 
@@ -3499,24 +3531,21 @@ def upload_files():
                         restored_count += 1
                     except Exception as exc:
                         db.session.rollback()
-                        if os.path.exists(temp_path):
-                            os.remove(temp_path)
                         flash(
                             f"Could not restore duplicate file {original_filename}: {exc}"
                         )
                 else:
-                    os.remove(temp_path)
                     flash(f"Duplicate file skipped: {original_filename}")
                     skipped_count += 1
                 continue
 
             stored_filename = f"{uuid.uuid4().hex}.{ext}"
             try:
-                size_bytes = storage.save_document(stored_filename, temp_path, DOC_FOLDER)
+                size_bytes = storage.save_document(
+                    stored_filename, temp_path, DOC_FOLDER
+                )
                 storage.verify_document_stored(stored_filename, DOC_FOLDER)
             except Exception as exc:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
                 flash(f"Upload failed for {original_filename}: {exc}")
                 continue
 
@@ -3529,34 +3558,39 @@ def upload_files():
                 uploaded_by=current_user.id,
             )
             db.session.add(doc)
-            db.session.commit()
+            try:
+                db.session.commit()
+            except Exception as exc:
+                db.session.rollback()
+                storage.delete_document(stored_filename, DOC_FOLDER)
+                flash(f"Database error for {original_filename}: {exc}")
+                continue
+
             try:
                 index_document_record(doc)
-            except Exception as e:
-                flash(f"Indexing error for {original_filename}: {str(e)}")
+            except Exception as exc:
+                db.session.rollback()
+                print(f"Indexing error for {original_filename}: {exc}")
+                flash(f"File saved but indexing failed for {original_filename}: {exc}")
 
             uploaded_count += 1
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-        summary_parts = []
-        if uploaded_count:
-            summary_parts.append(f"uploaded {uploaded_count}")
-        if restored_count:
-            summary_parts.append(f"restored {restored_count}")
-        if skipped_count:
-            summary_parts.append(f"skipped {skipped_count} duplicate(s)")
-        flash(
-            "Upload complete: " + ", ".join(summary_parts) + "."
-            if summary_parts
-            else "No files were uploaded."
-        )
-        return redirect(url_for("upload_files"))
-
-    return render_template_string(
-        UPLOAD_TEMPLATE,
-        allowed_extensions=", ".join(sorted(ALLOWED_EXTENSIONS)),
-        storage_backend=storage.storage_backend_name(),
-        storage_persistent=storage.object_storage_enabled(),
+    summary_parts = []
+    if uploaded_count:
+        summary_parts.append(f"uploaded {uploaded_count}")
+    if restored_count:
+        summary_parts.append(f"restored {restored_count}")
+    if skipped_count:
+        summary_parts.append(f"skipped {skipped_count} duplicate(s)")
+    flash(
+        "Upload complete: " + ", ".join(summary_parts) + "."
+        if summary_parts
+        else "No files were uploaded."
     )
+    return redirect(url_for("upload_files"))
 
 @app.route("/admin/documents")
 @login_required
