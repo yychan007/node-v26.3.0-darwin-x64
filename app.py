@@ -448,6 +448,72 @@ def expand_query_tokens(tokens):
         out.extend(variants)
     return list(dict.fromkeys(out))
 
+
+def get_all_expanded_terms(query):
+    q = (query or "").strip().lower()
+    terms = []
+    if q:
+        terms.append(q)
+    for token in preprocess(query):
+        terms.extend(expand_query_tokens([token]))
+    return list(dict.fromkeys(terms))
+
+
+def default_exact_search_terms(query):
+    tokens = preprocess(query)
+    if tokens:
+        return tokens
+    q = (query or "").strip().lower()
+    return [q] if q else []
+
+
+def resolve_active_search_terms(query, selected_terms=None):
+    all_terms = get_all_expanded_terms(query)
+    if not selected_terms:
+        return default_exact_search_terms(query)
+
+    allowed = {term.lower() for term in all_terms}
+    active = []
+    for raw in selected_terms:
+        value = (raw or "").strip().lower()
+        if value not in allowed:
+            continue
+        for candidate in all_terms:
+            if candidate.lower() == value:
+                active.append(candidate)
+                break
+    return list(dict.fromkeys(active)) or default_exact_search_terms(query)
+
+
+def term_matches_text(term, text):
+    value = (term or "").strip().lower()
+    haystack = (text or "").lower()
+    if not value or not haystack:
+        return False
+    if " " in value:
+        return value in haystack
+    return re.search(r"\b" + re.escape(value) + r"\b", haystack) is not None
+
+
+def count_exact_term_hits(block, query, exact_terms):
+    combined = " ".join(
+        [
+            block.title or "",
+            block.summary or "",
+            block.definition or "",
+            block.full_text or "",
+            block.requirement_id or "",
+        ]
+    )
+    hits = 0
+    q = (query or "").strip().lower()
+    if q and q in combined.lower():
+        hits += 3
+    for term in exact_terms:
+        if term_matches_text(term, combined):
+            hits += 1
+    return hits
+
 def detect_category(text, title=""):
     combined = f"{title} {text}".lower()
     if "emc" in combined and "aard" in combined:
@@ -878,6 +944,12 @@ def find_hit_position(text, expanded_tokens, query=""):
     q = (query or "").lower().strip()
     if q and q in text_lower:
         return text_lower.find(q)
+
+    exact_terms = default_exact_search_terms(query)
+    for term in exact_terms:
+        match = re.search(r"\b" + re.escape(term.lower()) + r"\b", text_lower)
+        if match:
+            return match.start()
 
     hit_pos = -1
     for term in expanded_tokens:
@@ -1601,12 +1673,22 @@ def dedupe_lookup(file_hash):
     return DocumentRecord.query.filter_by(file_hash=file_hash).first()
 
 
+def restore_document_file_from_temp(doc, temp_path):
+    size_bytes = storage.save_document(doc.stored_filename, temp_path, DOC_FOLDER)
+    storage.verify_document_stored(doc.stored_filename, DOC_FOLDER)
+    doc.size_bytes = size_bytes
+    db.session.commit()
+    return size_bytes
+
+
 # =========================================================
 # Search
 # =========================================================
-def lexical_score(block, query, expanded_tokens):
+def lexical_score(block, query, active_terms, exact_terms=None):
     score = 0.0
     q = query.lower().strip()
+    exact_terms = exact_terms or default_exact_search_terms(query)
+    synonym_terms = [t for t in active_terms if t.lower() not in {e.lower() for e in exact_terms}]
 
     doc = block.document
     filename = (doc.original_filename or "").lower()
@@ -1620,7 +1702,14 @@ def lexical_score(block, query, expanded_tokens):
     req_id = (block.requirement_id or "").lower()
     section = (block.section or "").lower()
     category = (block.category or "").lower()
-    tokens = set((block.token_blob or "").split())
+    combined = " ".join([title, summary, definition, full_text, req_id, section, category])
+
+    matched_active = any(term_matches_text(term, combined) for term in active_terms)
+    if not matched_active and not any(
+        term_matches_text(term, " ".join([filename, stored_filename, filename_no_ext]))
+        for term in active_terms
+    ):
+        return 0.0
 
     # Strong exact filename matches
     if q and q == filename:
@@ -1638,25 +1727,41 @@ def lexical_score(block, query, expanded_tokens):
     if q and q in filename_no_ext:
         score += 35
 
-    # Existing scoring
+    # Exact query phrase / token matches (highest priority in content)
+    if q and q in title:
+        score += 45
+    if q and q in summary:
+        score += 35
+    if q and q in definition:
+        score += 35
+    if q and q in full_text:
+        score += 40
+    if q and len(q.split()) > 1 and q in full_text:
+        score += 15
+
+    for term in exact_terms:
+        if term_matches_text(term, title):
+            score += 28
+        if term_matches_text(term, summary):
+            score += 22
+        if term_matches_text(term, definition):
+            score += 22
+        if term_matches_text(term, full_text):
+            score += 30
+        if term_matches_text(term, req_id):
+            score += 25
+        if term_matches_text(term, section):
+            score += 18
+        if term_matches_text(term, category):
+            score += 10
+
+    # Existing ID / metadata matches for exact query
     if q and q == req_id:
         score += 30
-    if q and q in title:
-        score += 20
-    if q and len(q.split()) > 1 and q in title:
-        score += 15
-    if q and q in summary:
-        score += 12
-    if q and q in definition:
-        score += 12
     if q and q in section:
         score += 10
     if q and q in category:
         score += 6
-    if q and q in full_text:
-        score += 10
-    if q and len(q.split()) > 1 and q in full_text:
-        score += 12
 
     query_tokens = preprocess(query)
     if len(query_tokens) > 1 and all(t in full_text for t in query_tokens):
@@ -1664,24 +1769,23 @@ def lexical_score(block, query, expanded_tokens):
     if len(query_tokens) > 1 and all(t in title for t in query_tokens):
         score += 8
 
-    for term in set(expanded_tokens):
-        if term in filename:
-            score += 10
-        if term in filename_no_ext:
-            score += 10
-        if term in title:
-            score += 6
-        if term in summary:
+    # Selected synonym / expanded terms (lower weight)
+    for term in set(synonym_terms):
+        if term_matches_text(term, filename) or term_matches_text(term, filename_no_ext):
+            score += 8
+        if term_matches_text(term, title):
             score += 5
-        if term in definition:
-            score += 5
-        if term in category:
-            score += 3
-        if term in tokens:
+        if term_matches_text(term, summary):
+            score += 4
+        if term_matches_text(term, definition):
+            score += 4
+        if term_matches_text(term, full_text):
+            score += 4
+        if term_matches_text(term, category):
             score += 2
 
-    if any(t.startswith("aard") for t in expanded_tokens) and "ground" in category:
-        score += 3
+    if any(t.startswith("aard") for t in active_terms) and "ground" in category:
+        score += 2
 
     return score
 
@@ -1702,15 +1806,9 @@ def semantic_score(query, block):
     except Exception:
         return 0.0
 
-def get_result_snippet(block, expanded_tokens):
+def get_result_snippet(block, active_terms, query=""):
     text = block.full_text or ""
-    text_lower = text.lower()
-    hit_pos = -1
-
-    for t in expanded_tokens:
-        pos = text_lower.find(t.lower())
-        if pos != -1 and (hit_pos == -1 or pos < hit_pos):
-            hit_pos = pos
+    hit_pos = find_hit_position(text, active_terms, query)
 
     window = 900
     if hit_pos == -1:
@@ -1726,7 +1824,8 @@ def get_result_snippet(block, expanded_tokens):
         if end < len(text):
             snippet = snippet + "..."
 
-    return highlight_terms(snippet, expanded_tokens)
+    highlight = list(dict.fromkeys([query] + active_terms))
+    return highlight_terms(snippet, highlight)
 
 
 def get_text_snippet(text, expanded_tokens, query=""):
@@ -1748,11 +1847,13 @@ def get_text_snippet(text, expanded_tokens, query=""):
         if end < len(text):
             snippet += "..."
 
-    return highlight_terms(snippet, expanded_tokens)
+    return highlight_terms(snippet, list(dict.fromkeys([query] + expanded_tokens)))
 
 
-def score_document_text(doc, query, expanded_tokens):
+def score_document_text(doc, query, active_terms, exact_terms=None):
     q = query.lower().strip()
+    exact_terms = exact_terms or default_exact_search_terms(query)
+    synonym_terms = [t for t in active_terms if t.lower() not in {e.lower() for e in exact_terms}]
     text = doc.text_preview or ""
     if not text.strip():
         return 0
@@ -1762,20 +1863,34 @@ def score_document_text(doc, query, expanded_tokens):
     base_name = filename.rsplit(".", 1)[0] if "." in filename else filename
     score = 0.0
 
+    if not any(
+        term_matches_text(term, text)
+        or term_matches_text(term, filename)
+        or term_matches_text(term, base_name)
+        for term in active_terms
+    ):
+        return 0.0
+
     if q and q in text_lower:
-        score += 18
+        score += 35
     if q and q in filename:
         score += 25
     if q and q in base_name:
         score += 20
 
+    for term in exact_terms:
+        if term_matches_text(term, text_lower):
+            score += 20
+        if term_matches_text(term, filename) or term_matches_text(term, base_name):
+            score += 12
+
     matched_terms = 0
-    for term in set(expanded_tokens):
-        if term.lower() in text_lower:
+    for term in set(synonym_terms):
+        if term_matches_text(term, text_lower):
             matched_terms += 1
-            score += 5
-        if term.lower() in filename or term.lower() in base_name:
             score += 4
+        if term_matches_text(term, filename) or term_matches_text(term, base_name):
+            score += 3
 
     query_tokens = preprocess(query)
     if len(query_tokens) > 1 and all(t in text_lower for t in query_tokens):
@@ -1784,10 +1899,30 @@ def score_document_text(doc, query, expanded_tokens):
     return score
 
 
-def build_document_fallback_results(query, expanded_tokens, seen_keys, top_k=10):
+def count_exact_term_hits_simple(result_item, query, exact_terms):
+    combined = " ".join(
+        [
+            result_item.get("title") or "",
+            result_item.get("summary") or "",
+            result_item.get("full_text") or "",
+            result_item.get("filename") or "",
+        ]
+    )
+    hits = 0
+    q = (query or "").strip().lower()
+    if q and q in combined.lower():
+        hits += 3
+    for term in exact_terms:
+        if term_matches_text(term, combined):
+            hits += 1
+    return hits
+
+
+def build_document_fallback_results(query, active_terms, seen_keys, top_k=10):
+    exact_terms = default_exact_search_terms(query)
     results = []
     for doc in DocumentRecord.query.all():
-        score = score_document_text(doc, query, expanded_tokens)
+        score = score_document_text(doc, query, active_terms, exact_terms)
         if score <= 0:
             continue
 
@@ -1795,7 +1930,7 @@ def build_document_fallback_results(query, expanded_tokens, seen_keys, top_k=10)
             doc,
             0,
             doc.text_preview,
-            expanded_tokens,
+            active_terms,
             query,
             1,
         )
@@ -1817,7 +1952,7 @@ def build_document_fallback_results(query, expanded_tokens, seen_keys, top_k=10)
             "definition": "",
             "summary": (doc.text_preview or "")[:240],
             "full_text": doc.text_preview or "",
-            "snippet": get_text_snippet(doc.text_preview, expanded_tokens, query),
+            "snippet": get_text_snippet(doc.text_preview, active_terms, query),
             "relevance": round(score, 2),
             "is_pdf": doc.extension.lower() == "pdf",
             "is_docx": doc.extension.lower() == "docx",
@@ -1828,7 +1963,13 @@ def build_document_fallback_results(query, expanded_tokens, seen_keys, top_k=10)
             "is_document_fallback": True,
         }))
 
-    results.sort(key=lambda r: r["relevance"], reverse=True)
+    results.sort(
+        key=lambda item: (
+            count_exact_term_hits_simple(item, query, exact_terms),
+            item["relevance"],
+        ),
+        reverse=True,
+    )
     return results[:top_k]
 
 
@@ -1841,12 +1982,17 @@ def grouped_search_summary(results):
         "top_requirement_ids": req_ids[:8]
     }
 
-def search_requirements(query, top_k=30):
+def search_requirements(query, top_k=30, active_terms=None):
     if not query.strip():
         return [], []
 
-    query_tokens = preprocess(query)
-    expanded_tokens = expand_query_tokens(query_tokens)
+    all_expanded_terms = get_all_expanded_terms(query)
+    exact_terms = default_exact_search_terms(query)
+    if active_terms is None:
+        active_terms = exact_terms
+    else:
+        active_terms = resolve_active_search_terms(query, active_terms)
+
     q = query.lower().strip()
 
     direct_docs = DocumentRecord.query.all()
@@ -1864,7 +2010,7 @@ def search_requirements(query, top_k=30):
 
     scored = []
     for row in rows:
-        score = lexical_score(row, query, expanded_tokens)
+        score = lexical_score(row, query, active_terms, exact_terms)
 
         if row.document_id in matched_doc_ids:
             score += 120
@@ -1872,20 +2018,21 @@ def search_requirements(query, top_k=30):
         score += semantic_score(query, row)
 
         if score > 0:
-            scored.append((row, score))
+            exact_hits = count_exact_term_hits(row, query, exact_terms)
+            scored.append((row, score, exact_hits))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    scored.sort(key=lambda x: (x[2], x[1]), reverse=True)
     results = []
     seen_keys = set()
 
-    for row, score in scored[:top_k]:
+    for row, score, _exact_hits in scored[:top_k]:
         doc = row.document
         seen_keys.add((doc.id, row.page or 1, row.requirement_id or row.title))
         display_page = resolve_result_page(
             doc,
             row.char_start or 0,
             row.full_text,
-            expanded_tokens,
+            active_terms,
             query,
             row.page,
         )
@@ -1902,7 +2049,7 @@ def search_requirements(query, top_k=30):
             "definition": row.definition,
             "summary": row.summary,
             "full_text": row.full_text,
-            "snippet": get_result_snippet(row, expanded_tokens),
+            "snippet": get_result_snippet(row, active_terms, query),
             "relevance": round(score, 2),
             "is_pdf": doc.extension.lower() == "pdf",
             "is_docx": doc.extension.lower() == "docx",
@@ -1915,22 +2062,31 @@ def search_requirements(query, top_k=30):
 
     if len(results) < top_k:
         fallback = build_document_fallback_results(
-            query, expanded_tokens, seen_keys, top_k=top_k - len(results)
+            query, active_terms, seen_keys, top_k=top_k - len(results)
         )
         results.extend(fallback)
 
-    results.sort(key=lambda r: r["relevance"], reverse=True)
-    return results[:top_k], expanded_tokens
+    results.sort(
+        key=lambda r: (
+            count_exact_term_hits_simple(r, query, exact_terms),
+            r["relevance"],
+        ),
+        reverse=True,
+    )
+    return results[:top_k], all_expanded_terms
 
 
-def search_documents(query, top_k=10):
+def search_documents(query, top_k=10, active_terms=None):
     q = query.lower().strip()
-    query_tokens = preprocess(query)
-    expanded_tokens = expand_query_tokens(query_tokens)
+    exact_terms = default_exact_search_terms(query)
+    if active_terms is None:
+        active_terms = exact_terms
+    else:
+        active_terms = resolve_active_search_terms(query, active_terms)
     scored = []
 
     for doc in DocumentRecord.query.all():
-        score = score_document_text(doc, query, expanded_tokens)
+        score = score_document_text(doc, query, active_terms, exact_terms)
         filename = (doc.original_filename or "").lower()
         stored = (doc.stored_filename or "").lower()
         base = filename.rsplit(".", 1)[0] if "." in filename else filename
@@ -1981,6 +2137,88 @@ button { background:#0069d9; }
 .filename { font-size:18px; font-weight:bold; color:#b00020; }
 .meta { color:#555; margin:8px 0; font-size:14px; }
 .summary-box { margin-top:16px; padding:12px; background:#f8f9fa; border:1px solid #ececec; border-radius:6px; }
+.stats-panel, .search-meta-panel, .search-filter-panel {
+  margin-top:16px;
+  padding:16px 18px;
+  background:#eef1f5;
+  border:1px solid #d8dee6;
+  border-radius:10px;
+}
+.panel-title {
+  font-size:15px;
+  font-weight:700;
+  color:#334155;
+  margin:0 0 12px 0;
+  padding-bottom:8px;
+  border-bottom:1px solid #d8dee6;
+}
+.panel-section { margin-top:14px; }
+.panel-section:first-of-type { margin-top:0; }
+.panel-label {
+  font-size:13px;
+  font-weight:700;
+  color:#475569;
+  margin-bottom:8px;
+  letter-spacing:0.02em;
+  text-transform:uppercase;
+}
+.stats-grid {
+  display:flex;
+  flex-wrap:wrap;
+  gap:12px;
+}
+.stat-item {
+  flex:1 1 180px;
+  background:#fff;
+  border:1px solid #dbe1ea;
+  border-radius:8px;
+  padding:12px 14px;
+}
+.stat-label { display:block; font-size:12px; color:#64748b; margin-bottom:4px; }
+.stat-value { display:block; font-size:22px; font-weight:700; color:#0f172a; }
+.term-chip-list { display:flex; flex-wrap:wrap; gap:8px; }
+.term-chip {
+  display:inline-block;
+  background:#fff;
+  border:1px solid #cbd5e1;
+  color:#334155;
+  padding:5px 10px;
+  border-radius:999px;
+  font-size:13px;
+}
+.term-chip.active {
+  background:#dbeafe;
+  border-color:#93c5fd;
+  color:#1d4ed8;
+  font-weight:700;
+}
+.term-chip.exact {
+  border-color:#86efac;
+  background:#ecfdf5;
+}
+.meta-line { margin-top:6px; line-height:1.6; color:#334155; }
+.btn-small { padding:7px 12px; font-size:13px; }
+.search-filter-panel .term-filter-row {
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px 16px;
+  margin-bottom:12px;
+}
+.search-filter-panel label {
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  cursor:pointer;
+  background:#fff;
+  border:1px solid #dbe1ea;
+  border-radius:999px;
+  padding:6px 12px;
+}
+.search-filter-panel label:has(input:checked) {
+  background:#dbeafe;
+  border-color:#93c5fd;
+}
+.search-filter-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
 .snippet, .full-block { background:#fff; padding:12px; white-space:pre-wrap; border:1px solid #eee; border-radius:6px; font-family:Consolas, monospace; }
 .highlight { color:green; font-weight:bold; background:#eaf7ea; padding:1px 2px; border-radius:2px; }
 .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
@@ -2041,15 +2279,71 @@ HOME_TEMPLATE = """
         Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>
     </div>
 
-    <form method="GET" action="/">
+    <form method="GET" action="/" id="search-form">
         <input type="text" name="q" value="{{ query }}" placeholder="Search requirement ID, Dutch/English keyword, section, definition">
         <button type="submit">Search</button>
+
+        {% if query and all_expanded_terms %}
+        <div class="search-filter-panel">
+            <div class="panel-title">Term filters</div>
+            <div class="panel-section">
+                <div class="panel-label">Select search terms</div>
+                <div class="small" style="margin-bottom:10px;">Exact search word is checked by default. Choose additional related terms if needed.</div>
+                <div class="term-filter-row">
+                    {% for term in all_expanded_terms %}
+                    <label>
+                        <input type="checkbox" name="term" value="{{ term }}"
+                            {% if term in selected_terms %}checked{% endif %}>
+                        <span{% if term in exact_terms %} style="font-weight:700;"{% endif %}>{{ term }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+                <div class="search-filter-actions">
+                    <button type="submit" class="btn btn-green btn-small">Apply term filters</button>
+                    <button type="button" class="btn btn-gray btn-small" onclick="selectAllTerms(true)">Select all</button>
+                    <button type="button" class="btn btn-gray btn-small" onclick="selectAllTerms(false)">Clear all</button>
+                    <button type="button" class="btn btn-gray btn-small" onclick="selectExactTermsOnly()">Exact only</button>
+                </div>
+                {% if selected_terms %}
+                <div class="meta-line small" style="margin-top:10px;">
+                    <strong>Active terms:</strong> {{ selected_terms|join(', ') }}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
     </form>
 
-    <div class="summary-box">
-        <strong>Indexed documents:</strong> {{ doc_count }} |
-        <strong>Requirement blocks:</strong> {{ block_count }} |
-        <strong>Tables:</strong> {{ table_count }}
+    <script>
+    function selectAllTerms(checked) {
+        document.querySelectorAll('#search-form input[name="term"]').forEach(function(el) {
+            el.checked = checked;
+        });
+    }
+    function selectExactTermsOnly() {
+        const exact = new Set({{ exact_terms|tojson }});
+        document.querySelectorAll('#search-form input[name="term"]').forEach(function(el) {
+            el.checked = exact.has(el.value);
+        });
+    }
+    </script>
+
+    <div class="stats-panel">
+        <div class="panel-title">Index statistics</div>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <span class="stat-label">Indexed documents</span>
+                <span class="stat-value">{{ doc_count }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Requirement blocks</span>
+                <span class="stat-value">{{ block_count }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Tables</span>
+                <span class="stat-value">{{ table_count }}</span>
+            </div>
+        </div>
     </div>
 
     {% if doc_count == 0 %}
@@ -2059,16 +2353,36 @@ HOME_TEMPLATE = """
     {% endif %}
 
     {% if query %}
-        <div class="summary-box">
-            <strong>Expanded terms:</strong> {{ expanded_terms|join(', ') if expanded_terms else '-' }}
-            {% if summary.top_categories %}
-            <br><strong>Top categories:</strong>
-            {% for cat, cnt in summary.top_categories %}
-                <span class="badge">{{ cat }} ({{ cnt }})</span>
-            {% endfor %}
+        <div class="search-meta-panel">
+            <div class="panel-title">Search analysis</div>
+
+            {% if all_expanded_terms %}
+            <div class="panel-section">
+                <div class="panel-label">Expanded terms</div>
+                <div class="term-chip-list">
+                    {% for term in all_expanded_terms %}
+                    <span class="term-chip{% if term in selected_terms %} active{% endif %}{% if term in exact_terms %} exact{% endif %}">{{ term }}</span>
+                    {% endfor %}
+                </div>
+            </div>
             {% endif %}
+
+            {% if summary.top_categories %}
+            <div class="panel-section">
+                <div class="panel-label">Top categories</div>
+                <div class="meta-line">
+                    {% for cat, cnt in summary.top_categories %}
+                        <span class="badge">{{ cat }} ({{ cnt }})</span>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+
             {% if summary.top_requirement_ids %}
-            <br><strong>Top requirement IDs:</strong> {{ summary.top_requirement_ids|join(', ') }}
+            <div class="panel-section">
+                <div class="panel-label">Top requirement IDs</div>
+                <div class="meta-line">{{ summary.top_requirement_ids|join(', ') }}</div>
+            </div>
             {% endif %}
         </div>
 
@@ -2267,7 +2581,11 @@ UPLOAD_TEMPLATE = """
 
     <div class="info">
         Allowed types: {{ allowed_extensions }}<br>
-        Max size: 100 MB per request
+        Max size: 100 MB per request<br>
+        Storage backend: <strong>{{ storage_backend }}</strong>
+        {% if not storage_persistent %}
+        <br><span style="color:#b45309;"><strong>Warning:</strong> Files are stored on temporary disk and will be lost after a Render restart. Configure Supabase S3 for persistent PDF storage.</span>
+        {% endif %}
     </div>
 
     <form method="POST" enctype="multipart/form-data">
@@ -2324,10 +2642,12 @@ DOCS_TEMPLATE = """
                 <th>Size</th>
                 <th>OCR</th>
                 <th>Status</th>
+                <th>File</th>
                 <th>Uploaded</th>
                 <th>Actions</th>
             </tr>
-            {% for d in docs %}
+            {% for row in doc_rows %}
+            {% set d = row.record %}
             <tr>
                 <td>
                     <input type="checkbox" name="document_ids" value="{{ d.id }}" class="doc-checkbox">
@@ -2338,6 +2658,13 @@ DOCS_TEMPLATE = """
                 <td>{{ d.size_bytes }}</td>
                 <td>{{ 'Yes' if d.is_ocr else 'No' }}</td>
                 <td>{{ d.status }}</td>
+                <td>
+                    {% if row.file_available %}
+                    <span style="color:#198754; font-weight:700;">OK</span>
+                    {% else %}
+                    <span style="color:#dc3545; font-weight:700;">Missing</span>
+                    {% endif %}
+                </td>
                 <td>{{ d.uploaded_at }}</td>
                 <td>
                     <a href="{{ url_for('reindex_document', document_id=d.id) }}">Reindex</a>
@@ -2810,13 +3137,22 @@ TABLE_TEMPLATE = """
 def home():
     query = request.args.get("q", "").strip()
     results = []
-    expanded_terms = []
+    all_expanded_terms = []
+    selected_terms = []
+    exact_terms = []
     summary = {"top_categories": [], "top_requirement_ids": []}
     document_matches = []
 
     if query:
-        document_matches = search_documents(query)
-        results, expanded_terms = search_requirements(query)
+        all_expanded_terms = get_all_expanded_terms(query)
+        exact_terms = default_exact_search_terms(query)
+        if request.args.getlist("term"):
+            selected_terms = resolve_active_search_terms(query, request.args.getlist("term"))
+        else:
+            selected_terms = exact_terms
+
+        document_matches = search_documents(query, active_terms=selected_terms)
+        results, _ = search_requirements(query, active_terms=selected_terms)
         summary = grouped_search_summary(results)
 
     return render_template_string(
@@ -2824,7 +3160,9 @@ def home():
         query=query,
         results=results,
         document_matches=document_matches,
-        expanded_terms=expanded_terms,
+        all_expanded_terms=all_expanded_terms,
+        selected_terms=selected_terms,
+        exact_terms=exact_terms,
         summary=summary,
         doc_count=DocumentRecord.query.count(),
         block_count=RequirementBlock.query.count(),
@@ -3060,6 +3398,7 @@ def upload_files():
 
         uploaded_count = 0
         skipped_count = 0
+        restored_count = 0
 
         for file in files:
             if not file or file.filename == "":
@@ -3071,20 +3410,42 @@ def upload_files():
             original_filename = secure_filename(file.filename)
             ext = file_ext(original_filename)
 
-            # Save file temporarily to compute hash
             temp_path = os.path.join(DOC_FOLDER, f"temp_{uuid.uuid4().hex}.{ext}")
             file.save(temp_path)
             file_hash = sha256_of_file(temp_path)
 
             existing = dedupe_lookup(file_hash)
             if existing:
-                os.remove(temp_path)
-                flash(f"Duplicate file skipped: {original_filename}")
-                skipped_count += 1
+                if not storage.document_exists(existing.stored_filename, DOC_FOLDER):
+                    try:
+                        restore_document_file_from_temp(existing, temp_path)
+                        index_document_record(existing)
+                        flash(
+                            f"Restored missing file and reindexed: {original_filename}"
+                        )
+                        restored_count += 1
+                    except Exception as exc:
+                        db.session.rollback()
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
+                        flash(
+                            f"Could not restore duplicate file {original_filename}: {exc}"
+                        )
+                else:
+                    os.remove(temp_path)
+                    flash(f"Duplicate file skipped: {original_filename}")
+                    skipped_count += 1
                 continue
 
             stored_filename = f"{uuid.uuid4().hex}.{ext}"
-            size_bytes = storage.save_document(stored_filename, temp_path, DOC_FOLDER)
+            try:
+                size_bytes = storage.save_document(stored_filename, temp_path, DOC_FOLDER)
+                storage.verify_document_stored(stored_filename, DOC_FOLDER)
+            except Exception as exc:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                flash(f"Upload failed for {original_filename}: {exc}")
+                continue
 
             doc = DocumentRecord(
                 original_filename=original_filename,
@@ -3103,12 +3464,25 @@ def upload_files():
 
             uploaded_count += 1
 
-        flash(f"Uploaded {uploaded_count} file(s), skipped {skipped_count} duplicate(s).")
+        summary_parts = []
+        if uploaded_count:
+            summary_parts.append(f"uploaded {uploaded_count}")
+        if restored_count:
+            summary_parts.append(f"restored {restored_count}")
+        if skipped_count:
+            summary_parts.append(f"skipped {skipped_count} duplicate(s)")
+        flash(
+            "Upload complete: " + ", ".join(summary_parts) + "."
+            if summary_parts
+            else "No files were uploaded."
+        )
         return redirect(url_for("upload_files"))
 
     return render_template_string(
         UPLOAD_TEMPLATE,
-        allowed_extensions=", ".join(sorted(ALLOWED_EXTENSIONS))
+        allowed_extensions=", ".join(sorted(ALLOWED_EXTENSIONS)),
+        storage_backend=storage.storage_backend_name(),
+        storage_persistent=storage.object_storage_enabled(),
     )
 
 @app.route("/admin/documents")
@@ -3118,7 +3492,14 @@ def admin_documents():
         abort(403)
 
     docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
-    return render_template_string(DOCS_TEMPLATE, docs=docs)
+    doc_rows = [
+        {
+            "record": doc,
+            "file_available": storage.document_exists(doc.stored_filename, DOC_FOLDER),
+        }
+        for doc in docs
+    ]
+    return render_template_string(DOCS_TEMPLATE, doc_rows=doc_rows)
 
 @app.route("/reindex/<int:document_id>")
 @login_required
