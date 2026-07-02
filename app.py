@@ -2770,11 +2770,22 @@ HOME_TEMPLATE = """
                     </label>
                     {% endfor %}
                 </div>
+                <div class="panel-label" style="margin-top:14px;">SELECT SEARCH TERMS</div>
+                <div class="term-filter-row">
+                    <label>
+                        <input type="checkbox" name="result_type" value="drawings"
+                            {% if 'drawings' in result_types %}checked{% endif %}>
+                        <span>Related pages / drawings</span>
+                    </label>
+                    <label>
+                        <input type="checkbox" name="result_type" value="text"
+                            {% if 'text' in result_types %}checked{% endif %}>
+                        <span>Text</span>
+                    </label>
+                </div>
                 <div class="search-filter-actions">
                     <button type="submit" class="btn btn-green btn-small">Apply term filters</button>
                     <button type="button" class="btn btn-gray btn-small" onclick="selectAllTerms(true)">Select all</button>
-                    <button type="button" class="btn btn-gray btn-small" onclick="selectAllTerms(false)">Clear all</button>
-                    <button type="button" class="btn btn-gray btn-small" onclick="selectExactTermsOnly()">Exact only</button>
                 </div>
                 {% if selected_terms %}
                 <div class="meta-line small" style="margin-top:10px;">
@@ -2790,12 +2801,6 @@ HOME_TEMPLATE = """
     function selectAllTerms(checked) {
         document.querySelectorAll('#search-form input[name="term"]').forEach(function(el) {
             el.checked = checked;
-        });
-    }
-    function selectExactTermsOnly() {
-        const exact = new Set({{ exact_terms|tojson }});
-        document.querySelectorAll('#search-form input[name="term"]').forEach(function(el) {
-            el.checked = exact.has(el.value);
         });
     }
     function scrollToTopSmooth() {
@@ -2815,7 +2820,7 @@ HOME_TEMPLATE = """
     {% endif %}
 
     {% if query %}
-        {% if document_matches %}
+        {% if document_matches and current_page == 1 and 'drawings' in result_types %}
         <div class="search-meta-panel">
             <div class="panel-title">Related pages / drawings</div>
             <div class="document-match-grid">
@@ -2878,6 +2883,7 @@ HOME_TEMPLATE = """
         </div>
         {% endif %}
 
+        {% if 'text' in result_types %}
         <h3>Results for "{{ query }}"</h3>
 
         {% if results %}
@@ -2983,17 +2989,18 @@ HOME_TEMPLATE = """
                 </div>
                 <div class="pagination-buttons">
                     {% if current_page > 1 %}
-                    <a class="btn btn-gray btn-small" href="{{ url_for('home', q=query, page=current_page-1, term=selected_terms) }}">Previous</a>
+                    <a class="btn btn-gray btn-small" href="{{ url_for('home', q=query, page=current_page-1, term=selected_terms, result_type=result_types) }}">Previous</a>
                     {% endif %}
                     <span class="small">Page {{ current_page }} / {{ total_pages }}</span>
                     {% if current_page < total_pages %}
-                    <a class="btn btn-gray btn-small" href="{{ url_for('home', q=query, page=current_page+1, term=selected_terms) }}">Next</a>
+                    <a class="btn btn-gray btn-small" href="{{ url_for('home', q=query, page=current_page+1, term=selected_terms, result_type=result_types) }}">Next</a>
                     {% endif %}
                 </div>
             </div>
             {% endif %}
         {% else %}
             <div class="warning">No matching results found.</div>
+        {% endif %}
         {% endif %}
     {% endif %}
 </div>
@@ -3717,6 +3724,7 @@ def home():
     exact_terms = []
     summary = {"top_categories": [], "top_requirement_ids": []}
     document_matches = []
+    result_types = ["drawings", "text"]
 
     if query:
         all_expanded_terms = get_all_expanded_terms(query)
@@ -3726,15 +3734,23 @@ def home():
         else:
             selected_terms = exact_terms
 
-        document_matches = search_documents(query, active_terms=selected_terms)
-        all_results, _ = search_requirements(query, active_terms=selected_terms)
-        summary = grouped_search_summary(all_results)
-        total_results = len(all_results)
-        total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
-        current_page = min(current_page, total_pages)
-        start_idx = (current_page - 1) * RESULTS_PER_PAGE
-        end_idx = start_idx + RESULTS_PER_PAGE
-        results = all_results[start_idx:end_idx]
+        requested_result_types = [
+            t for t in request.args.getlist("result_type") if t in {"drawings", "text"}
+        ]
+        if requested_result_types:
+            result_types = requested_result_types
+
+        if "drawings" in result_types:
+            document_matches = search_documents(query, active_terms=selected_terms)
+        if "text" in result_types:
+            all_results, _ = search_requirements(query, active_terms=selected_terms)
+            summary = grouped_search_summary(all_results)
+            total_results = len(all_results)
+            total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
+            current_page = min(current_page, total_pages)
+            start_idx = (current_page - 1) * RESULTS_PER_PAGE
+            end_idx = start_idx + RESULTS_PER_PAGE
+            results = all_results[start_idx:end_idx]
 
     return render_template_string(
         HOME_TEMPLATE,
@@ -3744,6 +3760,7 @@ def home():
         all_expanded_terms=all_expanded_terms,
         selected_terms=selected_terms,
         exact_terms=exact_terms,
+        result_types=result_types,
         summary=summary,
         current_page=current_page,
         total_pages=total_pages,
