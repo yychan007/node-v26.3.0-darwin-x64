@@ -290,6 +290,11 @@ MULTI_LANG_SYNONYMS = {
     "spanning": ["spanning", "voltage"],
     "transformer": ["transformer", "transformator"],
     "transformator": ["transformator", "transformer"],
+    "blast": ["blast", "scherf", "scherfwand", "blastwall", "blast-wall"],
+    "wall": ["wall", "wand", "scherfwand", "blast wall", "blastwall"],
+    "blastwall": ["blastwall", "blast wall", "scherfwand"],
+    "blast-wall": ["blast-wall", "blast wall", "scherfwand"],
+    "scherfwand": ["scherfwand", "blast wall", "blastwall", "blast-wall"],
     "requirement": ["requirement", "requirements", "req", "eis", "eisen"],
     "req": ["req", "requirement", "eis"],
     "eis": ["eis", "requirement", "req"],
@@ -305,6 +310,8 @@ MULTI_LANG_SYNONYMS = {
     "frequentie": ["frequentie", "frequency"],
     "frequency": ["frequency", "frequentie"],
 }
+
+DRAWING_MARKERS = ("drawing", "tekening")
 
 REQ_ID_REGEX = re.compile(r'\b([A-Z]{1,10}-Req-\d+(?:\.\d+)?)\b', re.IGNORECASE)
 
@@ -2347,9 +2354,19 @@ def search_documents(query, top_k=10, active_terms=None):
             total_pages = max((p for _s, _e, p in offsets), default=page or 1)
             center = page or 1
             candidates = [center, center - 1, center + 1, center - 2, center + 2]
+            # Prefer pages whose extracted text includes "drawing/tekening"
             for p in candidates:
-                if isinstance(p, int) and 1 <= p <= total_pages and p not in image_pages:
-                    image_pages.append(p)
+                if not (isinstance(p, int) and 1 <= p <= total_pages):
+                    continue
+                page_text = extract_page_text_from_preview(doc, p).lower()
+                if any(marker in page_text for marker in DRAWING_MARKERS):
+                    if p not in image_pages:
+                        image_pages.append(p)
+            # Fallback to nearby pages if none match drawing markers
+            if not image_pages:
+                for p in candidates:
+                    if isinstance(p, int) and 1 <= p <= total_pages and p not in image_pages:
+                        image_pages.append(p)
         if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
             try:
                 with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
