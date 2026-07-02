@@ -2659,6 +2659,8 @@ a:hover { text-decoration:underline; }
   justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
+  padding-right: 132px;
+  padding-bottom: 6px;
 }
 .pagination-buttons {
   display: flex;
@@ -2671,8 +2673,28 @@ a:hover { text-decoration:underline; }
   bottom: 22px;
   z-index: 999;
   display: none;
+  background: #0ea5a4;
+  color: #fff;
+  border: 1px solid #0b8d8c;
+  box-shadow: 0 6px 14px rgba(14, 165, 164, 0.28);
+  border-radius: 999px;
+  font-weight: 600;
+  padding: 10px 14px;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.back-to-top:hover {
+  background: #0b8d8c;
+  transform: translateY(-1px);
 }
 @media (max-width: 900px) {
+  .pagination-bar {
+    padding-right: 0;
+    padding-bottom: 52px;
+  }
+  .back-to-top {
+    right: 14px;
+    bottom: 14px;
+  }
   .result-page-img img {
     max-width: 100%;
     height: auto;
