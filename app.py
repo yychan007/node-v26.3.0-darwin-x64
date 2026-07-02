@@ -1067,6 +1067,50 @@ def get_docx_image(document_path, image_index=0):
     except Exception as exc:
         print(f"DOCX image read error: {document_path} {entry_name} -> {exc}")
         return None
+
+
+def get_best_docx_image_index(document_path):
+    image_entries = list_docx_image_entries(document_path)
+    if not image_entries:
+        return None
+
+    best_idx = 0
+    best_area = 0
+    for idx, entry_name in enumerate(image_entries):
+        try:
+            with zipfile.ZipFile(document_path) as docx_zip:
+                raw = docx_zip.read(entry_name)
+            with Image.open(io.BytesIO(raw)) as img:
+                width, height = img.size
+                area = max(0, int(width)) * max(0, int(height))
+            if area > best_area:
+                best_area = area
+                best_idx = idx
+        except Exception:
+            continue
+    return best_idx
+
+
+def get_top_docx_image_indexes(document_path, max_images=4, min_area=50000):
+    image_entries = list_docx_image_entries(document_path)
+    if not image_entries:
+        return []
+
+    scored = []
+    for idx, entry_name in enumerate(image_entries):
+        try:
+            with zipfile.ZipFile(document_path) as docx_zip:
+                raw = docx_zip.read(entry_name)
+            with Image.open(io.BytesIO(raw)) as img:
+                width, height = img.size
+                area = max(0, int(width)) * max(0, int(height))
+            if area >= min_area:
+                scored.append((area, idx))
+        except Exception:
+            continue
+
+    scored.sort(reverse=True)
+    return [idx for _area, idx in scored[:max_images]]
 # =========================================================
 # Text extraction
 # =========================================================
@@ -2249,6 +2293,28 @@ def search_documents(query, top_k=10, active_terms=None):
 
     results = []
     for doc, score in scored[:top_k]:
+        requirement_id = "-"
+        block_rows = RequirementBlock.query.filter_by(document_id=doc.id).all()
+        if block_rows:
+            best_req = None
+            best_score = -1.0
+            for row in block_rows:
+                row_req = (row.requirement_id or "").strip()
+                if not row_req:
+                    continue
+                row_score = lexical_score(row, query, active_terms, exact_terms)
+                if row_score > best_score:
+                    best_score = row_score
+                    best_req = row_req
+            if best_req:
+                requirement_id = best_req
+            else:
+                for row in block_rows:
+                    row_req = (row.requirement_id or "").strip()
+                    if row_req:
+                        requirement_id = row_req
+                        break
+
         page = resolve_result_page(
             doc,
             0,
@@ -2257,23 +2323,37 @@ def search_documents(query, top_k=10, active_terms=None):
             query,
             1,
         )
+
+        # Better virtual-page estimate for docx/txt (since page_offsets_json is not meaningful there)
+        if doc.extension.lower() in {"docx", "txt"}:
+            try:
+                full_text = get_document_full_text(doc)
+                hit_pos = find_hit_position(full_text, active_terms, query)
+                chunks = split_text_into_virtual_pages(full_text)
+                if hit_pos >= 0 and chunks:
+                    cursor = 0
+                    for idx, chunk in enumerate(chunks, start=1):
+                        cursor += len(chunk) + 2
+                        if hit_pos < cursor:
+                            page = idx
+                            break
+            except Exception as exc:
+                print(f"Virtual page estimate error for doc {doc.id}: {exc}")
+
         image_pages = []
         image_indexes = []
         if doc.extension.lower() == "pdf":
             offsets = load_page_offsets(doc)
             total_pages = max((p for _s, _e, p in offsets), default=page or 1)
             center = page or 1
-            candidates = [center, center + 1, center - 1]
-            image_pages = [
-                p for p in candidates if isinstance(p, int) and p >= 1 and p <= total_pages
-            ]
-            # keep order and remove duplicates
-            seen_pages = set()
-            image_pages = [p for p in image_pages if not (p in seen_pages or seen_pages.add(p))]
+            candidates = [center, center - 1, center + 1, center - 2, center + 2]
+            for p in candidates:
+                if isinstance(p, int) and 1 <= p <= total_pages and p not in image_pages:
+                    image_pages.append(p)
         if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
             try:
                 with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
-                    image_indexes = list(range(min(3, len(list_docx_image_entries(file_path)))))
+                    image_indexes = get_top_docx_image_indexes(file_path, max_images=4, min_area=50000)
             except Exception as exc:
                 print(f"DOCX image preview error for doc {doc.id}: {exc}")
         results.append(
@@ -2281,6 +2361,7 @@ def search_documents(query, top_k=10, active_terms=None):
                 "document_id": doc.id,
                 "filename": doc.original_filename,
                 "page": page,
+                "requirement_id": requirement_id,
                 "snippet": get_text_snippet(doc.text_preview or "", active_terms, query),
                 "relevance": round(score, 2),
                 "is_pdf": doc.extension.lower() == "pdf",
@@ -2663,8 +2744,10 @@ HOME_TEMPLATE = """
                         {% endif %}
                     </div>
                     <div class="meta">
-                        Page: <strong>{{ doc.page or 1 }}</strong>
-                        | Relevance: <strong>{{ doc.relevance }}</strong>
+                        Filename: <strong>{{ doc.filename }}</strong>
+                        |
+                        Requirement number: <strong>{{ doc.requirement_id or '-' }}</strong>
+                        | Page: <strong>{{ doc.page or 1 }}</strong>
                     </div>
                     {% if doc.is_pdf and doc.image_pages %}
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:8px;">
@@ -2694,7 +2777,6 @@ HOME_TEMPLATE = """
                         {% endfor %}
                     </div>
                     {% endif %}
-                    <div class="snippet doc-snippet">({{ doc.snippet|safe }})</div>
                 </div>
                 {% endfor %}
             </div>
