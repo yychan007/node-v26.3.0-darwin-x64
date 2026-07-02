@@ -2202,7 +2202,31 @@ def search_documents(query, top_k=10, active_terms=None):
             scored.append((doc, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:top_k]
+
+    results = []
+    for doc, score in scored[:top_k]:
+        page = resolve_result_page(
+            doc,
+            0,
+            doc.text_preview or "",
+            active_terms,
+            query,
+            1,
+        )
+        results.append(
+            {
+                "document_id": doc.id,
+                "filename": doc.original_filename,
+                "page": page,
+                "snippet": get_text_snippet(doc.text_preview or "", active_terms, query),
+                "relevance": round(score, 2),
+                "is_pdf": doc.extension.lower() == "pdf",
+                "is_docx": doc.extension.lower() == "docx",
+                "is_txt": doc.extension.lower() == "txt",
+                "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
+            }
+        )
+    return results
 
 
 # =========================================================
@@ -2361,6 +2385,35 @@ a:hover { text-decoration:underline; }
 .result-page-img {
   margin: 10px 0 12px 0;
 }
+.document-match-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+  margin-top: 12px;
+}
+.document-match-card {
+  background: #fff;
+  border: 1px solid #dbe1ea;
+  border-radius: 10px;
+  padding: 12px;
+}
+.document-match-card img {
+  width: 100%;
+  max-height: 260px;
+  object-fit: contain;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  background: #fff;
+}
+.document-match-card .doc-title {
+  font-weight: 700;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+.document-match-card .doc-snippet {
+  margin-top: 10px;
+  font-size: 13px;
+}
 @media (max-width: 900px) {
   .result-page-img img {
     max-width: 100%;
@@ -2467,24 +2520,6 @@ HOME_TEMPLATE = """
     }
     </script>
 
-    <div class="stats-panel">
-        <div class="panel-title">Index statistics</div>
-        <div class="stats-grid">
-            <div class="stat-item">
-                <span class="stat-label">Indexed documents</span>
-                <span class="stat-value">{{ doc_count }}</span>
-            </div>
-            <div class="stat-item">
-                <span class="stat-label">Requirement blocks</span>
-                <span class="stat-value">{{ block_count }}</span>
-            </div>
-            <div class="stat-item">
-                <span class="stat-label">Tables</span>
-                <span class="stat-value">{{ table_count }}</span>
-            </div>
-        </div>
-    </div>
-
     {% if doc_count == 0 %}
         <div class="warning">
             No documents are indexed yet. Log in as admin, upload PDF files, then use <strong>Reindex</strong> in Documents.
@@ -2524,6 +2559,42 @@ HOME_TEMPLATE = """
             </div>
             {% endif %}
         </div>
+
+        {% if document_matches %}
+        <div class="search-meta-panel">
+            <div class="panel-title">Related pages / drawings</div>
+            <div class="document-match-grid">
+                {% for doc in document_matches %}
+                <div class="document-match-card">
+                    <div class="doc-title">
+                        {% if doc.is_pdf %}
+                        <a href="{{ url_for('pdf_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
+                            {{ doc.filename }}
+                        </a>
+                        {% else %}
+                            {{ doc.filename }}
+                        {% endif %}
+                    </div>
+                    <div class="meta">
+                        Page: <strong>{{ doc.page or 1 }}</strong>
+                        | Relevance: <strong>{{ doc.relevance }}</strong>
+                    </div>
+                    {% if doc.is_pdf %}
+                    <a href="{{ url_for('pdf_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
+                        <img
+                            src="{{ url_for('page_image', document_id=doc.document_id, page=doc.page or 1) }}"
+                            loading="lazy"
+                            alt="Page {{ doc.page or 1 }} preview"
+                            onerror="this.style.display='none';"
+                        />
+                    </a>
+                    {% endif %}
+                    <div class="snippet doc-snippet">{{ doc.snippet|safe }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
 
         <h3>Results for "{{ query }}"</h3>
 
@@ -2783,6 +2854,24 @@ DOCS_TEMPLATE = """
 <body>
 <div class="container">
     <h2>Indexed documents</h2>
+
+    <div class="stats-panel">
+        <div class="panel-title">Index statistics</div>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <span class="stat-label">Indexed documents</span>
+                <span class="stat-value">{{ doc_count }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Requirement blocks</span>
+                <span class="stat-value">{{ block_count }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Tables</span>
+                <span class="stat-value">{{ table_count }}</span>
+            </div>
+        </div>
+    </div>
 
     <div style="margin-bottom:16px;">
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
@@ -3707,7 +3796,13 @@ def admin_documents():
         }
         for doc in docs
     ]
-    return render_template_string(DOCS_TEMPLATE, doc_rows=doc_rows)
+    return render_template_string(
+        DOCS_TEMPLATE,
+        doc_rows=doc_rows,
+        doc_count=DocumentRecord.query.count(),
+        block_count=RequirementBlock.query.count(),
+        table_count=TablePreview.query.count(),
+    )
 
 @app.route("/reindex/<int:document_id>")
 @login_required
