@@ -312,6 +312,12 @@ MULTI_LANG_SYNONYMS = {
 }
 
 DRAWING_MARKERS = ("drawing", "tekening")
+CONTENTS_MARKERS = (
+    "table of contents",
+    "contents",
+    "inhoudsopgave",
+    "inhoud",
+)
 
 REQ_ID_REGEX = re.compile(r'\b([A-Z]{1,10}-Req-\d+(?:\.\d+)?)\b', re.IGNORECASE)
 
@@ -2359,6 +2365,8 @@ def search_documents(query, top_k=10, active_terms=None):
                 if not (isinstance(p, int) and 1 <= p <= total_pages):
                     continue
                 page_text = extract_page_text_from_preview(doc, p).lower()
+                if any(marker in page_text for marker in CONTENTS_MARKERS):
+                    continue
                 if any(marker in page_text for marker in DRAWING_MARKERS):
                     if p not in image_pages:
                         image_pages.append(p)
