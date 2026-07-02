@@ -2775,7 +2775,7 @@ HOME_TEMPLATE = """
                     <label>
                         <input type="checkbox" name="result_type" value="drawings"
                             {% if 'drawings' in result_types %}checked{% endif %}>
-                        <span>Related pages / drawings</span>
+                        <span>related drawings</span>
                     </label>
                     <label>
                         <input type="checkbox" name="result_type" value="text"
@@ -2822,7 +2822,7 @@ HOME_TEMPLATE = """
     {% if query %}
         {% if document_matches and current_page == 1 and 'drawings' in result_types %}
         <div class="search-meta-panel">
-            <div class="panel-title">Related pages / drawings</div>
+            <div class="panel-title">related drawings</div>
             <div class="document-match-grid">
                 {% for doc in document_matches %}
                 <div class="document-match-card">
