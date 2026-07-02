@@ -264,6 +264,8 @@ ALLOWED_EXTENSIONS = {
 if DOCX_AVAILABLE:
     ALLOWED_EXTENSIONS.add("docx")
 
+RESULTS_PER_PAGE = 10
+
 ADMIN_ROLE = "admin"
 USER_ROLE = "user"
 
@@ -2319,6 +2321,25 @@ button { background:#0069d9; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
 .filename { font-size:18px; font-weight:bold; color:#b00020; }
 .meta { color:#555; margin:8px 0; font-size:14px; }
+.meta-prominent {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 10px 0 12px 0;
+}
+.meta-prominent .meta-item {
+  font-size: 17px;
+  color: #1f2937;
+}
+.meta-prominent .meta-item strong {
+  font-weight: 800;
+}
+.meta-secondary {
+  font-size: 14px;
+  color: #475569;
+  margin-top: 6px;
+  line-height: 1.5;
+}
 .summary-box { margin-top:16px; padding:12px; background:#f8f9fa; border:1px solid #ececec; border-radius:6px; }
 .stats-panel, .search-meta-panel, .search-filter-panel {
   margin-top:16px;
@@ -2477,6 +2498,26 @@ a:hover { text-decoration:underline; }
   margin-top: 10px;
   font-size: 13px;
 }
+.pagination-bar {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.pagination-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.back-to-top {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 999;
+  display: none;
+}
 @media (max-width: 900px) {
   .result-page-img img {
     max-width: 100%;
@@ -2581,6 +2622,14 @@ HOME_TEMPLATE = """
             el.checked = exact.has(el.value);
         });
     }
+    function scrollToTopSmooth() {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    window.addEventListener("scroll", function() {
+        const topBtn = document.getElementById("back-to-top");
+        if (!topBtn) return;
+        topBtn.style.display = window.scrollY > 300 ? "inline-block" : "none";
+    });
     </script>
 
     {% if doc_count == 0 %}
@@ -2634,6 +2683,14 @@ HOME_TEMPLATE = """
                         <a href="{{ url_for('pdf_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
                             {{ doc.filename }}
                         </a>
+                        {% elif doc.is_docx %}
+                        <a href="{{ url_for('docx_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
+                            {{ doc.filename }}
+                        </a>
+                        {% elif doc.is_txt %}
+                        <a href="{{ url_for('document_view', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
+                            {{ doc.filename }}
+                        </a>
                         {% else %}
                             {{ doc.filename }}
                         {% endif %}
@@ -2659,7 +2716,7 @@ HOME_TEMPLATE = """
                     {% if doc.is_docx and doc.image_indexes %}
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:8px;">
                         {% for image_index in doc.image_indexes %}
-                        <a href="{{ url_for('docx_viewer', document_id=doc.document_id, page=1) }}" target="_blank">
+                        <a href="{{ url_for('docx_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
                             <img
                                 src="{{ url_for('docx_image', document_id=doc.document_id, image_index=image_index) }}"
                                 loading="lazy"
@@ -2670,7 +2727,7 @@ HOME_TEMPLATE = """
                         {% endfor %}
                     </div>
                     {% endif %}
-                    <div class="snippet doc-snippet">{{ doc.snippet|safe }}</div>
+                    <div class="snippet doc-snippet">({{ doc.snippet|safe }})</div>
                 </div>
                 {% endfor %}
             </div>
@@ -2687,19 +2744,29 @@ HOME_TEMPLATE = """
                             <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
                                 {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
                             </a>
+                        {% elif res.is_docx %}
+                            <a href="{{ url_for('docx_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
+                                {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
+                            </a>
+                        {% elif res.is_txt %}
+                            <a href="{{ url_for('document_view', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
+                                {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
+                            </a>
                         {% else %}
                             {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
                         {% endif %}
                     </div>
 
-                    <div class="meta">
-                        File: <strong>{{ res.filename }}</strong>
-                        | Page: <strong>{{ res.page or '?' }}</strong>
+                    <div class="meta-prominent">
+                        <div class="meta-item">Filename: <strong>{{ res.filename }}</strong></div>
+                        <div class="meta-item">Page: <strong>{{ res.page or '?' }}</strong></div>
                         {% if res.major_section or res.section %}
-                        | Section: <strong>{{ res.major_section or res.section }}</strong>
+                        <div class="meta-item">Section: <strong>{{ res.major_section or res.section }}</strong></div>
                         {% endif %}
-                        | Category: <strong>{{ res.category }}</strong>
-                        {% if res.ocr_used %}| <strong>OCR used</strong>{% endif %}
+                    </div>
+                    <div class="meta-secondary">
+                        Category: {{ res.category }}
+                        {% if res.ocr_used %}| OCR used{% endif %}
                     </div>
 
                     {% if res.is_pdf %}
@@ -2716,21 +2783,21 @@ HOME_TEMPLATE = """
                     {% endif %}
 
                     {% if res.definition %}
-                        <div><strong>Definition:</strong> {{ res.definition }}</div>
+                        <div class="meta-secondary">Definition (NL): ({{ res.definition }})</div>
                     {% endif %}
                     {% if res.summary %}
-                        <div><strong>Summary:</strong> {{ res.summary }}</div>
+                        <div class="meta-secondary">Summary (NL): ({{ res.summary }})</div>
                     {% endif %}
                     {% if res.section and res.major_section and res.section != res.major_section %}
-                        <div><strong>Subsection:</strong> {{ res.section }}</div>
+                        <div class="meta-secondary">Subsection (NL): ({{ res.section }})</div>
                     {% elif res.section and not res.major_section %}
-                        <div><strong>Section:</strong> {{ res.section }}</div>
+                        <div class="meta-secondary">Section (NL): ({{ res.section }})</div>
                     {% endif %}
 
                     <div class="snippet-columns">
                         <div class="snippet-panel snippet-panel-original">
                             <strong>Table 1 / Dutch (Original)</strong>
-                            <div class="snippet">{{ res.snippet|safe }}</div>
+                            <div class="snippet">({{ res.snippet|safe }})</div>
                         </div>
                         {% if res.snippet_en %}
                         <div class="snippet-panel snippet-panel-translation">
@@ -2745,9 +2812,9 @@ HOME_TEMPLATE = """
                             {% if res.is_pdf %}
                             <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open PDF at page {{ res.page or 1 }}</a>
                             {% elif res.is_docx %}
-                            <a href="{{ url_for('docx_viewer', document_id=res.document_id, page=1) }}" target="_blank">Open DOCX translation</a>
+                            <a href="{{ url_for('docx_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open DOCX translation</a>
                             {% elif res.is_txt %}
-                            <a href="{{ url_for('document_view', document_id=res.document_id, page=1) }}" target="_blank">Open TXT translation</a>
+                            <a href="{{ url_for('document_view', document_id=res.document_id, page=res.page or 1) }}" target="_blank">Open TXT translation</a>
                             {% endif %}
                         {% else %}
                             <a href="{{ url_for('requirement_detail', block_id=res.block_id) }}">Open full requirement</a>
@@ -2765,11 +2832,29 @@ HOME_TEMPLATE = """
                     </div>
                 </div>
             {% endfor %}
+            {% if total_pages > 1 %}
+            <div class="pagination-bar">
+                <div class="small">
+                    Showing {{ ((current_page - 1) * results_per_page) + 1 }}-{{ ((current_page - 1) * results_per_page) + (results|length) }}
+                    of {{ total_results }} results
+                </div>
+                <div class="pagination-buttons">
+                    {% if current_page > 1 %}
+                    <a class="btn btn-gray btn-small" href="{{ url_for('home', q=query, page=current_page-1, term=selected_terms) }}">Previous</a>
+                    {% endif %}
+                    <span class="small">Page {{ current_page }} / {{ total_pages }}</span>
+                    {% if current_page < total_pages %}
+                    <a class="btn btn-gray btn-small" href="{{ url_for('home', q=query, page=current_page+1, term=selected_terms) }}">Next</a>
+                    {% endif %}
+                </div>
+            </div>
+            {% endif %}
         {% else %}
             <div class="warning">No matching results found.</div>
         {% endif %}
     {% endif %}
 </div>
+<button id="back-to-top" class="btn btn-gray back-to-top" onclick="scrollToTopSmooth()">Back to top</button>
 </body>
 </html>
 """
@@ -3480,6 +3565,9 @@ TABLE_TEMPLATE = """
 @app.route("/")
 def home():
     query = request.args.get("q", "").strip()
+    current_page = max(1, request.args.get("page", 1, type=int) or 1)
+    total_pages = 1
+    total_results = 0
     results = []
     all_expanded_terms = []
     selected_terms = []
@@ -3496,8 +3584,14 @@ def home():
             selected_terms = exact_terms
 
         document_matches = search_documents(query, active_terms=selected_terms)
-        results, _ = search_requirements(query, active_terms=selected_terms)
-        summary = grouped_search_summary(results)
+        all_results, _ = search_requirements(query, active_terms=selected_terms)
+        summary = grouped_search_summary(all_results)
+        total_results = len(all_results)
+        total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
+        current_page = min(current_page, total_pages)
+        start_idx = (current_page - 1) * RESULTS_PER_PAGE
+        end_idx = start_idx + RESULTS_PER_PAGE
+        results = all_results[start_idx:end_idx]
 
     return render_template_string(
         HOME_TEMPLATE,
@@ -3508,6 +3602,10 @@ def home():
         selected_terms=selected_terms,
         exact_terms=exact_terms,
         summary=summary,
+        current_page=current_page,
+        total_pages=total_pages,
+        total_results=total_results,
+        results_per_page=RESULTS_PER_PAGE,
         doc_count=DocumentRecord.query.count(),
         block_count=RequirementBlock.query.count(),
         table_count=TablePreview.query.count(),
