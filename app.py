@@ -1023,6 +1023,37 @@ def get_page_image(document_path, page_num=1):
     except Exception as e:
         print(f"Page image error: {document_path} page {page_num} -> {e}")
         return None
+
+
+def list_docx_image_entries(document_path):
+    try:
+        with zipfile.ZipFile(document_path) as docx_zip:
+            image_entries = [
+                name
+                for name in docx_zip.namelist()
+                if name.startswith("word/media/")
+                and file_ext(name) in {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+            ]
+        return sorted(image_entries)
+    except Exception as exc:
+        print(f"DOCX image list error: {document_path} -> {exc}")
+        return []
+
+
+def get_docx_image(document_path, image_index=0):
+    image_entries = list_docx_image_entries(document_path)
+    if image_index < 0 or image_index >= len(image_entries):
+        return None
+
+    entry_name = image_entries[image_index]
+    try:
+        with zipfile.ZipFile(document_path) as docx_zip:
+            image_bytes = docx_zip.read(entry_name)
+        mime_type = mimetypes.guess_type(entry_name)[0] or "application/octet-stream"
+        return image_bytes, mime_type
+    except Exception as exc:
+        print(f"DOCX image read error: {document_path} {entry_name} -> {exc}")
+        return None
 # =========================================================
 # Text extraction
 # =========================================================
@@ -2213,6 +2244,13 @@ def search_documents(query, top_k=10, active_terms=None):
             query,
             1,
         )
+        image_indexes = []
+        if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
+            try:
+                with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+                    image_indexes = list(range(min(3, len(list_docx_image_entries(file_path)))))
+            except Exception as exc:
+                print(f"DOCX image preview error for doc {doc.id}: {exc}")
         results.append(
             {
                 "document_id": doc.id,
@@ -2224,6 +2262,7 @@ def search_documents(query, top_k=10, active_terms=None):
                 "is_docx": doc.extension.lower() == "docx",
                 "is_txt": doc.extension.lower() == "txt",
                 "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
+                "image_indexes": image_indexes,
             }
         )
     return results
@@ -2588,6 +2627,20 @@ HOME_TEMPLATE = """
                             onerror="this.style.display='none';"
                         />
                     </a>
+                    {% endif %}
+                    {% if doc.is_docx and doc.image_indexes %}
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:8px;">
+                        {% for image_index in doc.image_indexes %}
+                        <a href="{{ url_for('docx_viewer', document_id=doc.document_id, page=1) }}" target="_blank">
+                            <img
+                                src="{{ url_for('docx_image', document_id=doc.document_id, image_index=image_index) }}"
+                                loading="lazy"
+                                alt="DOCX drawing {{ image_index + 1 }}"
+                                onerror="this.style.display='none';"
+                            />
+                        </a>
+                        {% endfor %}
+                    </div>
                     {% endif %}
                     <div class="snippet doc-snippet">{{ doc.snippet|safe }}</div>
                 </div>
@@ -4019,6 +4072,20 @@ def page_image(document_id):
         # fallback: return a 1x1 transparent PNG (or 404)
         from flask import Response
         return Response(status=404)
+    return send_file(io.BytesIO(image_data[0]), mimetype=image_data[1])
+
+
+@app.route("/docx-image/<int:document_id>/<int:image_index>")
+def docx_image(document_id, image_index):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc or doc.extension != "docx":
+        abort(404)
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        abort(404)
+    with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+        image_data = get_docx_image(file_path, image_index)
+    if image_data is None:
+        abort(404)
     return send_file(io.BytesIO(image_data[0]), mimetype=image_data[1])
 
 def safe_excel_sheet_name(name, used_names=None) -> str:
