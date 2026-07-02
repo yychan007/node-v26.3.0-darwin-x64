@@ -663,6 +663,57 @@ def extract_page_text_from_preview(doc, page_num):
     return ""
 
 
+def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4):
+    offsets = load_page_offsets(doc)
+    if not offsets:
+        return []
+
+    q = (query or "").lower().strip()
+    query_terms = [t for t in re.findall(r"[a-z0-9\-]+", q) if len(t) > 1]
+    expanded_terms = [(t or "").lower().strip() for t in (active_terms or []) if t]
+    expanded_terms = [t for t in expanded_terms if len(t) > 1]
+
+    scored_pages = []
+    for _start, _end, page_num in offsets:
+        page_text = extract_page_text_from_preview(doc, page_num).lower()
+        if not page_text:
+            continue
+
+        if any(marker in page_text for marker in CONTENTS_MARKERS):
+            continue
+
+        has_drawing_marker = any(marker in page_text for marker in DRAWING_MARKERS)
+        if not has_drawing_marker:
+            continue
+
+        score = 0.0
+        score += 6.0  # hard-prioritize explicit drawing pages
+
+        term_hits = 0
+        for term in expanded_terms:
+            if term in page_text:
+                term_hits += 1
+        score += min(term_hits, 5) * 1.8
+
+        query_hits = 0
+        for token in query_terms:
+            if token in page_text:
+                query_hits += 1
+        score += min(query_hits, 5) * 1.3
+
+        if isinstance(center_page, int) and center_page > 0:
+            distance = abs(page_num - center_page)
+            score += max(0.0, 2.5 - (distance * 0.4))
+
+        scored_pages.append((page_num, score))
+
+    if not scored_pages:
+        return []
+
+    scored_pages.sort(key=lambda item: (item[1], -abs(item[0] - (center_page or item[0]))), reverse=True)
+    return [page for page, _score in scored_pages[:max_images]]
+
+
 def pdf_source_file_missing(doc):
     return (
         doc.extension.lower() == "pdf"
@@ -2356,25 +2407,13 @@ def search_documents(query, top_k=10, active_terms=None):
         image_pages = []
         image_indexes = []
         if doc.extension.lower() == "pdf":
-            offsets = load_page_offsets(doc)
-            total_pages = max((p for _s, _e, p in offsets), default=page or 1)
-            center = page or 1
-            candidates = [center, center - 1, center + 1, center - 2, center + 2]
-            # Prefer pages whose extracted text includes "drawing/tekening"
-            for p in candidates:
-                if not (isinstance(p, int) and 1 <= p <= total_pages):
-                    continue
-                page_text = extract_page_text_from_preview(doc, p).lower()
-                if any(marker in page_text for marker in CONTENTS_MARKERS):
-                    continue
-                if any(marker in page_text for marker in DRAWING_MARKERS):
-                    if p not in image_pages:
-                        image_pages.append(p)
-            # Fallback to nearby pages if none match drawing markers
-            if not image_pages:
-                for p in candidates:
-                    if isinstance(p, int) and 1 <= p <= total_pages and p not in image_pages:
-                        image_pages.append(p)
+            image_pages = select_pdf_drawing_pages(
+                doc,
+                query=query,
+                active_terms=active_terms,
+                center_page=page or 1,
+                max_images=4,
+            )
         if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
             try:
                 with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
