@@ -667,9 +667,91 @@ def extract_page_text_from_preview(doc, page_num):
     return ""
 
 
+def page_has_drawing_section_label(page_text):
+    for line in (page_text or "").splitlines():
+        normalized = re.sub(r"\s+", " ", line.strip().lower())
+        if not normalized:
+            continue
+        if normalized in DRAWING_MARKERS:
+            return True
+        if (normalized.startswith("drawing ") or normalized.startswith("tekening ")) and len(normalized) < 140:
+            return True
+    return False
+
+
+def _pdf_page_image_coverage(page):
+    page_area = max(0.0, float(page.rect.width) * float(page.rect.height))
+    if page_area <= 0:
+        return 0.0, 0
+
+    covered = 0.0
+    image_count = 0
+    try:
+        image_infos = page.get_image_info(xrefs=True)
+    except Exception:
+        image_infos = []
+
+    for info in image_infos or []:
+        bbox = info.get("bbox")
+        if not bbox or len(bbox) < 4:
+            continue
+        width = max(0.0, float(bbox[2]) - float(bbox[0]))
+        height = max(0.0, float(bbox[3]) - float(bbox[1]))
+        if width * height > 2500:
+            covered += width * height
+            image_count += 1
+
+    return min(1.0, covered / page_area), image_count
+
+
+def _is_visual_drawing_page(coverage, image_count, text_len):
+    if image_count <= 0:
+        return False
+    if text_len > 1800 and coverage < 0.22:
+        return False
+    if coverage >= 0.24:
+        return True
+    if coverage >= 0.10 and text_len < 700:
+        return True
+    if coverage >= 0.16 and text_len < 1200:
+        return True
+    return False
+
+
+def pdf_page_is_visual_drawing_page(doc, page_num, page_text="", pdf_doc=None):
+    if not OCR_AVAILABLE or fitz is None:
+        return False
+
+    text = (page_text or extract_page_text_from_preview(doc, page_num) or "").strip()
+    text_len = len(text)
+
+    try:
+        if pdf_doc is not None:
+            if page_num < 1 or page_num > len(pdf_doc):
+                return False
+            page = pdf_doc.load_page(page_num - 1)
+            coverage, image_count = _pdf_page_image_coverage(page)
+            return _is_visual_drawing_page(coverage, image_count, text_len)
+
+        if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+            return False
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+            with fitz.open(file_path) as opened:
+                if page_num < 1 or page_num > len(opened):
+                    return False
+                page = opened.load_page(page_num - 1)
+                coverage, image_count = _pdf_page_image_coverage(page)
+                return _is_visual_drawing_page(coverage, image_count, text_len)
+    except Exception as exc:
+        print(f"PDF visual drawing check error doc {doc.id} page {page_num}: {exc}")
+        return False
+
+
 def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4):
     offsets = load_page_offsets(doc)
     if not offsets:
+        return []
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER) or fitz is None:
         return []
 
     q = (query or "").lower().strip()
@@ -679,6 +761,7 @@ def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4
     total_pages = max((p for _s, _e, p in offsets), default=1)
 
     def page_matches_terms(page_text):
+        page_text = (page_text or "").lower()
         if q and q in page_text:
             return True
         if any(term in page_text for term in expanded_terms):
@@ -689,59 +772,54 @@ def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4
 
     scored_pages = []
     seen_pages = set()
-    for _start, _end, page_num in offsets:
-        page_text = extract_page_text_from_preview(doc, page_num).lower()
-        if not page_text:
-            continue
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+            with fitz.open(file_path) as pdf_doc:
+                for _start, _end, page_num in offsets:
+                    if page_num < 1 or page_num > total_pages:
+                        continue
 
-        if any(marker in page_text for marker in CONTENTS_MARKERS):
-            continue
+                    page_text = extract_page_text_from_preview(doc, page_num)
+                    page_text_lower = (page_text or "").lower()
+                    if any(marker in page_text_lower for marker in CONTENTS_MARKERS):
+                        continue
+                    if not pdf_page_is_visual_drawing_page(doc, page_num, page_text, pdf_doc=pdf_doc):
+                        continue
 
-        has_drawing_marker = any(marker in page_text for marker in DRAWING_MARKERS)
-        prev_text = ""
-        if page_num > 1:
-            prev_text = extract_page_text_from_preview(doc, page_num - 1).lower()
-        prev_has_drawing = any(marker in prev_text for marker in DRAWING_MARKERS)
-        prev_matches = page_matches_terms(prev_text)
+                    prev_text = ""
+                    if page_num > 1:
+                        prev_text = extract_page_text_from_preview(doc, page_num - 1) or ""
+                    prev_text_lower = prev_text.lower()
+                    prev_has_drawing_label = page_has_drawing_section_label(prev_text)
+                    prev_matches = page_matches_terms(prev_text_lower)
+                    current_matches = page_matches_terms(page_text_lower)
 
-        # Drawing captions are often on the previous page; include the following page image.
-        if prev_has_drawing and prev_matches:
-            score = 9.0
-            if isinstance(center_page, int) and center_page > 0:
-                distance = abs(page_num - center_page)
-                score += max(0.0, 3.0 - (distance * 0.4))
-            if page_num not in seen_pages:
-                scored_pages.append((page_num, score))
-                seen_pages.add(page_num)
-            continue
+                    if not (prev_matches or current_matches):
+                        continue
 
-        if not has_drawing_marker:
-            continue
+                    score = 8.0
+                    if prev_has_drawing_label and prev_matches:
+                        score += 5.0
+                    if current_matches:
+                        score += 2.0
+                    if page_has_drawing_section_label(page_text) and current_matches:
+                        score += 1.0
 
-        score = 6.0
-        term_hits = sum(1 for term in expanded_terms if term in page_text)
-        score += min(term_hits, 5) * 1.8
-        query_hits = sum(1 for token in query_terms if token in page_text)
-        score += min(query_hits, 5) * 1.3
+                    term_hits = sum(1 for term in expanded_terms if term in prev_text_lower or term in page_text_lower)
+                    score += min(term_hits, 5) * 1.5
+                    query_hits = sum(1 for token in query_terms if token in prev_text_lower or token in page_text_lower)
+                    score += min(query_hits, 5) * 1.2
 
-        if isinstance(center_page, int) and center_page > 0:
-            distance = abs(page_num - center_page)
-            score += max(0.0, 2.5 - (distance * 0.4))
+                    if isinstance(center_page, int) and center_page > 0:
+                        distance = abs(page_num - center_page)
+                        score += max(0.0, 2.5 - (distance * 0.35))
 
-        if page_num not in seen_pages:
-            scored_pages.append((page_num, score))
-            seen_pages.add(page_num)
-
-        if page_matches_terms(page_text) and page_num + 1 <= total_pages:
-            next_page = page_num + 1
-            next_text = extract_page_text_from_preview(doc, next_page).lower()
-            if not any(marker in next_text for marker in CONTENTS_MARKERS) and next_page not in seen_pages:
-                next_score = 8.5
-                if isinstance(center_page, int) and center_page > 0:
-                    distance = abs(next_page - center_page)
-                    next_score += max(0.0, 3.0 - (distance * 0.4))
-                scored_pages.append((next_page, next_score))
-                seen_pages.add(next_page)
+                    if page_num not in seen_pages:
+                        scored_pages.append((page_num, score))
+                        seen_pages.add(page_num)
+    except Exception as exc:
+        print(f"PDF drawing page select error for doc {doc.id}: {exc}")
+        return []
 
     if not scored_pages:
         return []
@@ -1414,20 +1492,7 @@ def select_docx_drawing_images(document_path, query, active_terms, max_images=4,
     scored.sort(reverse=True)
     if scored:
         return [idx for _score, idx in scored[:max_images]]
-
-    # Fallback: still prefer drawing-zone images even if query match is weak.
-    drawing_only = []
-    for candidate in candidates:
-        image_index = candidate["image_index"]
-        if image_index in seen:
-            continue
-        if not candidate.get("in_drawing_zone"):
-            continue
-        seen.add(image_index)
-        drawing_only.append(image_index)
-        if len(drawing_only) >= max_images:
-            break
-    return drawing_only
+    return []
 # =========================================================
 # Text extraction
 # =========================================================
@@ -2575,6 +2640,74 @@ def search_requirements(query, top_k=30, active_terms=None):
     return results[:top_k], all_expanded_terms
 
 
+def search_table_results(query, top_k=20, active_terms=None):
+    if not query.strip():
+        return []
+
+    exact_terms = default_exact_search_terms(query)
+    if active_terms is None:
+        active_terms = exact_terms
+    else:
+        active_terms = resolve_active_search_terms(query, active_terms)
+
+    q = query.lower().strip()
+    results = []
+    for row in TablePreview.query.all():
+        doc = row.document
+        if not doc:
+            continue
+
+        searchable_parts = [
+            row.sheet_name or "",
+            row.preview_title or "",
+            row.csv_text or "",
+            row.csv_text_en or "",
+            strip_html_legacy(row.html_table or ""),
+            strip_html_legacy(row.html_table_en or ""),
+            doc.original_filename or "",
+        ]
+        combined = "\n".join(part for part in searchable_parts if part).lower()
+        if not combined:
+            continue
+
+        if not any(
+            term_matches_text(term, combined)
+            for term in active_terms
+        ) and not (q and q in combined):
+            continue
+
+        score = 0.0
+        if q and q in combined:
+            score += 35.0
+        for term in exact_terms:
+            if term_matches_text(term, combined):
+                score += 20.0
+        for term in set(active_terms):
+            if term_matches_text(term, combined):
+                score += 6.0
+            if term_matches_text(term, row.sheet_name or ""):
+                score += 8.0
+            if term_matches_text(term, doc.original_filename or ""):
+                score += 5.0
+
+        results.append(
+            {
+                "table_id": row.id,
+                "document_id": doc.id,
+                "filename": doc.original_filename,
+                "sheet_name": row.sheet_name or "-",
+                "preview_title": row.preview_title or doc.original_filename,
+                "table_format": row.table_format or "xlsx",
+                "html_table": row.html_table or "",
+                "html_table_en": row.html_table_en or "",
+                "relevance": round(score, 2),
+            }
+        )
+
+    results.sort(key=lambda item: item["relevance"], reverse=True)
+    return results[:top_k]
+
+
 def search_documents(query, top_k=10, active_terms=None):
     q = query.lower().strip()
     exact_terms = default_exact_search_terms(query)
@@ -2609,7 +2742,9 @@ def search_documents(query, top_k=10, active_terms=None):
     scored.sort(key=lambda x: x[1], reverse=True)
 
     results = []
-    for doc, score in scored[:top_k]:
+    for doc, score in scored:
+        if len(results) >= top_k:
+            break
         requirement_id = "-"
         block_rows = RequirementBlock.query.filter_by(document_id=doc.id).all()
         if block_rows:
@@ -2678,6 +2813,11 @@ def search_documents(query, top_k=10, active_terms=None):
                     )
             except Exception as exc:
                 print(f"DOCX image preview error for doc {doc.id}: {exc}")
+
+        has_drawings = bool(image_pages or image_indexes)
+        if not has_drawings:
+            continue
+
         results.append(
             {
                 "document_id": doc.id,
@@ -3019,7 +3159,7 @@ HOME_TEMPLATE = """
                     </label>
                     {% endfor %}
                 </div>
-                <div class="panel-label" style="margin-top:14px;">SELECT SEARCH TERMS</div>
+                <div class="panel-label" style="margin-top:14px;">SELECT SEARCH TYPES</div>
                 <div class="term-filter-row">
                     <label>
                         <input type="checkbox" name="result_type" value="drawings"
@@ -3030,6 +3170,11 @@ HOME_TEMPLATE = """
                         <input type="checkbox" name="result_type" value="text"
                             {% if 'text' in result_types %}checked{% endif %}>
                         <span>Text</span>
+                    </label>
+                    <label>
+                        <input type="checkbox" name="result_type" value="tables"
+                            {% if 'tables' in result_types %}checked{% endif %}>
+                        <span>excel table</span>
                     </label>
                 </div>
                 <div class="search-filter-actions">
@@ -3130,6 +3275,43 @@ HOME_TEMPLATE = """
                 {% endfor %}
             </div>
         </div>
+        {% endif %}
+
+        {% if table_results and current_page == 1 and 'tables' in result_types %}
+        <div class="search-meta-panel">
+            <div class="panel-title">excel table</div>
+            {% for t in table_results %}
+            <div class="result-item">
+                <div class="filename">
+                    <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">
+                        {{ t.preview_title }}
+                    </a>
+                </div>
+                <div class="meta-prominent">
+                    <div class="meta-item">Filename: <strong>{{ t.filename }}</strong></div>
+                    <div class="meta-item">Sheet: <strong>{{ t.sheet_name }}</strong></div>
+                    <div class="meta-item">Format: <strong>{{ t.table_format }}</strong></div>
+                </div>
+                <div class="snippet-columns">
+                    <div class="snippet-panel snippet-panel-original">
+                        <strong>Table 1 / Dutch (Original)</strong>
+                        <div class="data-table">{{ t.html_table|safe }}</div>
+                    </div>
+                    {% if t.html_table_en %}
+                    <div class="snippet-panel snippet-panel-translation">
+                        <strong>Table 2 / English (Translation)</strong>
+                        <div class="data-table">{{ t.html_table_en|safe }}</div>
+                    </div>
+                    {% endif %}
+                </div>
+                <div class="meta">
+                    <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open full table preview</a>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% elif 'tables' in result_types and current_page == 1 %}
+        <div class="warning">No matching excel tables found.</div>
         {% endif %}
 
         {% if 'text' in result_types %}
@@ -3973,6 +4155,7 @@ def home():
     exact_terms = []
     summary = {"top_categories": [], "top_requirement_ids": []}
     document_matches = []
+    table_results = []
     result_types = ["drawings", "text"]
 
     if query:
@@ -3984,13 +4167,15 @@ def home():
             selected_terms = exact_terms
 
         requested_result_types = [
-            t for t in request.args.getlist("result_type") if t in {"drawings", "text"}
+            t for t in request.args.getlist("result_type") if t in {"drawings", "text", "tables"}
         ]
         if requested_result_types:
             result_types = requested_result_types
 
         if "drawings" in result_types:
             document_matches = search_documents(query, active_terms=selected_terms)
+        if "tables" in result_types:
+            table_results = search_table_results(query, active_terms=selected_terms)
         if "text" in result_types:
             all_results, _ = search_requirements(query, active_terms=selected_terms)
             summary = grouped_search_summary(all_results)
@@ -4006,6 +4191,7 @@ def home():
         query=query,
         results=results,
         document_matches=document_matches,
+        table_results=table_results,
         all_expanded_terms=all_expanded_terms,
         selected_terms=selected_terms,
         exact_terms=exact_terms,
