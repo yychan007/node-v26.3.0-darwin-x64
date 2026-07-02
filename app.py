@@ -1004,25 +1004,36 @@ def get_page_image(document_path, page_num=1):
     Convert a single PDF page to PNG image bytes.
     Returns (bytes, mimetype) or None if conversion fails.
     """
-    if not PDF2IMAGE_AVAILABLE or convert_from_path is None:
-        return None
-    try:
-        # Convert only the requested page (page_num is 1-based)
-        images = convert_from_path(
-            document_path,
-            first_page=page_num,
-            last_page=page_num,
-            dpi=150  # reasonable quality for preview
-        )
-        if not images:
-            return None
-        img_io = io.BytesIO()
-        images[0].save(img_io, format='PNG')
-        img_io.seek(0)
-        return img_io.getvalue(), 'image/png'
-    except Exception as e:
-        print(f"Page image error: {document_path} page {page_num} -> {e}")
-        return None
+    # First try pdf2image (requires poppler).
+    if PDF2IMAGE_AVAILABLE and convert_from_path is not None:
+        try:
+            images = convert_from_path(
+                document_path,
+                first_page=page_num,
+                last_page=page_num,
+                dpi=150,
+            )
+            if images:
+                img_io = io.BytesIO()
+                images[0].save(img_io, format="PNG")
+                img_io.seek(0)
+                return img_io.getvalue(), "image/png"
+        except Exception as e:
+            print(f"pdf2image page render error: {document_path} page {page_num} -> {e}")
+
+    # Fallback: render with PyMuPDF, which doesn't need poppler.
+    if OCR_AVAILABLE and fitz is not None:
+        try:
+            with fitz.open(document_path) as pdf_doc:
+                if page_num < 1 or page_num > len(pdf_doc):
+                    return None
+                page = pdf_doc.load_page(page_num - 1)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
+                return pix.tobytes("png"), "image/png"
+        except Exception as e:
+            print(f"fitz page render error: {document_path} page {page_num} -> {e}")
+
+    return None
 
 
 def list_docx_image_entries(document_path):
@@ -2244,7 +2255,19 @@ def search_documents(query, top_k=10, active_terms=None):
             query,
             1,
         )
+        image_pages = []
         image_indexes = []
+        if doc.extension.lower() == "pdf":
+            offsets = load_page_offsets(doc)
+            total_pages = max((p for _s, _e, p in offsets), default=page or 1)
+            center = page or 1
+            candidates = [center, center + 1, center - 1]
+            image_pages = [
+                p for p in candidates if isinstance(p, int) and p >= 1 and p <= total_pages
+            ]
+            # keep order and remove duplicates
+            seen_pages = set()
+            image_pages = [p for p in image_pages if not (p in seen_pages or seen_pages.add(p))]
         if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
             try:
                 with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
@@ -2262,6 +2285,7 @@ def search_documents(query, top_k=10, active_terms=None):
                 "is_docx": doc.extension.lower() == "docx",
                 "is_txt": doc.extension.lower() == "txt",
                 "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
+                "image_pages": image_pages,
                 "image_indexes": image_indexes,
             }
         )
@@ -2618,15 +2642,19 @@ HOME_TEMPLATE = """
                         Page: <strong>{{ doc.page or 1 }}</strong>
                         | Relevance: <strong>{{ doc.relevance }}</strong>
                     </div>
-                    {% if doc.is_pdf %}
-                    <a href="{{ url_for('pdf_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
-                        <img
-                            src="{{ url_for('page_image', document_id=doc.document_id, page=doc.page or 1) }}"
-                            loading="lazy"
-                            alt="Page {{ doc.page or 1 }} preview"
-                            onerror="this.style.display='none';"
-                        />
-                    </a>
+                    {% if doc.is_pdf and doc.image_pages %}
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:8px;">
+                        {% for page_num in doc.image_pages %}
+                        <a href="{{ url_for('pdf_viewer', document_id=doc.document_id, page=page_num) }}" target="_blank">
+                            <img
+                                src="{{ url_for('page_image', document_id=doc.document_id, page=page_num) }}"
+                                loading="lazy"
+                                alt="PDF page {{ page_num }} preview"
+                                onerror="this.style.display='none';"
+                            />
+                        </a>
+                        {% endfor %}
+                    </div>
                     {% endif %}
                     {% if doc.is_docx and doc.image_indexes %}
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:8px;">
