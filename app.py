@@ -1045,6 +1045,15 @@ def find_hit_position(text, expanded_tokens, query=""):
     return hit_pos
 
 
+def compact_display_text(text):
+    if not text:
+        return ""
+    normalized = re.sub(r"\r\n?", "\n", text)
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
 def resolve_result_page(doc, char_start, body_text, expanded_tokens, query, fallback_page=1):
     offsets = load_page_offsets(doc)
     if not offsets:
@@ -2052,7 +2061,7 @@ def semantic_score(query, block):
         return 0.0
 
 def get_result_snippet(block, active_terms, query=""):
-    text = block.full_text or ""
+    text = compact_display_text(block.full_text or "")
     hit_pos = find_hit_position(text, active_terms, query)
 
     window = 900
@@ -2074,7 +2083,7 @@ def get_result_snippet(block, active_terms, query=""):
 
 
 def get_text_snippet(text, expanded_tokens, query=""):
-    text = text or ""
+    text = compact_display_text(text or "")
     text_lower = text.lower()
     hit_pos = find_hit_position(text, expanded_tokens, query)
 
@@ -2581,7 +2590,7 @@ button { background:#0069d9; }
 }
 .snippet-panel .snippet {
   margin-top:8px;
-  height:100%;
+  height:auto;
   box-sizing:border-box;
 }
 .snippet-panel-original .snippet {
