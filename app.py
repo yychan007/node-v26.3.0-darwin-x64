@@ -41,6 +41,7 @@ import secrets
 import zipfile
 import tempfile
 import mimetypes
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -318,6 +319,9 @@ CONTENTS_MARKERS = (
     "inhoudsopgave",
     "inhoud",
 )
+DOCX_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+DOCX_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+DOCX_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 REQ_ID_REGEX = re.compile(r'\b([A-Z]{1,10}-Req-\d+(?:\.\d+)?)\b', re.IGNORECASE)
 
@@ -672,8 +676,19 @@ def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4
     query_terms = [t for t in re.findall(r"[a-z0-9\-]+", q) if len(t) > 1]
     expanded_terms = [(t or "").lower().strip() for t in (active_terms or []) if t]
     expanded_terms = [t for t in expanded_terms if len(t) > 1]
+    total_pages = max((p for _s, _e, p in offsets), default=1)
+
+    def page_matches_terms(page_text):
+        if q and q in page_text:
+            return True
+        if any(term in page_text for term in expanded_terms):
+            return True
+        if any(token in page_text for token in query_terms):
+            return True
+        return False
 
     scored_pages = []
+    seen_pages = set()
     for _start, _end, page_num in offsets:
         page_text = extract_page_text_from_preview(doc, page_num).lower()
         if not page_text:
@@ -683,29 +698,50 @@ def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4
             continue
 
         has_drawing_marker = any(marker in page_text for marker in DRAWING_MARKERS)
+        prev_text = ""
+        if page_num > 1:
+            prev_text = extract_page_text_from_preview(doc, page_num - 1).lower()
+        prev_has_drawing = any(marker in prev_text for marker in DRAWING_MARKERS)
+        prev_matches = page_matches_terms(prev_text)
+
+        # Drawing captions are often on the previous page; include the following page image.
+        if prev_has_drawing and prev_matches:
+            score = 9.0
+            if isinstance(center_page, int) and center_page > 0:
+                distance = abs(page_num - center_page)
+                score += max(0.0, 3.0 - (distance * 0.4))
+            if page_num not in seen_pages:
+                scored_pages.append((page_num, score))
+                seen_pages.add(page_num)
+            continue
+
         if not has_drawing_marker:
             continue
 
-        score = 0.0
-        score += 6.0  # hard-prioritize explicit drawing pages
-
-        term_hits = 0
-        for term in expanded_terms:
-            if term in page_text:
-                term_hits += 1
+        score = 6.0
+        term_hits = sum(1 for term in expanded_terms if term in page_text)
         score += min(term_hits, 5) * 1.8
-
-        query_hits = 0
-        for token in query_terms:
-            if token in page_text:
-                query_hits += 1
+        query_hits = sum(1 for token in query_terms if token in page_text)
         score += min(query_hits, 5) * 1.3
 
         if isinstance(center_page, int) and center_page > 0:
             distance = abs(page_num - center_page)
             score += max(0.0, 2.5 - (distance * 0.4))
 
-        scored_pages.append((page_num, score))
+        if page_num not in seen_pages:
+            scored_pages.append((page_num, score))
+            seen_pages.add(page_num)
+
+        if page_matches_terms(page_text) and page_num + 1 <= total_pages:
+            next_page = page_num + 1
+            next_text = extract_page_text_from_preview(doc, next_page).lower()
+            if not any(marker in next_text for marker in CONTENTS_MARKERS) and next_page not in seen_pages:
+                next_score = 8.5
+                if isinstance(center_page, int) and center_page > 0:
+                    distance = abs(next_page - center_page)
+                    next_score += max(0.0, 3.0 - (distance * 0.4))
+                scored_pages.append((next_page, next_score))
+                seen_pages.add(next_page)
 
     if not scored_pages:
         return []
@@ -1184,6 +1220,214 @@ def get_top_docx_image_indexes(document_path, max_images=4, min_area=50000):
 
     scored.sort(reverse=True)
     return [idx for _area, idx in scored[:max_images]]
+
+
+def _read_docx_relationships(docx_zip, rels_path):
+    try:
+        root = ET.fromstring(docx_zip.read(rels_path))
+    except Exception:
+        return {}
+    rels = {}
+    for rel in root:
+        rel_id = rel.attrib.get("Id")
+        target = rel.attrib.get("Target", "")
+        if rel_id and target:
+            rels[rel_id] = target
+    return rels
+
+
+def _docx_target_to_media_path(target):
+    target = (target or "").lstrip("/")
+    if target.startswith("word/"):
+        return target
+    return f"word/{target}"
+
+
+def _docx_paragraph_text_and_images(paragraph_elem):
+    texts = []
+    image_rids = []
+    has_page_break = False
+    for elem in paragraph_elem.iter():
+        tag = elem.tag
+        if tag == f"{DOCX_W_NS}t":
+            if elem.text:
+                texts.append(elem.text)
+            if elem.tail:
+                texts.append(elem.tail)
+        elif tag == f"{DOCX_W_NS}br":
+            if elem.attrib.get(f"{DOCX_W_NS}type") == "page":
+                has_page_break = True
+        elif tag == f"{DOCX_A_NS}blip":
+            rid = elem.attrib.get(f"{DOCX_R_NS}embed") or elem.attrib.get(f"{DOCX_R_NS}link")
+            if rid:
+                image_rids.append(rid)
+    return "".join(texts).strip(), image_rids, has_page_break
+
+
+def _docx_table_text(table_elem):
+    parts = []
+    for text_elem in table_elem.iter(f"{DOCX_W_NS}t"):
+        if text_elem.text:
+            parts.append(text_elem.text)
+        if text_elem.tail:
+            parts.append(text_elem.tail)
+    return "".join(parts).strip()
+
+
+def _is_drawing_heading(text):
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return normalized in DRAWING_MARKERS or normalized.startswith("drawing ") or normalized.startswith("tekening ")
+
+
+def _docx_image_area(document_path, image_index, min_area=50000):
+    image_entries = list_docx_image_entries(document_path)
+    if image_index < 0 or image_index >= len(image_entries):
+        return 0
+    try:
+        with zipfile.ZipFile(document_path) as docx_zip:
+            raw = docx_zip.read(image_entries[image_index])
+        with Image.open(io.BytesIO(raw)) as img:
+            width, height = img.size
+            area = max(0, int(width)) * max(0, int(height))
+        return area if area >= min_area else 0
+    except Exception:
+        return 0
+
+
+def collect_docx_drawing_image_candidates(document_path, min_area=50000):
+    candidates = []
+    try:
+        with zipfile.ZipFile(document_path) as docx_zip:
+            rels = _read_docx_relationships(docx_zip, "word/_rels/document.xml.rels")
+            media_entries = list_docx_image_entries(document_path)
+            media_index = {name: idx for idx, name in enumerate(media_entries)}
+
+            root = ET.fromstring(docx_zip.read("word/document.xml"))
+            body = root.find(f".//{DOCX_W_NS}body")
+            if body is None:
+                return []
+
+            recent_text = []
+            drawing_caption = ""
+            blocks_since_drawing_marker = 999
+
+            for child in body:
+                text = ""
+                image_indexes = []
+                has_page_break = False
+
+                if child.tag == f"{DOCX_W_NS}p":
+                    text, image_rids, has_page_break = _docx_paragraph_text_and_images(child)
+                    for rid in image_rids:
+                        target = rels.get(rid, "")
+                        media_path = _docx_target_to_media_path(target)
+                        if media_path in media_index:
+                            image_indexes.append(media_index[media_path])
+                elif child.tag == f"{DOCX_W_NS}tbl":
+                    text = _docx_table_text(child)
+
+                if text:
+                    lower = text.lower()
+                    if _is_drawing_heading(text) or any(marker in lower for marker in DRAWING_MARKERS):
+                        blocks_since_drawing_marker = 0
+                        drawing_caption = ""
+                    elif blocks_since_drawing_marker < 8:
+                        blocks_since_drawing_marker += 1
+                        if blocks_since_drawing_marker <= 3 and not _is_drawing_heading(text):
+                            drawing_caption = text
+                    else:
+                        blocks_since_drawing_marker = 999
+                        drawing_caption = ""
+
+                    recent_text.append(text)
+                    if len(recent_text) > 10:
+                        recent_text = recent_text[-10:]
+
+                if has_page_break and blocks_since_drawing_marker < 8:
+                    blocks_since_drawing_marker += 1
+
+                if not image_indexes:
+                    continue
+
+                context = " ".join(recent_text)
+                for image_index in image_indexes:
+                    if _docx_image_area(document_path, image_index, min_area=min_area) <= 0:
+                        continue
+                    candidates.append(
+                        {
+                            "image_index": image_index,
+                            "context": context,
+                            "caption": drawing_caption,
+                            "in_drawing_zone": blocks_since_drawing_marker <= 8,
+                        }
+                    )
+    except Exception as exc:
+        print(f"DOCX drawing candidate error: {document_path} -> {exc}")
+    return candidates
+
+
+def score_docx_drawing_candidate(candidate, query, active_terms):
+    context = f"{candidate.get('context', '')} {candidate.get('caption', '')}".lower()
+    if any(marker in context for marker in CONTENTS_MARKERS):
+        return -1.0
+    if not candidate.get("in_drawing_zone") and not any(marker in context for marker in DRAWING_MARKERS):
+        return -1.0
+
+    score = 4.0 if candidate.get("in_drawing_zone") else 0.0
+    if any(marker in context for marker in DRAWING_MARKERS):
+        score += 4.0
+
+    q = (query or "").lower().strip()
+    if q and q in context:
+        score += 6.0
+
+    for term in active_terms or []:
+        term_lower = (term or "").lower().strip()
+        if len(term_lower) > 1 and term_lower in context:
+            score += 3.0
+
+    query_tokens = [t for t in re.findall(r"[a-z0-9\-]+", q) if len(t) > 2]
+    for token in query_tokens:
+        if token in context:
+            score += 1.5
+
+    return score
+
+
+def select_docx_drawing_images(document_path, query, active_terms, max_images=4, min_area=50000):
+    candidates = collect_docx_drawing_image_candidates(document_path, min_area=min_area)
+    if not candidates:
+        return []
+
+    scored = []
+    seen = set()
+    for candidate in candidates:
+        image_index = candidate["image_index"]
+        if image_index in seen:
+            continue
+        score = score_docx_drawing_candidate(candidate, query, active_terms)
+        if score <= 0:
+            continue
+        seen.add(image_index)
+        scored.append((score, image_index))
+
+    scored.sort(reverse=True)
+    if scored:
+        return [idx for _score, idx in scored[:max_images]]
+
+    # Fallback: still prefer drawing-zone images even if query match is weak.
+    drawing_only = []
+    for candidate in candidates:
+        image_index = candidate["image_index"]
+        if image_index in seen:
+            continue
+        if not candidate.get("in_drawing_zone"):
+            continue
+        seen.add(image_index)
+        drawing_only.append(image_index)
+        if len(drawing_only) >= max_images:
+            break
+    return drawing_only
 # =========================================================
 # Text extraction
 # =========================================================
@@ -2426,7 +2670,12 @@ def search_documents(query, top_k=10, active_terms=None):
         if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
             try:
                 with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
-                    image_indexes = get_top_docx_image_indexes(file_path, max_images=4, min_area=50000)
+                    image_indexes = select_docx_drawing_images(
+                        file_path,
+                        query=query,
+                        active_terms=active_terms,
+                        max_images=4,
+                    )
             except Exception as exc:
                 print(f"DOCX image preview error for doc {doc.id}: {exc}")
         results.append(
