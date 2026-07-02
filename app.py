@@ -2352,6 +2352,21 @@ a:hover { text-decoration:underline; }
 .badge { display:inline-block; background:#eef; color:#334; padding:3px 8px; border-radius:12px; font-size:12px; margin-right:6px; }
 .page-img-preview { max-width:200px; max-height:200px; border:1px solid #ccc; margin-right:16px; float:left; cursor:pointer; transition: transform 0.2s; }
 .page-img-preview:hover { transform: scale(1.02); }
+.result-page-img img {
+  max-width: 240px;
+  max-height: 240px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+.result-page-img {
+  margin: 10px 0 12px 0;
+}
+@media (max-width: 900px) {
+  .result-page-img img {
+    max-width: 100%;
+    height: auto;
+  }
+}
 .clearfix::after { content:""; display:table; clear:both; }
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
@@ -2534,6 +2549,19 @@ HOME_TEMPLATE = """
                         | Category: <strong>{{ res.category }}</strong>
                         {% if res.ocr_used %}| <strong>OCR used</strong>{% endif %}
                     </div>
+
+                    {% if res.is_pdf %}
+                    <div class="result-page-img">
+                        <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
+                            <img
+                                src="{{ url_for('page_image', document_id=res.document_id, page=res.page or 1) }}"
+                                loading="lazy"
+                                alt="Page {{ res.page or 1 }} preview"
+                                onerror="this.style.display='none';"
+                            />
+                        </a>
+                    </div>
+                    {% endif %}
 
                     {% if res.definition %}
                         <div><strong>Definition:</strong> {{ res.definition }}</div>
