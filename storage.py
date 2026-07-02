@@ -48,12 +48,100 @@ def bucket_name():
     return ""
 
 
-def document_key(stored_filename):
+def key_prefix():
     if supabase_s3_enabled():
-        prefix = os.environ.get("SUPABASE_S3_KEY_PREFIX", "documents").strip("/")
-    else:
-        prefix = os.environ.get("R2_KEY_PREFIX", "documents").strip("/")
+        return os.environ.get("SUPABASE_S3_KEY_PREFIX", "").strip("/")
+    return os.environ.get("R2_KEY_PREFIX", "documents").strip("/")
+
+
+def document_key(stored_filename):
+    prefix = key_prefix()
     return f"{prefix}/{stored_filename}" if prefix else stored_filename
+
+
+def format_storage_error(exc):
+    message = str(exc)
+    bucket = bucket_name()
+    if "NoSuchBucket" in message or "Bucket not found" in message:
+        return (
+            f"Supabase bucket '{bucket}' was not found. "
+            "In Supabase Dashboard go to Storage → New bucket, create a bucket with "
+            f"this exact name ('{bucket}'), then try again. "
+            "Also verify SUPABASE_S3_BUCKET_NAME on Render matches that name."
+        )
+    if "AccessDenied" in message or "403" in message:
+        return (
+            f"Access denied for bucket '{bucket}'. "
+            "Regenerate S3 access keys in Supabase → Project Settings → Storage → "
+            "S3 Access Keys, then update SUPABASE_S3_ACCESS_KEY_ID and "
+            "SUPABASE_S3_SECRET_ACCESS_KEY on Render."
+        )
+    if "InvalidAccessKeyId" in message or "SignatureDoesNotMatch" in message:
+        return (
+            "Invalid Supabase S3 credentials. "
+            "Check SUPABASE_S3_ACCESS_KEY_ID, SUPABASE_S3_SECRET_ACCESS_KEY, "
+            "SUPABASE_S3_ENDPOINT, and SUPABASE_S3_REGION on Render."
+        )
+    return message
+
+
+def get_storage_status():
+    backend = storage_backend_name()
+    if not object_storage_enabled():
+        return {
+            "ok": True,
+            "backend": backend,
+            "persistent": False,
+            "bucket": "",
+            "key_prefix": "",
+            "message": "Files are saved on local disk only (lost after Render restart).",
+        }
+
+    bucket = bucket_name()
+    prefix = key_prefix()
+    status = {
+        "ok": False,
+        "backend": backend,
+        "persistent": True,
+        "bucket": bucket,
+        "key_prefix": prefix or "(root)",
+        "endpoint": os.environ.get("SUPABASE_S3_ENDPOINT", "") if supabase_s3_enabled() else "",
+        "region": os.environ.get("SUPABASE_S3_REGION", "") if supabase_s3_enabled() else "",
+        "message": "",
+        "hint": "",
+    }
+
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        client = get_s3_client()
+        client.head_bucket(Bucket=bucket)
+        status["ok"] = True
+        status["message"] = f"Connected to bucket '{bucket}'."
+        return status
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        status["message"] = exc.response.get("Error", {}).get("Message", str(exc))
+        if code in {"404", "NoSuchBucket", "NotFound"}:
+            status["hint"] = (
+                f"Create bucket '{bucket}' in Supabase → Storage → New bucket. "
+                "Set SUPABASE_S3_BUCKET_NAME on Render to the same name."
+            )
+        elif code in {"403", "AccessDenied"}:
+            status["hint"] = (
+                "Regenerate S3 access keys in Supabase → Project Settings → Storage."
+            )
+        else:
+            status["hint"] = format_storage_error(exc)
+        return status
+    except (BotoCoreError, RuntimeError) as exc:
+        status["message"] = str(exc)
+        status["hint"] = format_storage_error(exc)
+        return status
+    except Exception as exc:
+        status["message"] = str(exc)
+        status["hint"] = format_storage_error(exc)
+        return status
 
 
 def get_s3_client():
@@ -176,7 +264,7 @@ def save_document(stored_filename, temp_path, local_folder):
                 document_key(stored_filename),
             )
         except Exception as exc:
-            raise RuntimeError(f"Cloud storage upload failed: {exc}") from exc
+            raise RuntimeError(format_storage_error(exc)) from exc
         temp.unlink(missing_ok=True)
         return size
 
