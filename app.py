@@ -44,6 +44,7 @@ import mimetypes
 from datetime import datetime
 from collections import defaultdict, Counter
 from pathlib import Path
+from typing import Any, cast
 
 import pdfplumber
 import pandas as pd
@@ -70,7 +71,7 @@ from flask_login import (  # pyright: ignore[reportMissingImports]
 from PIL import Image
 
 def extract_text_from_image(path):
-    if not TESSERACT_AVAILABLE:
+    if not TESSERACT_AVAILABLE or pytesseract is None:
         return "", [(0, 0, 1)], []
 
     try:
@@ -84,12 +85,14 @@ def extract_text_from_image(path):
 
 # Optional packages
 DOCX_AVAILABLE = True
+DocxDocument = None
 try:
     from docx import Document as DocxDocument
 except Exception:
     DOCX_AVAILABLE = False
 
 OCR_AVAILABLE = True
+fitz = None
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -97,11 +100,13 @@ except Exception:
 
 TESSERACT_AVAILABLE = True
 PDF2IMAGE_AVAILABLE = False
+pytesseract = None
 try:
     import pytesseract
 except Exception:
     TESSERACT_AVAILABLE = False
 
+convert_from_path = None
 try:
     from pdf2image import convert_from_path
     PDF2IMAGE_AVAILABLE = True
@@ -109,6 +114,7 @@ except Exception:
     PDF2IMAGE_AVAILABLE = False
 
 SEMANTIC_AVAILABLE = True
+SentenceTransformer = None
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
@@ -201,7 +207,8 @@ if IS_PRODUCTION:
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
-login_manager.login_view = "login"
+# Avoid static type issues with Flask-Login's stubs.
+setattr(login_manager, "login_view", "login")
 login_manager.login_message_category = "warning"
 
 
@@ -239,7 +246,7 @@ def get_semantic_model():
     global semantic_model
     if not SEMANTIC_SEARCH_ENABLED:
         return None
-    if semantic_model is None and SEMANTIC_AVAILABLE:
+    if semantic_model is None and SEMANTIC_AVAILABLE and SentenceTransformer is not None:
         try:
             semantic_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
         except Exception:
@@ -536,7 +543,7 @@ def detect_category(text, title=""):
         return "Cables"
     return "General"
 
-def strip_html(text):
+def strip_html_legacy(text):
     return re.sub(r"<[^>]+>", "", text or "")
 
 
@@ -551,8 +558,9 @@ def store_cached_translation(text_hash, source_text, translated_text, provider=N
     row = TranslationCache.query.get(text_hash)
     if row:
         return
+    cache_cls = cast(Any, TranslationCache)
     db.session.add(
-        TranslationCache(
+        cache_cls(
             text_hash=text_hash,
             source_text=source_text[:5000],
             translated_text=translated_text,
@@ -582,12 +590,14 @@ def get_document_full_text(doc):
                 text, _ = extract_text_from_docx(file_path)
             elif ext == "txt":
                 text, _ = extract_text_from_txt(file_path)
-            elif ext == "pdf" and OCR_AVAILABLE:
+            elif ext == "pdf" and OCR_AVAILABLE and fitz is not None:
                 with fitz.open(file_path) as pdf_doc:
-                    text = "\n".join(
-                        (pdf_doc.load_page(i).get_text("text") or "")
-                        for i in range(len(pdf_doc))
-                    )
+                    # Convert to str explicitly to keep the type checker happy.
+                    text_parts = []
+                    for i in range(len(pdf_doc)):
+                        page_text = pdf_doc.load_page(i).get_text("text") or ""
+                        text_parts.append(str(page_text))
+                    text = "\n".join(text_parts)
             else:
                 text = ""
     except Exception as exc:
@@ -657,7 +667,7 @@ def extract_single_page_text(doc, page_num):
     if ext != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         return ""
 
-    if not OCR_AVAILABLE:
+    if not OCR_AVAILABLE or fitz is None:
         return ""
 
     try:
@@ -665,7 +675,8 @@ def extract_single_page_text(doc, page_num):
             with fitz.open(file_path) as pdf_doc:
                 if page_num < 1 or page_num > len(pdf_doc):
                     return ""
-                return (pdf_doc.load_page(page_num - 1).get_text("text") or "").strip()
+                page_text = pdf_doc.load_page(page_num - 1).get_text("text") or ""
+                return str(page_text).strip()
     except Exception as exc:
         print(f"Page text extract error for doc {doc.id} page {page_num}: {exc}")
         return ""
@@ -687,12 +698,14 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
             row.translated_text_es if target_lang == "es" else row.translated_text
         ) or ""
     if cached_translation:
+        cached_source = row.source_text if row else ""
+        cached_provider = row.provider if row else get_translation_provider()
         return {
             "page": page_num,
             "lang": target_lang,
-            "source": row.source_text,
+            "source": cached_source,
             "translation": cached_translation,
-            "provider": row.provider,
+            "provider": cached_provider,
             "cached": True,
         }
 
@@ -726,8 +739,9 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
                 row.translated_text = translated
             row.provider = provider
         else:
+            dpt_cls = cast(Any, DocumentPageTranslation)
             db.session.add(
-                DocumentPageTranslation(
+                dpt_cls(
                     document_id=doc.id,
                     page=page_num,
                     source_text=source[:20000],
@@ -759,7 +773,7 @@ def count_pdf_pages(doc):
     if doc.extension != "pdf" or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         return 0
 
-    if not OCR_AVAILABLE:
+    if not OCR_AVAILABLE or fitz is None:
         return 0
 
     try:
@@ -800,6 +814,8 @@ def _split_text_for_pages(text, max_chars=3200):
 
 
 def _append_translation_text(pdf_doc, header, text):
+    if fitz is None:
+        raise RuntimeError("PyMuPDF is required to export translated PDFs.")
     page_width, page_height = fitz.paper_size("a4")
     margin_x = 50
     margin_top = 70
@@ -829,6 +845,8 @@ def _append_translation_text(pdf_doc, header, text):
 
 def build_translated_pdf_bytes(doc, target_lang="en"):
     if not OCR_AVAILABLE:
+        raise RuntimeError("PyMuPDF is required to export translated PDFs.")
+    if fitz is None:
         raise RuntimeError("PyMuPDF is required to export translated PDFs.")
 
     if not translation.translation_enabled():
@@ -986,7 +1004,7 @@ def get_page_image(document_path, page_num=1):
     Convert a single PDF page to PNG image bytes.
     Returns (bytes, mimetype) or None if conversion fails.
     """
-    if not PDF2IMAGE_AVAILABLE:
+    if not PDF2IMAGE_AVAILABLE or convert_from_path is None:
         return None
     try:
         # Convert only the requested page (page_num is 1-based)
@@ -1023,7 +1041,7 @@ def ensure_indexable_file(path):
 
 
 def extract_text_from_pdf_fitz(path, max_pages=0):
-    if not OCR_AVAILABLE:
+    if not OCR_AVAILABLE or fitz is None:
         return None
 
     full_text = ""
@@ -1036,7 +1054,7 @@ def extract_text_from_pdf_fitz(path, max_pages=0):
             page_limit = total_pages if max_pages <= 0 else min(total_pages, max_pages)
             for page_num in range(page_limit):
                 page = doc.load_page(page_num)
-                text = page.get_text("text") or ""
+                text = str(page.get_text("text") or "")
                 start = current
                 full_text += text + "\n"
                 current += len(text) + 1
@@ -1080,7 +1098,7 @@ def extract_text_from_txt(path):
     return text, [(0, len(text), 1)]
 
 def extract_text_from_docx(path):
-    if not DOCX_AVAILABLE:
+    if not DOCX_AVAILABLE or DocxDocument is None:
         return "", [(0, 0, 1)]
     doc = DocxDocument(path)
     parts = []
@@ -1199,7 +1217,7 @@ def normalize_excel_sheet(raw_df, max_rows=200):
     return body.head(max_rows)
 
 def ocr_pdf(path):
-    if not TESSERACT_AVAILABLE:
+    if not TESSERACT_AVAILABLE or pytesseract is None or convert_from_path is None:
         return "", [(0, 0, 1)]
 
     full_text = ""
@@ -1209,7 +1227,8 @@ def ocr_pdf(path):
     try:
         images = convert_from_path(path)
         for i, image in enumerate(images, start=1):
-            text = pytesseract.image_to_string(image)
+            text = pytesseract.image_to_string(image) or ""
+            text = str(text)
             start = current
             full_text += text + "\n"
             current += len(text) + 1
@@ -1516,7 +1535,8 @@ def create_default_admin():
 
     user = User.query.filter_by(username=admin_username).first()
     if not user:
-        user = User(username=admin_username, role=ADMIN_ROLE)
+        user_cls = cast(Any, User)
+        user = user_cls(username=admin_username, role=ADMIN_ROLE)
         user.set_password(admin_password)
         db.session.add(user)
         db.session.commit()
@@ -1573,7 +1593,8 @@ def save_table_previews(doc_id, tables):
             html_table_en, csv_text_en = translate_preview_df(preview_df, "en")
         csv_buf = io.StringIO()
         preview_df.to_csv(csv_buf, index=False)
-        row = TablePreview(
+        table_preview_cls = cast(Any, TablePreview)
+        row = table_preview_cls(
             document_id=doc_id,
             sheet_name=str(sheet_name),
             page=1,
@@ -1710,7 +1731,8 @@ def _index_document_record_impl(doc_record):
             continue
         seen_hashes.add(th)
 
-        row = RequirementBlock(
+        req_block_cls = cast(Any, RequirementBlock)
+        row = req_block_cls(
             document_id=doc_record.id,
             requirement_id=b["requirement_id"],
             title=b["title"],
@@ -2294,6 +2316,32 @@ button { background:#0069d9; }
 }
 .search-filter-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
 .snippet, .full-block { background:#fff; padding:12px; white-space:pre-wrap; border:1px solid #eee; border-radius:6px; font-family:Consolas, monospace; }
+.snippet-columns {
+  display:grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap:12px;
+  align-items:start;
+  margin-top:10px;
+}
+.snippet-panel {
+  min-width:0;
+}
+.snippet-panel .snippet {
+  margin-top:8px;
+  height:100%;
+  box-sizing:border-box;
+}
+.snippet-panel-original .snippet {
+  border-left:4px solid #0069d9;
+}
+.snippet-panel-translation .snippet {
+  border-left:4px solid #28a745;
+}
+@media (max-width: 900px) {
+  .snippet-columns {
+    grid-template-columns: 1fr;
+  }
+}
 .highlight { color:green; font-weight:bold; background:#eaf7ea; padding:1px 2px; border-radius:2px; }
 .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
 .data-table table, table.data-table { width:100%; border-collapse:collapse; }
@@ -2499,16 +2547,18 @@ HOME_TEMPLATE = """
                         <div><strong>Section:</strong> {{ res.section }}</div>
                     {% endif %}
 
-                    <div class="snippet">
-                        <strong>Table 1 / Dutch (Original)</strong>
-                        <div>{{ res.snippet|safe }}</div>
+                    <div class="snippet-columns">
+                        <div class="snippet-panel snippet-panel-original">
+                            <strong>Table 1 / Dutch (Original)</strong>
+                            <div class="snippet">{{ res.snippet|safe }}</div>
+                        </div>
+                        {% if res.snippet_en %}
+                        <div class="snippet-panel snippet-panel-translation">
+                            <strong>Table 2 / English (Translation)</strong>
+                            <div class="snippet">{{ res.snippet_en|safe }}</div>
+                        </div>
+                        {% endif %}
                     </div>
-                    {% if res.snippet_en %}
-                    <div class="snippet" style="margin-top:10px; border-left:4px solid #28a745;">
-                        <strong>Table 2 / English (Translation)</strong>
-                        <div>{{ res.snippet_en|safe }}</div>
-                    </div>
-                    {% endif %}
 
                     <div class="meta">
                         {% if res.is_document_fallback %}
@@ -2665,12 +2715,25 @@ UPLOAD_TEMPLATE = """
         Allowed types: {{ allowed_extensions }}<br>
         Max size: 100 MB per request<br>
         Storage backend: <strong>{{ storage_backend }}</strong>
+        {% if storage_status.persistent %}
+        <br>Bucket: <strong>{{ storage_status.bucket }}</strong>
+        {% if storage_status.key_prefix and storage_status.key_prefix != '(root)' %}
+        <br>Key prefix: <strong>{{ storage_status.key_prefix }}</strong>
+        {% endif %}
+        {% endif %}
         {% if not storage_persistent %}
         <br><span style="color:#b45309;"><strong>Warning:</strong> Files are stored on temporary disk and will be lost after a Render restart. Configure Supabase S3 for persistent PDF storage.</span>
         {% endif %}
     </div>
 
-    <form method="POST" enctype="multipart/form-data">
+    {% if storage_status.persistent and not storage_status.ok %}
+    <div class="flash" style="background:#fdecea; border-left-color:#dc3545;">
+        <strong>Storage not ready:</strong> {{ storage_status.message }}<br>
+        {{ storage_status.hint }}
+    </div>
+    {% endif %}
+
+    <form method="POST" enctype="multipart/form-data"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% endif %}>
         <input type="file" name="files" multiple required>
         <br><br>
         <button type="submit">Upload and index</button>
@@ -3255,11 +3318,13 @@ def home():
 
 @app.route("/healthz")
 def healthz():
+    storage_status = storage.get_storage_status()
     return jsonify(
         {
-            "status": "ok",
+            "status": "ok" if storage_status.get("ok", True) else "degraded",
             "environment": APP_ENV,
             "storage_backend": storage.storage_backend_name(),
+            "storage": storage_status,
             "data_dir": str(DATA_DIR),
             "database_path": str(DATABASE_PATH),
             "translation": get_translation_status(),
@@ -3456,7 +3521,8 @@ def admin_users():
         elif User.query.filter_by(username=username).first():
             flash("Username already exists.")
         else:
-            new_user = User(username=username, role=role)
+            user_cls = cast(Any, User)
+            new_user = user_cls(username=username, role=role)
             new_user.set_password(password)
             db.session.add(new_user)
             db.session.commit()
@@ -3487,10 +3553,16 @@ def upload_files():
         allowed_extensions=", ".join(sorted(ALLOWED_EXTENSIONS)),
         storage_backend=storage.storage_backend_name(),
         storage_persistent=storage.object_storage_enabled(),
+        storage_status=storage.get_storage_status(),
     )
 
 
 def _handle_upload_post():
+    storage_status = storage.get_storage_status()
+    if storage.object_storage_enabled() and not storage_status.get("ok"):
+        flash(storage_status.get("hint") or storage_status.get("message") or "Storage is not configured.")
+        return redirect(url_for("upload_files"))
+
     files = request.files.getlist("files")
     if not files or all(f.filename == "" for f in files):
         flash("No files selected.")
@@ -3507,7 +3579,7 @@ def _handle_upload_post():
             flash(f"File type not allowed: {file.filename}")
             continue
 
-        original_filename = secure_filename(file.filename)
+        original_filename = secure_filename(file.filename or "")
         if not original_filename:
             flash("Invalid filename.")
             continue
@@ -3549,7 +3621,8 @@ def _handle_upload_post():
                 flash(f"Upload failed for {original_filename}: {exc}")
                 continue
 
-            doc = DocumentRecord(
+            doc_cls = cast(Any, DocumentRecord)
+            doc = doc_cls(
                 original_filename=original_filename,
                 stored_filename=stored_filename,
                 extension=ext,
@@ -3665,7 +3738,7 @@ def requirement_detail(block_id):
         "summary": block.summary,
         "full_text": block.full_text,
         "full_text_en": translate_to_english(block.full_text),
-        "document": block.document,
+        "document": getattr(block, "document", None),
     }
     return render_template_string(
         REQUIREMENT_TEMPLATE,
@@ -3825,7 +3898,7 @@ def page_image(document_id):
         return Response(status=404)
     return send_file(io.BytesIO(image_data[0]), mimetype=image_data[1])
 
-def safe_excel_sheet_name(name, used_names=None):
+def safe_excel_sheet_name(name, used_names=None) -> str:
     value = re.sub(r"[\\/*?:\[\]]+", "_", str(name or "Sheet")).strip(" .")
     if not value:
         value = "Sheet"
@@ -4018,18 +4091,22 @@ def export_table_xlsx(document_id):
 
     wb = Workbook()
     ws = wb.active
-    ws.title = safe_excel_sheet_name(
-        Path(doc.original_filename).stem or f"document_{document_id}"
+    ws.title = str(  # pyright: ignore[reportOptionalMemberAccess]
+        safe_excel_sheet_name(
+            Path(doc.original_filename).stem or f"document_{document_id}"
+        )
     )
 
     row_cursor = 1
     wrote_content = False
     single_table = len(tables) == 1
+    section = ""
 
     for index, table_row in enumerate(tables, start=1):
         if not single_table:
             section = table_row.sheet_name or table_row.preview_title or f"Table {index}"
-            section_cell = ws.cell(row=row_cursor, column=1, value=section)
+            section_cell = cast(Any, ws.cell(row=row_cursor, column=1, value=section))  # pyright: ignore[reportOptionalMemberAccess]
+            # pyright: ignore[reportOptionalMemberAccess]
             section_cell.font = Font(bold=True, size=13)
             row_cursor += 2
 
