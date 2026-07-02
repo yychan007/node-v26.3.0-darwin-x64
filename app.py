@@ -2639,39 +2639,6 @@ HOME_TEMPLATE = """
     {% endif %}
 
     {% if query %}
-        <div class="search-meta-panel">
-            <div class="panel-title">Search analysis</div>
-
-            {% if all_expanded_terms %}
-            <div class="panel-section">
-                <div class="panel-label">Expanded terms</div>
-                <div class="term-chip-list">
-                    {% for term in all_expanded_terms %}
-                    <span class="term-chip{% if term in selected_terms %} active{% endif %}{% if term in exact_terms %} exact{% endif %}">{{ term }}</span>
-                    {% endfor %}
-                </div>
-            </div>
-            {% endif %}
-
-            {% if summary.top_categories %}
-            <div class="panel-section">
-                <div class="panel-label">Top categories</div>
-                <div class="meta-line">
-                    {% for cat, cnt in summary.top_categories %}
-                        <span class="badge">{{ cat }} ({{ cnt }})</span>
-                    {% endfor %}
-                </div>
-            </div>
-            {% endif %}
-
-            {% if summary.top_requirement_ids %}
-            <div class="panel-section">
-                <div class="panel-label">Top requirement IDs</div>
-                <div class="meta-line">{{ summary.top_requirement_ids|join(', ') }}</div>
-            </div>
-            {% endif %}
-        </div>
-
         {% if document_matches %}
         <div class="search-meta-panel">
             <div class="panel-title">Related pages / drawings</div>
@@ -2764,10 +2731,9 @@ HOME_TEMPLATE = """
                         <div class="meta-item">Section: <strong>{{ res.major_section or res.section }}</strong></div>
                         {% endif %}
                     </div>
-                    <div class="meta-secondary">
-                        Category: {{ res.category }}
-                        {% if res.ocr_used %}| OCR used{% endif %}
-                    </div>
+                    {% if res.ocr_used %}
+                    <div class="meta-secondary">OCR used</div>
+                    {% endif %}
 
                     {% if res.is_pdf %}
                     <div class="result-page-img">
