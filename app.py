@@ -863,6 +863,52 @@ def extract_single_page_text(doc, page_num):
         return ""
 
 
+def _group_pdf_blocks_into_rows(blocks, page_height):
+    if not blocks:
+        return []
+
+    heights = [max(4.0, b["y1"] - b["y0"]) for b in blocks]
+    median_h = sorted(heights)[len(heights) // 2] if heights else 12.0
+    y_tolerance = max(8.0, min(20.0, median_h * 0.75))
+
+    for block in blocks:
+        block["y_center"] = (block["y0"] + block["y1"]) / 2.0
+
+    blocks.sort(key=lambda b: (b["y_center"], b["x0"]))
+    rows = []
+    for block in blocks:
+        if not rows:
+            rows.append({"y0": block["y0"], "cells": [block]})
+            continue
+        last_row = rows[-1]
+        last_center = sum(c["y_center"] for c in last_row["cells"]) / len(last_row["cells"])
+        if abs(last_center - block["y_center"]) <= y_tolerance:
+            last_row["cells"].append(block)
+        else:
+            rows.append({"y0": block["y0"], "cells": [block]})
+
+    for row in rows:
+        row["cells"].sort(key=lambda c: c["x0"])
+    return rows
+
+
+def _translation_cell_class(cell, row_cells, page_width):
+    text = (cell.get("translation") or "").strip()
+    text_len = len(text)
+    cell_count = len(row_cells)
+    width_ratio = max(cell["x1"] - cell["x0"], 1.0) / max(page_width, 1.0)
+
+    if cell_count == 1:
+        return "translation-flow-cell translation-flow-cell-full"
+    if cell_count >= 4 or (text_len <= 24 and width_ratio < 0.2):
+        return "translation-flow-cell translation-flow-cell-table"
+    if text_len <= 36 and (text.endswith(":") or width_ratio < 0.22):
+        return "translation-flow-cell translation-flow-cell-label"
+    if text_len <= 80 and width_ratio < 0.3:
+        return "translation-flow-cell translation-flow-cell-narrow"
+    return "translation-flow-cell translation-flow-cell-body"
+
+
 def extract_pdf_page_layout_rows(doc, page_num, y_tolerance=12):
     if doc.extension.lower() != "pdf" or not OCR_AVAILABLE or fitz is None:
         return None
@@ -901,19 +947,7 @@ def extract_pdf_page_layout_rows(doc, page_num, y_tolerance=12):
                     return None
 
                 blocks.sort(key=lambda b: (b["y0"], b["x0"]))
-                rows = []
-                for block in blocks:
-                    if not rows:
-                        rows.append({"y0": block["y0"], "cells": [block]})
-                        continue
-                    last_row = rows[-1]
-                    if abs(last_row["y0"] - block["y0"]) <= y_tolerance:
-                        last_row["cells"].append(block)
-                    else:
-                        rows.append({"y0": block["y0"], "cells": [block]})
-
-                for row in rows:
-                    row["cells"].sort(key=lambda c: c["x0"])
+                rows = _group_pdf_blocks_into_rows(blocks, page_height)
 
                 return {
                     "page_width": page_width,
@@ -944,19 +978,32 @@ def translate_layout_rows(layout_rows, target_lang="en"):
     return translated_rows
 
 
-def build_translation_flow_html(translated_rows):
+def _normalize_translation_cell_text(text):
+    text = re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
+    return text
+
+
+def build_translation_flow_html(translated_rows, page_width=1.0):
     if not translated_rows:
         return ""
 
+    page_width = max(float(page_width or 1.0), 1.0)
     parts = ['<div class="translation-layout-flow">']
     for row in translated_rows:
+        cells = row["cells"]
+        if len(cells) >= 4:
+            parts.append('<table class="translation-mini-table"><tr>')
+            for cell in cells:
+                text = html.escape(_normalize_translation_cell_text(cell.get("translation") or ""))
+                parts.append(f"<td>{text}</td>")
+            parts.append("</tr></table>")
+            continue
+
         parts.append('<div class="translation-flow-row">')
-        for cell in row["cells"]:
-            width_weight = max(cell["x1"] - cell["x0"], 24.0)
-            text = html.escape(cell.get("translation") or "")
-            parts.append(
-                f'<div class="translation-flow-cell" style="flex:{width_weight:.0f} 1 0;">{text}</div>'
-            )
+        for cell in cells:
+            text = html.escape(_normalize_translation_cell_text(cell.get("translation") or ""))
+            css_class = _translation_cell_class(cell, cells, page_width)
+            parts.append(f'<div class="{css_class}">{text}</div>')
         parts.append("</div>")
     parts.append("</div>")
     return "".join(parts)
@@ -976,7 +1023,9 @@ def build_layout_translation_payload(doc, page_num, target_lang="en"):
         " | ".join(cell.get("translation") or "" for cell in row["cells"])
         for row in translated_rows
     ).strip()
-    translation_html = build_translation_flow_html(translated_rows)
+    translation_html = build_translation_flow_html(
+        translated_rows, page_width=layout.get("page_width") or 1.0
+    )
     return {
         "source": source,
         "translation": translation,
@@ -2200,14 +2249,75 @@ def finalize_display_dataframe(df, max_rows=40):
     return cleaned.head(max_rows).reset_index(drop=True)
 
 
+def split_table_footnote_rows(df):
+    if df is None or df.empty:
+        return df, []
+
+    footnotes = []
+    keep_rows = []
+    for _, row in df.iterrows():
+        values = [normalize_cell_text(v) for v in row.tolist()]
+        non_empty = [v for v in values if v]
+        if not non_empty:
+            continue
+        joined = " ".join(non_empty)
+        is_footnote = (
+            (len(non_empty) == 1 and len(non_empty[0]) >= 70)
+            or (len(non_empty) <= 2 and max(len(v) for v in non_empty) >= 100)
+            or bool(re.match(r"^\d+\)\s", non_empty[0]))
+        )
+        if is_footnote:
+            footnotes.append(joined)
+        else:
+            keep_rows.append(row)
+
+    if keep_rows:
+        trimmed = pd.DataFrame(keep_rows, columns=df.columns).reset_index(drop=True)
+    else:
+        trimmed = df
+    return trimmed, footnotes
+
+
 def build_table_html(df):
     preview_df = finalize_display_dataframe(df, max_rows=40)
     if preview_df.empty:
         return "", pd.DataFrame()
+
+    preview_df, footnotes = split_table_footnote_rows(preview_df)
     html_table = preview_df.to_html(
-        index=False, classes="data-table", border=0, na_rep=""
+        index=False, classes="data-table compact-table", border=0, na_rep=""
     )
+    if footnotes:
+        html_table += "".join(
+            f'<div class="table-footnote">{html.escape(note)}</div>' for note in footnotes
+        )
     return html_table, preview_df
+
+
+def dataframe_from_table_csv(csv_text):
+    if not csv_text or not str(csv_text).strip():
+        return None
+    try:
+        return pd.read_csv(io.StringIO(csv_text), dtype=str, keep_default_na=False)
+    except Exception:
+        return None
+
+
+def render_table_preview_html(table_row, lang="nl"):
+    csv_text = (table_row.csv_text or "").strip()
+    csv_text_en = (table_row.csv_text_en or "").strip()
+    if lang == "en" and csv_text_en:
+        csv_text = csv_text_en
+
+    df = dataframe_from_table_csv(csv_text)
+    if df is not None and not df.empty:
+        html_table, _ = build_table_html(df)
+        if html_table:
+            return html_table
+
+    if lang == "en":
+        return table_row.html_table_en or ""
+    return table_row.html_table or ""
 
 
 def translate_preview_df(preview_df, target_lang="en"):
@@ -2222,11 +2332,16 @@ def translate_preview_df(preview_df, target_lang="en"):
             max_cells=TRANSLATE_MAX_CELLS,
         )
         translated_df = finalize_display_dataframe(translated_df, max_rows=40)
+        translated_df, footnotes = split_table_footnote_rows(translated_df)
         csv_buf = io.StringIO()
         translated_df.to_csv(csv_buf, index=False)
         html_table = translated_df.to_html(
-            index=False, classes="data-table", border=0, na_rep=""
+            index=False, classes="data-table compact-table", border=0, na_rep=""
         )
+        if footnotes:
+            html_table += "".join(
+                f'<div class="table-footnote">{html.escape(note)}</div>' for note in footnotes
+            )
         return html_table, csv_buf.getvalue()
     except Exception as exc:
         print(f"Table translation skipped ({target_lang}): {exc}")
@@ -2894,8 +3009,8 @@ def search_table_results(query, top_k=20, active_terms=None):
                 "sheet_name": row.sheet_name or "-",
                 "preview_title": row.preview_title or doc.original_filename,
                 "table_format": row.table_format or "xlsx",
-                "html_table": row.html_table or "",
-                "html_table_en": row.html_table_en or "",
+                "html_table": render_table_preview_html(row, "nl"),
+                "html_table_en": render_table_preview_html(row, "en"),
                 "relevance": round(score, 2),
             }
         )
@@ -3241,16 +3356,30 @@ button { background:#0069d9; }
   width: auto;
   max-width: 100%;
 }
-.table-scroll-wrap .data-table table {
-  width: auto;
+.table-scroll-wrap .data-table table,
+.table-scroll-wrap .data-table table.compact-table {
+  width: max-content;
   max-width: none;
   table-layout: auto;
   margin: 0;
 }
 .table-scroll-wrap .data-table th,
 .table-scroll-wrap .data-table td {
+  width: 1%;
   white-space: nowrap;
-  padding: 5px 8px;
+  padding: 4px 10px;
+  vertical-align: top;
+}
+.table-scroll-wrap .table-footnote {
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #475569;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  white-space: normal;
 }
 .table-result-panel {
   min-width:0;
@@ -4162,18 +4291,61 @@ iframe { width:100%; height:100%; border:none; }
 .translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; line-height:1.55; margin-bottom:14px; }
 .translation-box h4 { margin:0 0 8px 0; color:#334155; }
 #translated-text { white-space:pre-wrap; line-height:1.55; }
-.translation-layout-flow { display:flex; flex-direction:column; gap:8px; }
-.translation-flow-row { display:flex; gap:10px; align-items:flex-start; width:100%; }
+.translation-layout-flow { display:flex; flex-direction:column; gap:6px; }
+.translation-flow-row {
+  display:flex;
+  gap:8px;
+  align-items:flex-start;
+  flex-wrap:wrap;
+  width:100%;
+}
 .translation-flow-cell {
-  min-width:0;
   font-size:12px;
-  line-height:1.45;
+  line-height:1.4;
   white-space:pre-wrap;
   word-break:break-word;
-  padding:6px 8px;
+  padding:5px 8px;
   background:#f8fafc;
   border:1px solid #e2e8f0;
   border-radius:4px;
+  box-sizing:border-box;
+}
+.translation-flow-cell-label {
+  flex:0 0 auto;
+  max-width:34%;
+  min-width:72px;
+}
+.translation-flow-cell-narrow {
+  flex:0 1 auto;
+  max-width:42%;
+}
+.translation-flow-cell-body {
+  flex:1 1 220px;
+  min-width:0;
+}
+.translation-flow-cell-full {
+  flex:1 1 100%;
+  width:100%;
+}
+.translation-flow-cell-table {
+  flex:0 1 auto;
+  max-width:24%;
+  min-width:56px;
+  font-size:11px;
+  padding:4px 6px;
+}
+.translation-mini-table {
+  width:100%;
+  border-collapse:collapse;
+  margin:2px 0 4px 0;
+  font-size:11px;
+}
+.translation-mini-table td {
+  border:1px solid #dbe1ea;
+  padding:4px 6px;
+  vertical-align:top;
+  white-space:nowrap;
+  width:1%;
 }
 .translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
 .btn-small { padding:6px 10px; font-size:13px; }
@@ -4988,8 +5160,21 @@ def table_preview(document_id):
     elif not tables and file_available:
         error_msg = error_msg or "No readable table data was found in this spreadsheet."
 
+    table_views = []
+    for table_row in tables:
+        html_en = render_table_preview_html(table_row, "en")
+        table_views.append(
+            {
+                "preview_title": table_row.preview_title,
+                "table_format": table_row.table_format,
+                "sheet_name": table_row.sheet_name,
+                "html_table": render_table_preview_html(table_row, "nl"),
+                "html_table_en": html_en,
+            }
+        )
+
     return render_template_string(
-        TABLE_TEMPLATE, doc=doc, tables=tables, error_msg=error_msg
+        TABLE_TEMPLATE, doc=doc, tables=table_views, error_msg=error_msg
     )
 
 
