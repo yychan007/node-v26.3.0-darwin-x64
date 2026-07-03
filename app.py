@@ -965,9 +965,22 @@ def translate_layout_rows(layout_rows, target_lang="en"):
         translated_cells = []
         for cell in row["cells"]:
             source_text = cell.get("text") or ""
-            translated = (
-                translate_to_language(source_text, target_lang) if source_text else ""
-            )
+            translated = ""
+            if source_text:
+                normalized_source = source_text.replace("\r\n", "\n")
+                source_lines = normalized_source.split("\n")
+                if len(source_lines) > 1:
+                    translated_lines = []
+                    for line in source_lines:
+                        line_text = line.strip()
+                        if not line_text:
+                            translated_lines.append("")
+                            continue
+                        line_translated = translate_to_language(line_text, target_lang)
+                        translated_lines.append(line_translated or line_text)
+                    translated = "\n".join(translated_lines).strip()
+                else:
+                    translated = translate_to_language(source_text, target_lang) or ""
             translated_cells.append(
                 {
                     **cell,
@@ -979,8 +992,20 @@ def translate_layout_rows(layout_rows, target_lang="en"):
 
 
 def _normalize_translation_cell_text(text):
-    text = re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
-    return text
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    previous_blank = False
+    for line in raw.split("\n"):
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if not normalized:
+            if previous_blank:
+                continue
+            lines.append("")
+            previous_blank = True
+            continue
+        lines.append(normalized)
+        previous_blank = False
+    return "\n".join(lines).strip()
 
 
 def build_translation_flow_html(translated_rows, page_width=1.0):
@@ -1841,6 +1866,20 @@ def normalize_excel_sheet(raw_df, max_rows=200):
 
     if sheet.empty:
         return pd.DataFrame()
+
+    # Trim surrounding blank canvas introduced by styled spreadsheets.
+    non_empty_mask = sheet.applymap(lambda value: bool(normalize_cell_text(value)))
+    if non_empty_mask.values.any():
+        non_empty_rows = non_empty_mask.any(axis=1)
+        non_empty_cols = non_empty_mask.any(axis=0)
+        row_positions = [idx for idx, keep in enumerate(non_empty_rows.tolist()) if keep]
+        col_positions = [idx for idx, keep in enumerate(non_empty_cols.tolist()) if keep]
+        if row_positions and col_positions:
+            row_start, row_end = row_positions[0], row_positions[-1]
+            col_start, col_end = col_positions[0], col_positions[-1]
+            sheet = sheet.iloc[row_start : row_end + 1, col_start : col_end + 1].reset_index(
+                drop=True
+            )
 
     scan_rows = min(len(sheet), 40)
     header_row_idx = max(
@@ -4365,6 +4404,14 @@ iframe { width:100%; height:100%; border:none; }
 .translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
 .btn-small { padding:6px 10px; font-size:13px; }
 .page-nav { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.jump-form { display:flex; gap:6px; align-items:center; }
+.jump-input {
+  width:72px;
+  padding:6px 8px;
+  border:1px solid #cbd5e1;
+  border-radius:6px;
+  font-size:13px;
+}
 </style>
 </head>
 <body>
@@ -4380,6 +4427,21 @@ iframe { width:100%; height:100%; border:none; }
                 {% endif %}
                 {% if page < total_pages %}
                 <a class="btn btn-gray btn-small" href="{{ url_for(viewer_route, document_id=document_id, page=page+1) }}">Next</a>
+                {% endif %}
+                {% if view_mode == 'pdf' %}
+                <form class="jump-form" method="get" action="{{ url_for(viewer_route, document_id=document_id) }}">
+                    <input
+                        class="jump-input"
+                        type="number"
+                        name="page"
+                        min="1"
+                        max="{{ total_pages }}"
+                        value="{{ page }}"
+                        aria-label="Jump to page"
+                        title="Jump to page (1-{{ total_pages }})"
+                    >
+                    <button class="btn btn-gray btn-small" type="submit">Go</button>
+                </form>
                 {% endif %}
             </div>
             {% if download_url %}
