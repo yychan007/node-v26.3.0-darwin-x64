@@ -156,6 +156,7 @@ MAX_PDF_PAGES = env_int("MAX_PDF_PAGES", 100 if IS_PRODUCTION else 0)
 MAX_INDEX_FILE_MB = env_int("MAX_INDEX_FILE_MB", 40 if IS_PRODUCTION else 0)
 TEXT_PREVIEW_LIMIT = env_int("TEXT_PREVIEW_LIMIT", 150000)
 TRANSLATE_MAX_CELLS = env_int("TRANSLATE_MAX_CELLS", 500)
+STORAGE_QUOTA_MB = env_int("STORAGE_QUOTA_MB", 1024)
 
 
 DEFAULT_DATA_DIR = BASE_DIR / "data"
@@ -2745,6 +2746,40 @@ def restore_document_file_from_temp(doc, temp_path):
     return size_bytes
 
 
+def format_storage_size(bytes_value):
+    size = max(int(bytes_value or 0), 0)
+    if size >= 1024 ** 3:
+        return f"{size / (1024 ** 3):.2f} GB"
+    if size >= 1024 ** 2:
+        return f"{size / (1024 ** 2):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.0f} KB"
+    return f"{size} B"
+
+
+def build_storage_usage_summary():
+    from sqlalchemy import func
+
+    quota_bytes = max(STORAGE_QUOTA_MB, 1) * 1024 * 1024
+    used_bytes = int(
+        db.session.query(func.coalesce(func.sum(DocumentRecord.size_bytes), 0)).scalar() or 0
+    )
+    used_bytes = max(used_bytes, 0)
+    percent = (used_bytes / quota_bytes) * 100 if quota_bytes else 0.0
+    remaining_bytes = max(quota_bytes - used_bytes, 0)
+    return {
+        "used_bytes": used_bytes,
+        "quota_bytes": quota_bytes,
+        "used_label": format_storage_size(used_bytes),
+        "quota_label": format_storage_size(quota_bytes),
+        "remaining_label": format_storage_size(remaining_bytes),
+        "percent": round(min(percent, 999.9), 1),
+        "doc_count": DocumentRecord.query.count(),
+        "near_limit": percent >= 85,
+        "over_limit": used_bytes > quota_bytes,
+    }
+
+
 # =========================================================
 # Search
 # =========================================================
@@ -3437,6 +3472,44 @@ button { background:#0069d9; }
 }
 .stat-label { display:block; font-size:12px; color:#64748b; margin-bottom:4px; }
 .stat-value { display:block; font-size:22px; font-weight:700; color:#0f172a; }
+.storage-usage-panel {
+  margin:12px 0;
+  padding:14px 16px;
+  background:#eef6ff;
+  border:1px solid #bfdbfe;
+  border-radius:8px;
+}
+.storage-usage-panel.storage-usage-warn {
+  background:#fff7ed;
+  border-color:#fdba74;
+}
+.storage-usage-panel.storage-usage-danger {
+  background:#fef2f2;
+  border-color:#fca5a5;
+}
+.storage-usage-summary {
+  margin-bottom:8px;
+  font-size:15px;
+  color:#1e293b;
+}
+.storage-usage-bar {
+  height:10px;
+  background:#dbeafe;
+  border-radius:999px;
+  overflow:hidden;
+  margin:8px 0;
+}
+.storage-usage-warn .storage-usage-bar { background:#ffedd5; }
+.storage-usage-danger .storage-usage-bar { background:#fee2e2; }
+.storage-usage-fill {
+  height:100%;
+  background:#0069d9;
+  border-radius:999px;
+  max-width:100%;
+}
+.storage-usage-warn .storage-usage-fill { background:#fd7e14; }
+.storage-usage-danger .storage-usage-fill { background:#dc3545; }
+.storage-usage-note { color:#64748b; font-size:13px; }
 .term-chip-list { display:flex; flex-wrap:wrap; gap:8px; }
 .term-chip {
   display:inline-block;
@@ -4148,6 +4221,20 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
+STORAGE_USAGE_PANEL = """
+    <div class="storage-usage-panel{% if storage_usage.near_limit %} storage-usage-warn{% endif %}{% if storage_usage.over_limit %} storage-usage-danger{% endif %}">
+        <div class="panel-title">Storage usage</div>
+        <div class="storage-usage-summary">
+            <strong>{{ storage_usage.used_label }}</strong> / {{ storage_usage.quota_label }}
+            <span class="small">({{ storage_usage.percent }}% · {{ storage_usage.doc_count }} indexed files)</span>
+        </div>
+        <div class="storage-usage-bar" aria-hidden="true">
+            <div class="storage-usage-fill" style="width: {% if storage_usage.percent > 100 %}100{% else %}{{ storage_usage.percent }}{% endif %}%;"></div>
+        </div>
+        <div class="storage-usage-note">{{ storage_usage.remaining_label }} remaining · based on indexed document sizes</div>
+    </div>
+"""
+
 UPLOAD_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -4167,6 +4254,8 @@ UPLOAD_TEMPLATE = """
         {% endfor %}
       {% endif %}
     {% endwith %}
+
+    """ + STORAGE_USAGE_PANEL + """
 
     <div class="info">
         Allowed types: {{ allowed_extensions }}<br>
@@ -4212,6 +4301,8 @@ DOCS_TEMPLATE = """
 <body>
 <div class="container">
     <h2>Indexed documents</h2>
+
+    """ + STORAGE_USAGE_PANEL + """
 
     <div class="stats-panel">
         <div class="panel-title">Index statistics</div>
@@ -5340,6 +5431,7 @@ def upload_files():
         storage_backend=storage.storage_backend_name(),
         storage_persistent=storage.object_storage_enabled(),
         storage_status=storage.get_storage_status(),
+        storage_usage=build_storage_usage_summary(),
     )
 
 
@@ -5471,6 +5563,7 @@ def admin_documents():
         doc_count=DocumentRecord.query.count(),
         block_count=RequirementBlock.query.count(),
         table_count=TablePreview.query.count(),
+        storage_usage=build_storage_usage_summary(),
     )
 
 @app.route("/reindex/<int:document_id>")
