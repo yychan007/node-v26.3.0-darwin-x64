@@ -648,6 +648,61 @@ def split_text_into_virtual_pages(text, max_chars=3500):
     return [part for part in parts if part] or [""]
 
 
+def block_index_to_virtual_page(block_index, total_blocks, total_pages):
+    if total_pages <= 1 or total_blocks <= 0:
+        return 1
+    return max(
+        1,
+        min(total_pages, int(((block_index + 1) * total_pages - 1) / total_blocks) + 1),
+    )
+
+
+def get_docx_viewer_image_indexes(
+    document_path, page=1, total_pages=1, highlight_index=None, max_images=8, page_tolerance=2
+):
+    candidates = collect_docx_drawing_image_candidates(document_path)
+    if not candidates:
+        return []
+
+    indexes = []
+    seen = set()
+
+    def add_index(image_index):
+        if image_index is None or image_index in seen:
+            return
+        seen.add(image_index)
+        indexes.append(image_index)
+
+    if highlight_index is not None:
+        add_index(highlight_index)
+
+    page_matches = []
+    nearby_matches = []
+    fallback_matches = []
+    for candidate in candidates:
+        image_index = candidate["image_index"]
+        if image_index in seen:
+            continue
+        est_page = block_index_to_virtual_page(
+            candidate.get("block_index", 0),
+            candidate.get("total_blocks", 1),
+            total_pages,
+        )
+        if est_page == page:
+            page_matches.append(image_index)
+        elif abs(est_page - page) <= page_tolerance:
+            nearby_matches.append(image_index)
+        elif candidate.get("in_drawing_zone"):
+            fallback_matches.append(image_index)
+
+    for image_index in page_matches + nearby_matches + fallback_matches:
+        add_index(image_index)
+        if len(indexes) >= max_images:
+            break
+
+    return indexes[:max_images]
+
+
 def extract_page_text_from_preview(doc, page_num):
     if page_num < 1:
         return ""
@@ -1603,11 +1658,14 @@ def collect_docx_drawing_image_candidates(document_path, min_area=50000):
             if body is None:
                 return []
 
+            body_children = [child for child in body if child.tag in {f"{DOCX_W_NS}p", f"{DOCX_W_NS}tbl"}]
+            total_blocks = len(body_children)
+
             recent_text = []
             drawing_caption = ""
             blocks_since_drawing_marker = 999
 
-            for child in body:
+            for block_index, child in enumerate(body_children):
                 text = ""
                 image_indexes = []
                 has_page_break = False
@@ -1655,6 +1713,8 @@ def collect_docx_drawing_image_candidates(document_path, min_area=50000):
                             "context": context,
                             "caption": drawing_caption,
                             "in_drawing_zone": blocks_since_drawing_marker <= 8,
+                            "block_index": block_index,
+                            "total_blocks": total_blocks,
                         }
                     )
     except Exception as exc:
@@ -3764,7 +3824,7 @@ HOME_TEMPLATE = """
                     {% if doc.is_docx and doc.image_indexes %}
                     <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:8px;">
                         {% for image_index in doc.image_indexes %}
-                        <a href="{{ url_for('docx_viewer', document_id=doc.document_id, page=doc.page or 1) }}" target="_blank">
+                        <a href="{{ url_for('docx_viewer', document_id=doc.document_id, page=doc.page or 1, image_index=image_index) }}" target="_blank">
                             <img
                                 src="{{ url_for('docx_image', document_id=doc.document_id, image_index=image_index) }}"
                                 loading="lazy"
@@ -4347,7 +4407,7 @@ REQUIREMENT_TEMPLATE = """
 TRANSLATABLE_EXTENSIONS = {"pdf", "docx", "txt"}
 
 
-def build_document_view_context(doc, page=1):
+def build_document_view_context(doc, page=1, highlight_image_index=None):
     ext = doc.extension.lower()
     if ext not in TRANSLATABLE_EXTENSIONS:
         return None
@@ -4359,11 +4419,24 @@ def build_document_view_context(doc, page=1):
     page = max(1, min(page, total_pages))
 
     original_text = ""
+    docx_image_indexes = []
     if ext in {"docx", "txt"}:
         chunks = split_text_into_virtual_pages(get_document_full_text(doc))
         original_text = chunks[page - 1] if chunks else ""
     elif ext == "pdf" and not file_available:
         original_text = extract_page_text_from_preview(doc, page)
+
+    if ext == "docx" and file_available:
+        try:
+            with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+                docx_image_indexes = get_docx_viewer_image_indexes(
+                    file_path,
+                    page=page,
+                    total_pages=total_pages,
+                    highlight_index=highlight_image_index,
+                )
+        except Exception as exc:
+            print(f"DOCX viewer image load error for doc {doc.id}: {exc}")
 
     return {
         "document_id": doc.id,
@@ -4378,6 +4451,8 @@ def build_document_view_context(doc, page=1):
         "pdf_url": url_for("serve_document", document_id=doc.id) if ext == "pdf" and file_available else "",
         "download_url": url_for("serve_document", document_id=doc.id) if file_available else "",
         "original_text": original_text,
+        "docx_image_indexes": docx_image_indexes,
+        "highlight_image_index": highlight_image_index,
         "translation_enabled": translation.translation_enabled(),
         "page_label": "Page" if ext == "pdf" else "Section",
         "viewer_route": "document_view",
@@ -4470,6 +4545,35 @@ iframe { width:100%; height:100%; border:none; }
   border-radius:6px;
   font-size:13px;
 }
+.docx-drawing-panel {
+  margin:16px;
+  padding:14px;
+  background:#fff;
+  border:1px solid #e2e8f0;
+  border-left:4px solid #0069d9;
+  border-radius:8px;
+}
+.docx-drawing-panel h3 {
+  margin:0 0 10px 0;
+  color:#334155;
+  font-size:16px;
+}
+.docx-drawing-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+  gap:10px;
+}
+.docx-drawing-grid img {
+  width:100%;
+  height:auto;
+  border:1px solid #dbe1ea;
+  border-radius:6px;
+  background:#fff;
+}
+.docx-drawing-grid img.highlighted {
+  border:2px solid #0069d9;
+  box-shadow:0 0 0 2px rgba(0,105,217,0.15);
+}
 </style>
 </head>
 <body>
@@ -4536,6 +4640,21 @@ iframe { width:100%; height:100%; border:none; }
                 {% endif %}
             {% else %}
                 <div style="padding:16px;">
+                    {% if extension == 'docx' and docx_image_indexes %}
+                    <div class="docx-drawing-panel">
+                        <h3>Related drawings</h3>
+                        <div class="docx-drawing-grid">
+                            {% for image_index in docx_image_indexes %}
+                            <img
+                                src="{{ url_for('docx_image', document_id=document_id, image_index=image_index) }}"
+                                alt="DOCX drawing {{ image_index + 1 }}"
+                                {% if highlight_image_index is not none and highlight_image_index == image_index %}class="highlighted"{% endif %}
+                                loading="lazy"
+                            />
+                            {% endfor %}
+                        </div>
+                    </div>
+                    {% endif %}
                     <h3 style="margin-top:0;">Original (Dutch)</h3>
                     {% if original_text %}
                     <div class="original-text-box">{{ original_text }}</div>
@@ -5372,7 +5491,10 @@ def docx_viewer(document_id):
     if not doc or doc.extension != "docx":
         abort(404)
     page = request.args.get("page", 1, type=int)
-    context = build_document_view_context(doc, page=page)
+    highlight_image_index = request.args.get("image_index", type=int)
+    context = build_document_view_context(
+        doc, page=page, highlight_image_index=highlight_image_index
+    )
     if not context:
         abort(404)
     context["viewer_route"] = "docx_viewer"
