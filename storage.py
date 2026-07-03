@@ -211,6 +211,41 @@ def document_exists(stored_filename, local_folder):
     return (Path(local_folder) / stored_filename).exists()
 
 
+def list_stored_document_filenames(local_folder):
+    if object_storage_enabled():
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        prefix = key_prefix()
+        list_prefix = f"{prefix}/" if prefix else ""
+        filenames = set()
+        try:
+            client = get_s3_client()
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket_name(), Prefix=list_prefix or None):
+                for item in page.get("Contents", []):
+                    key = item.get("Key") or ""
+                    if not key or key.endswith("/"):
+                        continue
+                    if list_prefix and key.startswith(list_prefix):
+                        name = key[len(list_prefix) :]
+                    else:
+                        name = key.rsplit("/", 1)[-1]
+                    if name:
+                        filenames.add(name)
+        except (ClientError, BotoCoreError, RuntimeError) as exc:
+            print(f"Storage list error: {exc}")
+            return None
+        except Exception as exc:
+            print(f"Unexpected storage list error: {exc}")
+            return None
+        return filenames
+
+    folder = Path(local_folder)
+    if not folder.exists():
+        return set()
+    return {path.name for path in folder.iterdir() if path.is_file()}
+
+
 def verify_document_stored(stored_filename, local_folder):
     if document_exists(stored_filename, local_folder):
         return

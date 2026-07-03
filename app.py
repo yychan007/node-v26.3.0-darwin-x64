@@ -3514,6 +3514,12 @@ button { background:#0069d9; }
 .notice, .flash, .warning, .info { padding:12px; border-radius:6px; margin:12px 0; }
 .notice { background:#fff3cd; border-left:4px solid #ffc107; }
 .flash { background:#e9f7ef; border-left:4px solid #28a745; }
+.flash-success { background:#e9f7ef; border-left:4px solid #28a745; }
+.flash-error { background:#fdecea; border-left:4px solid #dc3545; }
+.flash-warning { background:#fff3cd; border-left:4px solid #ffc107; }
+.flash-info, .flash-message { background:#eef6ff; border-left:4px solid #339af0; }
+.admin-feedback-panel { margin:16px 0; }
+.admin-feedback-panel .flash { font-size:15px; font-weight:500; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
 .info { background:#eef6ff; border-left:4px solid #339af0; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
@@ -4363,10 +4369,10 @@ UPLOAD_PANEL = """
             {{ storage_status.hint }}
         </div>
         {% endif %}
-        <form method="POST" action="{{ url_for('upload_files') }}" enctype="multipart/form-data"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% endif %}>
+        <form method="POST" action="{{ url_for('upload_files') }}" enctype="multipart/form-data" id="upload-form"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% else %} onsubmit="return handleUploadSubmit(this);"{% endif %}>
             <input type="file" name="files" multiple required>
             <div style="margin-top:12px;">
-                <button type="submit" class="btn btn-green">Upload and index</button>
+                <button type="submit" id="upload-submit-btn" class="btn btn-green">Upload and index</button>
             </div>
         </form>
     </div>
@@ -4388,17 +4394,21 @@ DOCS_TEMPLATE = """
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
     </div>
 
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for msg in messages %}
-          <div class="flash">{{ msg }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
-
     """ + STORAGE_USAGE_PANEL + """
 
     """ + UPLOAD_PANEL + """
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div id="admin-feedback" class="admin-feedback-panel">
+        {% for category, msg in messages %}
+          <div class="flash flash-{{ category if category != 'message' else 'info' }}">{{ msg }}</div>
+        {% endfor %}
+        </div>
+      {% else %}
+        <div id="admin-feedback"></div>
+      {% endif %}
+    {% endwith %}
 
     <div class="stats-panel">
         <div class="panel-title">Index statistics</div>
@@ -4514,6 +4524,28 @@ function confirmBulkReindex() {
     }
     return confirm('Reindex ' + checked.length + ' selected document(s)? This may take a while.');
 }
+
+function handleUploadSubmit(form) {
+    const btn = form.querySelector('#upload-submit-btn');
+    if (!btn || btn.disabled) {
+        return false;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Uploading and indexing…';
+    return true;
+}
+
+(function () {
+    const feedback = document.getElementById('admin-feedback');
+    if (feedback && feedback.querySelector('.flash')) {
+        feedback.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    } else if (location.hash === '#admin-feedback' || location.hash === '#upload-panel') {
+        const target = document.querySelector(location.hash);
+        if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+    }
+})();
 </script>
 </body>
 </html>
@@ -5508,15 +5540,23 @@ def admin_users():
 
 def build_admin_documents_page_context():
     docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
+    stored_files = storage.list_stored_document_filenames(DOC_FOLDER)
+    if stored_files is None:
+        stored_files = {
+            doc.stored_filename
+            for doc in docs
+            if storage.document_exists(doc.stored_filename, DOC_FOLDER)
+        }
+
     return {
         "doc_rows": [
             {
                 "record": doc,
-                "file_available": storage.document_exists(doc.stored_filename, DOC_FOLDER),
+                "file_available": doc.stored_filename in stored_files,
             }
             for doc in docs
         ],
-        "doc_count": DocumentRecord.query.count(),
+        "doc_count": len(docs),
         "block_count": RequirementBlock.query.count(),
         "table_count": TablePreview.query.count(),
         "storage_usage": build_storage_usage_summary(),
@@ -5525,6 +5565,21 @@ def build_admin_documents_page_context():
         "storage_persistent": storage.object_storage_enabled(),
         "storage_status": storage.get_storage_status(),
     }
+
+
+def redirect_admin_documents(anchor=""):
+    url = url_for("admin_documents")
+    if anchor:
+        url = f"{url}#{anchor}"
+    return redirect(url)
+
+
+def flash_upload_results(results):
+    if not results:
+        flash("No files were uploaded.", "warning")
+        return
+    for category, message in results:
+        flash(message, category)
 
 
 @app.route("/upload", methods=["GET", "POST"])
@@ -5541,35 +5596,41 @@ def upload_files():
     except Exception as exc:
         db.session.rollback()
         print(f"Upload route error: {exc}")
-        flash(f"Upload failed: {exc}")
-        return redirect(url_for("admin_documents"))
+        flash(f"Upload failed: {exc}", "error")
+        return redirect_admin_documents("admin-feedback")
 
 
 def _handle_upload_post():
     storage_status = storage.get_storage_status()
     if storage.object_storage_enabled() and not storage_status.get("ok"):
-        flash(storage_status.get("hint") or storage_status.get("message") or "Storage is not configured.")
-        return redirect(url_for("admin_documents"))
+        flash(
+            storage_status.get("hint")
+            or storage_status.get("message")
+            or "Storage is not configured.",
+            "error",
+        )
+        return redirect_admin_documents("admin-feedback")
 
     files = request.files.getlist("files")
     if not files or all(f.filename == "" for f in files):
-        flash("No files selected.")
-        return redirect(url_for("admin_documents"))
+        flash("No files selected.", "warning")
+        return redirect_admin_documents("admin-feedback")
 
     uploaded_count = 0
     skipped_count = 0
     restored_count = 0
+    results = []
 
     for file in files:
         if not file or file.filename == "":
             continue
         if not allowed_file(file.filename):
-            flash(f"File type not allowed: {file.filename}")
+            results.append(("error", f"File type not allowed: {file.filename}"))
             continue
 
         original_filename = secure_filename(file.filename or "")
         if not original_filename:
-            flash("Invalid filename.")
+            results.append(("error", "Invalid filename."))
             continue
         ext = file_ext(original_filename)
 
@@ -5585,17 +5646,25 @@ def _handle_upload_post():
                     try:
                         restore_document_file_from_temp(existing, temp_path)
                         index_document_record(existing)
-                        flash(
-                            f"Restored missing file and reindexed: {original_filename}"
+                        results.append(
+                            (
+                                "success",
+                                f"Restored missing file and reindexed: {original_filename}",
+                            )
                         )
                         restored_count += 1
                     except Exception as exc:
                         db.session.rollback()
-                        flash(
-                            f"Could not restore duplicate file {original_filename}: {exc}"
+                        results.append(
+                            (
+                                "error",
+                                f"Could not restore duplicate file {original_filename}: {exc}",
+                            )
                         )
                 else:
-                    flash(f"Duplicate file skipped: {original_filename}")
+                    results.append(
+                        ("warning", f"Duplicate file skipped: {original_filename}")
+                    )
                     skipped_count += 1
                 continue
 
@@ -5606,7 +5675,9 @@ def _handle_upload_post():
                 )
                 storage.verify_document_stored(stored_filename, DOC_FOLDER)
             except Exception as exc:
-                flash(f"Upload failed for {original_filename}: {exc}")
+                results.append(
+                    ("error", f"Upload failed for {original_filename}: {exc}")
+                )
                 continue
 
             doc_cls = cast(Any, DocumentRecord)
@@ -5624,7 +5695,9 @@ def _handle_upload_post():
             except Exception as exc:
                 db.session.rollback()
                 storage.delete_document(stored_filename, DOC_FOLDER)
-                flash(f"Database error for {original_filename}: {exc}")
+                results.append(
+                    ("error", f"Database error for {original_filename}: {exc}")
+                )
                 continue
 
             try:
@@ -5632,7 +5705,12 @@ def _handle_upload_post():
             except Exception as exc:
                 db.session.rollback()
                 print(f"Indexing error for {original_filename}: {exc}")
-                flash(f"File saved but indexing failed for {original_filename}: {exc}")
+                results.append(
+                    (
+                        "warning",
+                        f"File saved but indexing failed for {original_filename}: {exc}",
+                    )
+                )
 
             uploaded_count += 1
         finally:
@@ -5641,17 +5719,16 @@ def _handle_upload_post():
 
     summary_parts = []
     if uploaded_count:
-        summary_parts.append(f"uploaded {uploaded_count}")
+        summary_parts.append(f"{uploaded_count} uploaded and indexed")
     if restored_count:
-        summary_parts.append(f"restored {restored_count}")
+        summary_parts.append(f"{restored_count} restored")
     if skipped_count:
-        summary_parts.append(f"skipped {skipped_count} duplicate(s)")
-    flash(
-        "Upload complete: " + ", ".join(summary_parts) + "."
-        if summary_parts
-        else "No files were uploaded."
-    )
-    return redirect(url_for("admin_documents"))
+        summary_parts.append(f"{skipped_count} duplicate(s) skipped")
+    if summary_parts:
+        results.insert(0, ("success", "Upload complete: " + ", ".join(summary_parts) + "."))
+
+    flash_upload_results(results)
+    return redirect_admin_documents("admin-feedback")
 
 @app.route("/admin/documents")
 @login_required
@@ -5669,19 +5746,22 @@ def reindex_document(document_id):
 
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
-        flash("Document not found.")
-        return redirect(url_for("admin_documents"))
+        flash("Document not found.", "error")
+        return redirect_admin_documents("admin-feedback")
 
     try:
         index_document_record(doc)
         block_count = RequirementBlock.query.filter_by(document_id=doc.id).count()
-        flash(f"Reindexed: {doc.original_filename} ({block_count} requirement blocks)")
+        flash(
+            f"Reindexed: {doc.original_filename} ({block_count} requirement blocks)",
+            "success",
+        )
     except Exception as e:
         db.session.rollback()
         print(f"Reindex error for document {document_id}: {e}")
-        flash(f"Reindex error: {str(e)}")
+        flash(f"Reindex error: {str(e)}", "error")
 
-    return redirect(url_for("admin_documents"))
+    return redirect_admin_documents("admin-feedback")
 
 
 @app.route("/reindex-multiple", methods=["POST"])
@@ -5692,8 +5772,8 @@ def bulk_reindex_documents():
 
     raw_ids = request.form.getlist("document_ids")
     if not raw_ids:
-        flash("No documents selected.")
-        return redirect(url_for("admin_documents"))
+        flash("No documents selected.", "warning")
+        return redirect_admin_documents("admin-feedback")
 
     reindexed_count = 0
     missing_count = 0
@@ -5727,8 +5807,8 @@ def bulk_reindex_documents():
         if len(error_names) > 5:
             preview += f" (+{len(error_names) - 5} more)"
         summary += f" Failed: {preview}."
-    flash(summary)
-    return redirect(url_for("admin_documents"))
+    flash(summary, "success" if error_count == 0 else "warning")
+    return redirect_admin_documents("admin-feedback")
 
 
 @app.route("/delete/<int:document_id>")
@@ -5739,16 +5819,16 @@ def delete_document(document_id):
 
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
-        flash("Document not found.")
-        return redirect(url_for("admin_documents"))
+        flash("Document not found.", "error")
+        return redirect_admin_documents("admin-feedback")
 
     storage.delete_document(doc.stored_filename, DOC_FOLDER)
 
     # DB cascade will remove requirements & tables
     db.session.delete(doc)
     db.session.commit()
-    flash(f"Deleted: {doc.original_filename}")
-    return redirect(url_for("admin_documents"))
+    flash(f"Deleted: {doc.original_filename}", "success")
+    return redirect_admin_documents("admin-feedback")
 
 @app.route("/requirement/<int:block_id>")
 def requirement_detail(block_id):
@@ -6204,8 +6284,8 @@ def bulk_delete_documents():
 
     raw_ids = request.form.getlist("document_ids")
     if not raw_ids:
-        flash("No documents selected.")
-        return redirect(url_for("admin_documents"))
+        flash("No documents selected.", "warning")
+        return redirect_admin_documents("admin-feedback")
 
     deleted_count = 0
     missing_count = 0
@@ -6235,9 +6315,10 @@ def bulk_delete_documents():
             error_count += 1
 
     flash(
-        f"Bulk delete completed. Deleted: {deleted_count}, Missing: {missing_count}, Errors: {error_count}."
+        f"Bulk delete completed. Deleted: {deleted_count}, Missing: {missing_count}, Errors: {error_count}.",
+        "success" if error_count == 0 else "warning",
     )
-    return redirect(url_for("admin_documents"))
+    return redirect_admin_documents("admin-feedback")
 
 
 
