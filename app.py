@@ -4554,25 +4554,95 @@ iframe { width:100%; height:100%; border:none; }
   border-radius:8px;
 }
 .docx-drawing-panel h3 {
-  margin:0 0 10px 0;
+  margin:0 0 4px 0;
   color:#334155;
   font-size:16px;
+}
+.docx-drawing-hint {
+  margin:0 0 10px 0;
+  color:#64748b;
+  font-size:12px;
 }
 .docx-drawing-grid {
   display:grid;
   grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
   gap:10px;
 }
-.docx-drawing-grid img {
+.docx-drawing-thumb {
+  display:block;
+  width:100%;
+  padding:0;
+  border:none;
+  background:transparent;
+  cursor:zoom-in;
+}
+.docx-drawing-thumb img {
   width:100%;
   height:auto;
   border:1px solid #dbe1ea;
   border-radius:6px;
   background:#fff;
+  transition:box-shadow 0.15s ease, transform 0.15s ease;
 }
-.docx-drawing-grid img.highlighted {
+.docx-drawing-thumb:hover img {
+  box-shadow:0 4px 14px rgba(15,23,42,0.12);
+  transform:translateY(-1px);
+}
+.docx-drawing-thumb img.highlighted {
   border:2px solid #0069d9;
   box-shadow:0 0 0 2px rgba(0,105,217,0.15);
+}
+.docx-lightbox {
+  position:fixed;
+  inset:0;
+  z-index:9999;
+  background:rgba(15,23,42,0.82);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px;
+  box-sizing:border-box;
+}
+.docx-lightbox.hidden {
+  display:none;
+}
+.docx-lightbox-content {
+  position:relative;
+  max-width:96vw;
+  max-height:92vh;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:12px;
+}
+.docx-lightbox-content img {
+  max-width:96vw;
+  max-height:82vh;
+  width:auto;
+  height:auto;
+  border-radius:8px;
+  background:#fff;
+  box-shadow:0 10px 30px rgba(0,0,0,0.35);
+}
+.docx-lightbox-toolbar {
+  display:flex;
+  gap:8px;
+  align-items:center;
+}
+.docx-lightbox-close {
+  position:absolute;
+  top:-12px;
+  right:-12px;
+  width:36px;
+  height:36px;
+  border:none;
+  border-radius:999px;
+  background:#fff;
+  color:#334155;
+  font-size:22px;
+  line-height:1;
+  cursor:pointer;
+  box-shadow:0 2px 8px rgba(0,0,0,0.2);
 }
 </style>
 </head>
@@ -4590,7 +4660,7 @@ iframe { width:100%; height:100%; border:none; }
                 {% if page < total_pages %}
                 <a class="btn btn-gray btn-small" href="{{ url_for(viewer_route, document_id=document_id, page=page+1) }}">Next</a>
                 {% endif %}
-                {% if view_mode == 'pdf' %}
+                {% if total_pages > 1 %}
                 <form class="jump-form" method="get" action="{{ url_for(viewer_route, document_id=document_id) }}">
                     <input
                         class="jump-input"
@@ -4599,8 +4669,8 @@ iframe { width:100%; height:100%; border:none; }
                         min="1"
                         max="{{ total_pages }}"
                         value="{{ page }}"
-                        aria-label="Jump to page"
-                        title="Jump to page (1-{{ total_pages }})"
+                        aria-label="Jump to {{ page_label|lower }}"
+                        title="Jump to {{ page_label|lower }} (1-{{ total_pages }})"
                     >
                     <button class="btn btn-gray btn-small" type="submit">Go</button>
                 </form>
@@ -4643,14 +4713,23 @@ iframe { width:100%; height:100%; border:none; }
                     {% if extension == 'docx' and docx_image_indexes %}
                     <div class="docx-drawing-panel">
                         <h3>Related drawings</h3>
+                        <p class="docx-drawing-hint">Click any drawing to enlarge. Press Esc to close.</p>
                         <div class="docx-drawing-grid">
                             {% for image_index in docx_image_indexes %}
-                            <img
-                                src="{{ url_for('docx_image', document_id=document_id, image_index=image_index) }}"
-                                alt="DOCX drawing {{ image_index + 1 }}"
-                                {% if highlight_image_index is not none and highlight_image_index == image_index %}class="highlighted"{% endif %}
-                                loading="lazy"
-                            />
+                            {% set image_url = url_for('docx_image', document_id=document_id, image_index=image_index) %}
+                            <button
+                                type="button"
+                                class="docx-drawing-thumb"
+                                data-image-src="{{ image_url }}"
+                                aria-label="Open drawing {{ image_index + 1 }}"
+                            >
+                                <img
+                                    src="{{ image_url }}"
+                                    alt="DOCX drawing {{ image_index + 1 }}"
+                                    {% if highlight_image_index is not none and highlight_image_index == image_index %}class="highlighted"{% endif %}
+                                    loading="lazy"
+                                />
+                            </button>
                             {% endfor %}
                         </div>
                     </div>
@@ -4677,6 +4756,56 @@ iframe { width:100%; height:100%; border:none; }
         </div>
         {% endif %}
     </div>
+    {% if extension == 'docx' and docx_image_indexes %}
+    <div id="docx-lightbox" class="docx-lightbox hidden" role="dialog" aria-modal="true" aria-label="Drawing preview">
+        <div class="docx-lightbox-content">
+            <button type="button" class="docx-lightbox-close" id="docx-lightbox-close" aria-label="Close">×</button>
+            <img id="docx-lightbox-img" src="" alt="Expanded drawing" />
+            <div class="docx-lightbox-toolbar">
+                <a id="docx-lightbox-open" class="btn btn-gray btn-small" href="#" target="_blank" rel="noopener">Open full size</a>
+            </div>
+        </div>
+    </div>
+    <script>
+    (function() {
+        const lightbox = document.getElementById("docx-lightbox");
+        const lightboxImg = document.getElementById("docx-lightbox-img");
+        const lightboxOpen = document.getElementById("docx-lightbox-open");
+        const closeBtn = document.getElementById("docx-lightbox-close");
+        if (!lightbox || !lightboxImg) return;
+
+        function openLightbox(src) {
+            lightboxImg.src = src;
+            lightboxOpen.href = src;
+            lightbox.classList.remove("hidden");
+            document.body.style.overflow = "hidden";
+        }
+
+        function closeLightbox() {
+            lightbox.classList.add("hidden");
+            lightboxImg.src = "";
+            document.body.style.overflow = "";
+        }
+
+        document.querySelectorAll(".docx-drawing-thumb").forEach(function(btn) {
+            btn.addEventListener("click", function() {
+                const src = btn.getAttribute("data-image-src");
+                if (src) openLightbox(src);
+            });
+        });
+
+        closeBtn.addEventListener("click", closeLightbox);
+        lightbox.addEventListener("click", function(event) {
+            if (event.target === lightbox) closeLightbox();
+        });
+        document.addEventListener("keydown", function(event) {
+            if (event.key === "Escape" && !lightbox.classList.contains("hidden")) {
+                closeLightbox();
+            }
+        });
+    })();
+    </script>
+    {% endif %}
     {% if translation_enabled %}
     <script>
     const documentId = {{ document_id }};
