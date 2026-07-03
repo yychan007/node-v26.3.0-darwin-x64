@@ -1868,7 +1868,7 @@ def normalize_excel_sheet(raw_df, max_rows=200):
         return pd.DataFrame()
 
     # Trim surrounding blank canvas introduced by styled spreadsheets.
-    non_empty_mask = sheet.applymap(lambda value: bool(normalize_cell_text(value)))
+    non_empty_mask = sheet.apply(lambda col: col.map(lambda value: bool(normalize_cell_text(value))))
     if non_empty_mask.values.any():
         non_empty_rows = non_empty_mask.any(axis=1)
         non_empty_cols = non_empty_mask.any(axis=0)
