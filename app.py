@@ -2171,6 +2171,102 @@ def parse_section_blocks(content, page_offsets):
     return blocks
 
 
+def requirement_id_from_filename(filename):
+    match = REQ_ID_REGEX.search(filename or "")
+    return match.group(1) if match else ""
+
+
+def normalize_requirement_id_key(req_id):
+    return (req_id or "").strip().lower()
+
+
+def is_trackable_am_req_id(req_id):
+    text = (req_id or "").strip()
+    if not text:
+        return False
+    match = REQ_ID_REGEX.fullmatch(text)
+    if match:
+        return True
+    match = REQ_ID_REGEX.search(text)
+    return bool(match and match.group(1).lower() == text.lower())
+
+
+def requirement_block_keep_score(block):
+    score = len(block.full_text or "")
+    doc = block.document
+    if doc:
+        filename_req = requirement_id_from_filename(doc.original_filename)
+        block_req = normalize_requirement_id_key(block.requirement_id)
+        if filename_req and normalize_requirement_id_key(filename_req) == block_req:
+            score += 5_000_000
+        if not is_spreadsheet_document(doc):
+            score += 50_000
+    score += (block.id or 0) * 0.001
+    return score
+
+
+def dedupe_requirement_blocks_by_id():
+    rows = RequirementBlock.query.filter(
+        RequirementBlock.requirement_id.isnot(None),
+        RequirementBlock.requirement_id != "",
+    ).all()
+    groups = {}
+    for row in rows:
+        if not is_trackable_am_req_id(row.requirement_id):
+            continue
+        key = normalize_requirement_id_key(row.requirement_id)
+        groups.setdefault(key, []).append(row)
+
+    removed = 0
+    for group in groups.values():
+        if len(group) <= 1:
+            continue
+        keeper = max(group, key=requirement_block_keep_score)
+        for row in group:
+            if row.id != keeper.id:
+                db.session.delete(row)
+                removed += 1
+    if removed:
+        db.session.commit()
+    return removed
+
+
+def build_spreadsheet_requirement_blocks(doc_record, text, tables):
+    req_id = requirement_id_from_filename(doc_record.original_filename)
+    if not req_id:
+        return []
+
+    sheet_names = [str(name) for name, _df in (tables or []) if name]
+    filename = doc_record.original_filename or ""
+    if sheet_names:
+        shown = ", ".join(sheet_names[:6])
+        if len(sheet_names) > 6:
+            shown += f" (+{len(sheet_names) - 6} more)"
+        summary = f"Spreadsheet table · Sheets: {shown}"
+    else:
+        summary = "Spreadsheet table"
+
+    full_text = sanitize_text_for_db((text or "")[:20000])
+    if not full_text.strip():
+        full_text = sanitize_text_for_db(summary)
+
+    return [
+        {
+            "requirement_id": req_id,
+            "title": filename,
+            "section": sheet_names[0] if sheet_names else "",
+            "major_section": "",
+            "page": 1,
+            "char_start": 0,
+            "category": "Table",
+            "definition": "",
+            "summary": summary,
+            "full_text": full_text,
+            "token_blob": " ".join(preprocess(full_text)),
+        }
+    ]
+
+
 def parse_requirement_blocks(content, page_offsets):
     content = normalize_requirement_text(content)
     doc_sections = parse_document_sections(content)
@@ -2686,12 +2782,21 @@ def _index_document_record_impl(doc_record):
 
     remove_existing_blocks(doc_record.id)
 
-    blocks = parse_requirement_blocks(text, page_offsets)
+    if is_spreadsheet_document(doc_record):
+        blocks = build_spreadsheet_requirement_blocks(doc_record, text, tables)
+    else:
+        blocks = parse_requirement_blocks(text, page_offsets)
     seen_hashes = set()
+    seen_req_ids = set()
     pending = 0
 
     for b in blocks:
         requirement_id = sanitize_text_for_db(b.get("requirement_id", ""))
+        if requirement_id and is_trackable_am_req_id(requirement_id):
+            req_key = normalize_requirement_id_key(requirement_id)
+            if req_key in seen_req_ids:
+                continue
+            seen_req_ids.add(req_key)
         title = sanitize_text_for_db(b.get("title", ""))
         section = sanitize_text_for_db(b.get("section", ""))
         major_section = sanitize_text_for_db(b.get("major_section", ""))
@@ -2733,6 +2838,7 @@ def _index_document_record_impl(doc_record):
 
     save_table_previews(doc_record.id, tables)
     db.session.commit()
+    dedupe_requirement_blocks_by_id()
 
 def dedupe_lookup(file_hash):
     return DocumentRecord.query.filter_by(file_hash=file_hash).first()
@@ -4334,12 +4440,13 @@ DOCS_TEMPLATE = """
       {% endif %}
     {% endwith %}
 
-    <form method="POST" action="{{ url_for('bulk_delete_documents') }}" onsubmit="return confirmBulkDelete();">
+    <form method="POST" action="{{ url_for('bulk_delete_documents') }}">
         <div style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <button type="submit" class="btn btn-orange">Delete Selected</button>
+            <button type="submit" formaction="{{ url_for('bulk_reindex_documents') }}" class="btn btn-green" onclick="return confirmBulkReindex();">Reindex Selected</button>
+            <button type="submit" class="btn btn-orange" onclick="return confirmBulkDelete();">Delete Selected</button>
             <button type="button" class="btn btn-gray" onclick="toggleAll(true)">Select All</button>
             <button type="button" class="btn btn-gray" onclick="toggleAll(false)">Clear All</button>
-            <span class="small">Select multiple documents and delete them in one action.</span>
+            <span class="small">Select multiple documents to reindex or delete in one action.</span>
         </div>
 
         <table class="data-table" style="margin-top:16px; width:100%;">
@@ -4418,6 +4525,15 @@ function confirmBulkDelete() {
         return false;
     }
     return confirm('Delete ' + checked.length + ' selected document(s)? This cannot be undone.');
+}
+
+function confirmBulkReindex() {
+    const checked = document.querySelectorAll('.doc-checkbox:checked');
+    if (checked.length === 0) {
+        alert('Please select at least one document to reindex.');
+        return false;
+    }
+    return confirm('Reindex ' + checked.length + ' selected document(s)? This may take a while.');
 }
 </script>
 </body>
@@ -5587,6 +5703,54 @@ def reindex_document(document_id):
         flash(f"Reindex error: {str(e)}")
 
     return redirect(url_for("admin_documents"))
+
+
+@app.route("/reindex-multiple", methods=["POST"])
+@login_required
+def bulk_reindex_documents():
+    if not is_admin():
+        abort(403)
+
+    raw_ids = request.form.getlist("document_ids")
+    if not raw_ids:
+        flash("No documents selected.")
+        return redirect(url_for("admin_documents"))
+
+    reindexed_count = 0
+    missing_count = 0
+    error_count = 0
+    error_names = []
+
+    for raw_id in raw_ids:
+        try:
+            document_id = int(raw_id)
+        except ValueError:
+            error_count += 1
+            continue
+
+        doc = db.session.get(DocumentRecord, document_id)
+        if not doc:
+            missing_count += 1
+            continue
+
+        try:
+            index_document_record(doc)
+            reindexed_count += 1
+        except Exception as exc:
+            db.session.rollback()
+            error_count += 1
+            error_names.append(doc.original_filename)
+            print(f"Bulk reindex error for document {document_id}: {exc}")
+
+    summary = f"Bulk reindex completed. Reindexed: {reindexed_count}, Missing: {missing_count}, Errors: {error_count}."
+    if error_names:
+        preview = ", ".join(error_names[:5])
+        if len(error_names) > 5:
+            preview += f" (+{len(error_names) - 5} more)"
+        summary += f" Failed: {preview}."
+    flash(summary)
+    return redirect(url_for("admin_documents"))
+
 
 @app.route("/delete/<int:document_id>")
 @login_required
