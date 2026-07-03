@@ -1871,7 +1871,7 @@ def normalize_excel_sheet(raw_df, max_rows=200):
         headers.append(label)
 
     body = block.iloc[1:].copy()
-    body.columns = headers
+    body.columns = dedupe_column_names(headers)
     return finalize_display_dataframe(body, max_rows=max_rows)
 
 def ocr_pdf(path):
@@ -2206,13 +2206,25 @@ def normalize_cell_text(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def dedupe_column_names(columns):
+    seen = {}
+    result = []
+    for col in columns:
+        base = normalize_cell_text(col) or "Column"
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        result.append(base if count == 1 else f"{base} ({count})")
+    return result
+
+
 def trim_sparse_display_columns(df, min_fill_ratio=0.05):
     if df is None or df.empty:
         return df
     keep_cols = []
-    for col in df.columns:
+    for idx, col in enumerate(df.columns):
         col_name = normalize_cell_text(col)
-        values = [normalize_cell_text(v) for v in df[col].tolist()]
+        series = df.iloc[:, idx]
+        values = [normalize_cell_text(v) for v in series.tolist()]
         filled = sum(1 for value in values if value)
         if filled == 0:
             continue
@@ -2231,21 +2243,23 @@ def finalize_display_dataframe(df, max_rows=40):
         return pd.DataFrame()
 
     cleaned = df.copy()
-    cleaned.columns = [
-        normalize_cell_text(col) or f"Column {idx + 1}"
-        for idx, col in enumerate(cleaned.columns)
-    ]
-    for col in cleaned.columns:
-        cleaned[col] = cleaned[col].map(normalize_cell_text)
+    cleaned.columns = dedupe_column_names(cleaned.columns)
+    for idx in range(cleaned.shape[1]):
+        cleaned.iloc[:, idx] = cleaned.iloc[:, idx].map(normalize_cell_text)
 
     cleaned = clean_dataframe_for_display(cleaned, max_rows=max_rows)
     cleaned = trim_sparse_display_columns(cleaned)
     if cleaned.empty:
         return cleaned
 
-    keep_cols = [col for col in cleaned.columns if any(cleaned[col].str.strip())]
-    if keep_cols:
-        cleaned = cleaned.loc[:, keep_cols]
+    keep_indexes = [
+        idx
+        for idx in range(cleaned.shape[1])
+        if any(str(value).strip() for value in cleaned.iloc[:, idx].tolist())
+    ]
+    if keep_indexes:
+        cleaned = cleaned.iloc[:, keep_indexes]
+    cleaned.columns = dedupe_column_names(cleaned.columns)
     return cleaned.head(max_rows).reset_index(drop=True)
 
 
@@ -2272,9 +2286,10 @@ def split_table_footnote_rows(df):
             keep_rows.append(row)
 
     if keep_rows:
-        trimmed = pd.DataFrame(keep_rows, columns=df.columns).reset_index(drop=True)
+        trimmed = pd.DataFrame(keep_rows).reset_index(drop=True)
+        trimmed.columns = dedupe_column_names(df.columns[: trimmed.shape[1]])
     else:
-        trimmed = df
+        trimmed = df.iloc[0:0].copy()
     return trimmed, footnotes
 
 
