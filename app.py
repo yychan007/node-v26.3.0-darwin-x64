@@ -2438,12 +2438,13 @@ def split_table_footnote_rows(df):
     return trimmed, footnotes
 
 
-def build_table_html(df):
-    preview_df = finalize_display_dataframe(df, max_rows=40)
-    if preview_df.empty:
-        return "", pd.DataFrame()
+def prepare_table_display(full_df, footnotes_override=None):
+    if full_df is None or full_df.empty:
+        return "", pd.DataFrame(), []
 
-    preview_df, footnotes = split_table_footnote_rows(preview_df)
+    preview_df, footnotes = split_table_footnote_rows(full_df)
+    if footnotes_override is not None:
+        footnotes = footnotes_override
     html_table = preview_df.to_html(
         index=False, classes="data-table compact-table", border=0, na_rep=""
     )
@@ -2451,7 +2452,16 @@ def build_table_html(df):
         html_table += "".join(
             f'<div class="table-footnote">{html.escape(note)}</div>' for note in footnotes
         )
-    return html_table, preview_df
+    return html_table, preview_df, footnotes
+
+
+def build_table_html(df):
+    full_df = finalize_display_dataframe(df, max_rows=40)
+    if full_df.empty:
+        return "", pd.DataFrame()
+
+    html_table, _preview_df, _footnotes = prepare_table_display(full_df)
+    return html_table, full_df
 
 
 def dataframe_from_table_csv(csv_text):
@@ -2467,7 +2477,27 @@ def render_table_preview_html(table_row, lang="nl"):
     csv_text = (table_row.csv_text or "").strip()
     csv_text_en = (table_row.csv_text_en or "").strip()
     if lang == "en" and csv_text_en:
-        csv_text = csv_text_en
+        df_en = dataframe_from_table_csv(csv_text_en)
+        if df_en is not None and not df_en.empty:
+            full_df_en = finalize_display_dataframe(df_en, max_rows=40)
+            footnotes_override = None
+            if csv_text:
+                df_nl = dataframe_from_table_csv(csv_text)
+                if df_nl is not None and not df_nl.empty:
+                    _, original_footnotes = split_table_footnote_rows(
+                        finalize_display_dataframe(df_nl, max_rows=40)
+                    )
+                    if original_footnotes and translation.translation_enabled():
+                        footnotes_override = [
+                            translate_to_language(note, "en") or note
+                            for note in original_footnotes
+                        ]
+            html_table, _, _ = prepare_table_display(
+                full_df_en, footnotes_override=footnotes_override
+            )
+            if html_table:
+                return html_table
+        return table_row.html_table_en or ""
 
     df = dataframe_from_table_csv(csv_text)
     if df is not None and not df.empty:
@@ -2480,28 +2510,31 @@ def render_table_preview_html(table_row, lang="nl"):
     return table_row.html_table or ""
 
 
-def translate_preview_df(preview_df, target_lang="en"):
-    if preview_df is None or preview_df.empty or not translation.translation_enabled():
+def translate_preview_df(full_df, target_lang="en"):
+    if full_df is None or full_df.empty or not translation.translation_enabled():
         return "", ""
     try:
+        display_df = finalize_display_dataframe(full_df, max_rows=40)
         translated_df = translation.translate_dataframe_values(
-            preview_df,
+            display_df,
             target_lang=target_lang,
             cache_get=get_cached_translation,
             cache_set=store_cached_translation,
             max_cells=TRANSLATE_MAX_CELLS,
         )
         translated_df = finalize_display_dataframe(translated_df, max_rows=40)
-        translated_df, footnotes = split_table_footnote_rows(translated_df)
+        _, original_footnotes = split_table_footnote_rows(display_df)
+        translated_footnotes = None
+        if original_footnotes:
+            translated_footnotes = [
+                translate_to_language(note, target_lang) or note for note in original_footnotes
+            ]
+        html_table, _preview_df, _footnotes = prepare_table_display(
+            translated_df, footnotes_override=translated_footnotes
+        )
+
         csv_buf = io.StringIO()
         translated_df.to_csv(csv_buf, index=False)
-        html_table = translated_df.to_html(
-            index=False, classes="data-table compact-table", border=0, na_rep=""
-        )
-        if footnotes:
-            html_table += "".join(
-                f'<div class="table-footnote">{html.escape(note)}</div>' for note in footnotes
-            )
         return html_table, csv_buf.getvalue()
     except Exception as exc:
         print(f"Table translation skipped ({target_lang}): {exc}")
@@ -2517,15 +2550,15 @@ def save_table_previews(doc_id, tables):
     for sheet_name, df in tables:
         if df is None:
             continue
-        html_table, preview_df = build_table_html(df)
-        if preview_df.empty:
+        html_table, full_df = build_table_html(df)
+        if full_df.empty:
             continue
         html_table_en = ""
         csv_text_en = ""
         if translation.translation_enabled():
-            html_table_en, csv_text_en = translate_preview_df(preview_df, "en")
+            html_table_en, csv_text_en = translate_preview_df(full_df, "en")
         csv_buf = io.StringIO()
-        preview_df.to_csv(csv_buf, index=False)
+        full_df.to_csv(csv_buf, index=False)
         table_preview_cls = cast(Any, TablePreview)
         row = table_preview_cls(
             document_id=doc_id,
@@ -2577,12 +2610,12 @@ def refresh_table_translations_from_cache(tables):
             df = pd.read_csv(
                 io.StringIO(row.csv_text), dtype=str, keep_default_na=False
             )
-            html_table, preview_df = build_table_html(df)
-            if preview_df.empty:
+            html_table, full_df = build_table_html(df)
+            if full_df.empty:
                 continue
             row.html_table = html_table
             if needs_en:
-                row.html_table_en, row.csv_text_en = translate_preview_df(preview_df, "en")
+                row.html_table_en, row.csv_text_en = translate_preview_df(full_df, "en")
             updated = True
         except Exception as exc:
             print(f"Cached table translation failed for preview {row.id}: {exc}")
