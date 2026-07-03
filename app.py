@@ -2012,8 +2012,29 @@ def create_default_admin():
         db.session.commit()
         print(f"Created initial admin user '{admin_username}'.")
 
+def trim_sparse_display_columns(df, min_fill_ratio=0.2):
+    if df is None or df.empty:
+        return df
+    keep_cols = []
+    for col in df.columns:
+        col_name = str(col).strip()
+        values = [str(v).strip() for v in df[col].tolist()]
+        filled = sum(1 for value in values if value)
+        if filled == 0:
+            continue
+        if (col_name.startswith("Column ") or col_name.startswith("Unnamed:")) and (
+            filled / max(len(values), 1) < min_fill_ratio
+        ):
+            continue
+        keep_cols.append(col)
+    if not keep_cols:
+        return df
+    return df.loc[:, keep_cols]
+
+
 def build_table_html(df):
     preview_df = clean_dataframe_for_display(df, max_rows=40)
+    preview_df = trim_sparse_display_columns(preview_df)
     if preview_df.empty:
         return "", pd.DataFrame()
     html_table = preview_df.to_html(
@@ -3008,16 +3029,36 @@ button { background:#0069d9; }
 .table-result-columns {
   display:flex;
   flex-direction:column;
-  gap:20px;
-  margin-top:10px;
+  gap:12px;
+  margin-top:6px;
 }
-.table-result-panel {
-  min-width:0;
-  width:100%;
+.table-result-item {
+  margin-top:8px;
+  padding:10px 12px;
 }
-.table-result-panel > strong {
-  display:block;
+.table-result-item .meta-prominent {
+  margin:6px 0 8px 0;
+}
+.table-result-item .meta {
+  margin-top:8px;
+}
+.search-results-text {
+  margin-top:12px;
+}
+.search-results-text h3 {
+  margin:0 0 8px 0;
+}
+.search-empty-notice {
+  margin-top:12px;
+  padding:12px 14px;
+}
+.search-empty-notice .panel-title {
   margin-bottom:8px;
+  padding-bottom:6px;
+}
+.compact-warning {
+  margin:0;
+  padding:10px 12px;
 }
 .table-scroll-wrap {
   overflow-x:auto;
@@ -3041,10 +3082,18 @@ button { background:#0069d9; }
 .table-scroll-wrap .data-table th,
 .table-scroll-wrap .data-table td {
   white-space:nowrap;
+  padding:5px 8px;
 }
-.table-scroll-wrap .data-table td:last-child,
-.table-scroll-wrap .data-table th:last-child {
-  padding-right:12px;
+.table-scroll-wrap .data-table td:empty {
+  display:none;
+}
+.table-result-panel {
+  min-width:0;
+  width:100%;
+}
+.table-result-panel > strong {
+  display:block;
+  margin-bottom:6px;
 }
 a { color:#0069d9; text-decoration:none; }
 a:hover { text-decoration:underline; }
@@ -3324,13 +3373,18 @@ HOME_TEMPLATE = """
                 {% endfor %}
             </div>
         </div>
+        {% elif 'drawings' in result_types and current_page == 1 %}
+        <div class="search-meta-panel search-empty-notice">
+            <div class="panel-title">related drawings</div>
+            <div class="warning compact-warning">No matching related drawings found.</div>
+        </div>
         {% endif %}
 
         {% if table_results and current_page == 1 and 'tables' in result_types %}
         <div class="search-meta-panel">
             <div class="panel-title">excel table</div>
             {% for t in table_results %}
-            <div class="result-item">
+            <div class="result-item table-result-item">
                 <div class="filename">
                     <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">
                         {{ t.preview_title }}
@@ -3364,11 +3418,15 @@ HOME_TEMPLATE = """
             {% endfor %}
         </div>
         {% elif 'tables' in result_types and current_page == 1 %}
-        <div class="warning">No matching excel tables found.</div>
+        <div class="search-meta-panel search-empty-notice">
+            <div class="panel-title">excel table</div>
+            <div class="warning compact-warning">No matching excel table results found.</div>
+        </div>
         {% endif %}
 
         {% if 'text' in result_types %}
-        <h3>Results for "{{ query }}"</h3>
+        <div class="search-results-text">
+        <h3>Text results for "{{ query }}"</h3>
 
         {% if results %}
             {% for res in results %}
@@ -3483,8 +3541,9 @@ HOME_TEMPLATE = """
             </div>
             {% endif %}
         {% else %}
-            <div class="warning">No matching results found.</div>
+            <div class="warning compact-warning">No matching Text results found.</div>
         {% endif %}
+        </div>
         {% endif %}
     {% endif %}
 </div>
@@ -4213,7 +4272,7 @@ def home():
     summary = {"top_categories": [], "top_requirement_ids": []}
     document_matches = []
     table_results = []
-    result_types = ["drawings", "text"]
+    result_types = ["drawings", "text", "tables"]
 
     if query:
         all_expanded_terms = get_all_expanded_terms(query)
