@@ -2252,6 +2252,20 @@ def sanitize_text_for_db(value):
     return str(value or "").replace("\x00", "").strip()
 
 
+def _is_spacer_like_row(values):
+    non_empty = [normalize_cell_text(v) for v in values if normalize_cell_text(v)]
+    if not non_empty:
+        return True
+    if len(non_empty) == 1:
+        token = non_empty[0]
+        # Drop visual spacer artifacts such as lone symbols or short numeric markers.
+        if re.fullmatch(r"[-_=|./\\]+", token):
+            return True
+        if not any(ch.isalpha() for ch in token) and len(token) <= 2:
+            return True
+    return False
+
+
 def dedupe_column_names(columns):
     seen = {}
     result = []
@@ -2311,6 +2325,22 @@ def finalize_display_dataframe(df, max_rows=40):
     ]
     if keep_indexes:
         cleaned = cleaned.iloc[:, keep_indexes]
+
+    # After sparse/noise columns are removed, some rows may become fully empty.
+    if not cleaned.empty:
+        row_keep = cleaned.apply(
+            lambda row: any(normalize_cell_text(value) for value in row), axis=1
+        )
+        cleaned = cleaned.loc[row_keep]
+
+    if not cleaned.empty:
+        cleaned = cleaned.loc[
+            cleaned.apply(lambda row: not _is_spacer_like_row(row.tolist()), axis=1)
+        ]
+
+    if cleaned.empty:
+        return cleaned
+
     cleaned.columns = dedupe_column_names(cleaned.columns)
     return cleaned.head(max_rows).reset_index(drop=True)
 
@@ -2321,15 +2351,18 @@ def split_table_footnote_rows(df):
 
     footnotes = []
     keep_rows = []
+    total_cols = max(len(df.columns), 1)
     for _, row in df.iterrows():
         values = [normalize_cell_text(v) for v in row.tolist()]
         non_empty = [v for v in values if v]
         if not non_empty:
             continue
         joined = " ".join(non_empty)
+        sparse_row = len(non_empty) <= max(2, int(total_cols * 0.15))
         is_footnote = (
             (len(non_empty) == 1 and len(non_empty[0]) >= 70)
             or (len(non_empty) <= 2 and max(len(v) for v in non_empty) >= 100)
+            or (sparse_row and len(joined) >= 80)
             or bool(re.match(r"^\d+\)\s", non_empty[0]))
         )
         if is_footnote:
@@ -3442,8 +3475,10 @@ button { background:#0069d9; }
 }
 .table-scroll-wrap .data-table th,
 .table-scroll-wrap .data-table td {
-  width: 1%;
-  white-space: nowrap;
+  width: auto;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   padding: 4px 10px;
   vertical-align: top;
 }
