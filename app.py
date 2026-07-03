@@ -37,6 +37,7 @@ import json
 import time
 import uuid
 import hashlib
+import html
 import secrets
 import zipfile
 import tempfile
@@ -862,6 +863,127 @@ def extract_single_page_text(doc, page_num):
         return ""
 
 
+def extract_pdf_page_layout_rows(doc, page_num, y_tolerance=12):
+    if doc.extension.lower() != "pdf" or not OCR_AVAILABLE or fitz is None:
+        return None
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return None
+
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as file_path:
+            with fitz.open(file_path) as pdf_doc:
+                if page_num < 1 or page_num > len(pdf_doc):
+                    return None
+                page = pdf_doc.load_page(page_num - 1)
+                page_width = float(page.rect.width) or 1.0
+                page_height = float(page.rect.height) or 1.0
+                blocks = []
+                for item in page.get_text("blocks"):
+                    if len(item) < 7:
+                        continue
+                    x0, y0, x1, y1, text, _block_no, block_type = item[:7]
+                    if int(block_type) != 0:
+                        continue
+                    text = (text or "").strip()
+                    if not text:
+                        continue
+                    blocks.append(
+                        {
+                            "x0": float(x0),
+                            "y0": float(y0),
+                            "x1": float(x1),
+                            "y1": float(y1),
+                            "text": text,
+                        }
+                    )
+
+                if not blocks:
+                    return None
+
+                blocks.sort(key=lambda b: (b["y0"], b["x0"]))
+                rows = []
+                for block in blocks:
+                    if not rows:
+                        rows.append({"y0": block["y0"], "cells": [block]})
+                        continue
+                    last_row = rows[-1]
+                    if abs(last_row["y0"] - block["y0"]) <= y_tolerance:
+                        last_row["cells"].append(block)
+                    else:
+                        rows.append({"y0": block["y0"], "cells": [block]})
+
+                for row in rows:
+                    row["cells"].sort(key=lambda c: c["x0"])
+
+                return {
+                    "page_width": page_width,
+                    "page_height": page_height,
+                    "rows": rows,
+                }
+    except Exception as exc:
+        print(f"PDF layout extract error for doc {doc.id} page {page_num}: {exc}")
+        return None
+
+
+def translate_layout_rows(layout_rows, target_lang="en"):
+    translated_rows = []
+    for row in layout_rows:
+        translated_cells = []
+        for cell in row["cells"]:
+            source_text = cell.get("text") or ""
+            translated = (
+                translate_to_language(source_text, target_lang) if source_text else ""
+            )
+            translated_cells.append(
+                {
+                    **cell,
+                    "translation": translated or source_text,
+                }
+            )
+        translated_rows.append({"y0": row["y0"], "cells": translated_cells})
+    return translated_rows
+
+
+def build_translation_flow_html(translated_rows):
+    if not translated_rows:
+        return ""
+
+    parts = ['<div class="translation-layout-flow">']
+    for row in translated_rows:
+        parts.append('<div class="translation-flow-row">')
+        for cell in row["cells"]:
+            width_weight = max(cell["x1"] - cell["x0"], 24.0)
+            text = html.escape(cell.get("translation") or "")
+            parts.append(
+                f'<div class="translation-flow-cell" style="flex:{width_weight:.0f} 1 0;">{text}</div>'
+            )
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def build_layout_translation_payload(doc, page_num, target_lang="en"):
+    layout = extract_pdf_page_layout_rows(doc, page_num)
+    if not layout or not layout.get("rows"):
+        return None
+
+    translated_rows = translate_layout_rows(layout["rows"], target_lang=target_lang)
+    source = "\n".join(
+        " | ".join(cell.get("text") or "" for cell in row["cells"])
+        for row in layout["rows"]
+    ).strip()
+    translation = "\n".join(
+        " | ".join(cell.get("translation") or "" for cell in row["cells"])
+        for row in translated_rows
+    ).strip()
+    translation_html = build_translation_flow_html(translated_rows)
+    return {
+        "source": source,
+        "translation": translation,
+        "translation_html": translation_html,
+    }
+
+
 def normalize_translation_lang(lang):
     return "en"
 
@@ -872,6 +994,10 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
         document_id=doc.id, page=page_num
     ).first()
 
+    layout_payload = None
+    if doc.extension.lower() == "pdf":
+        layout_payload = build_layout_translation_payload(doc, page_num, target_lang=target_lang)
+
     cached_translation = ""
     if row:
         cached_translation = (
@@ -880,7 +1006,7 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
     if cached_translation:
         cached_source = row.source_text if row else ""
         cached_provider = row.provider if row else get_translation_provider()
-        return {
+        response = {
             "page": page_num,
             "lang": target_lang,
             "source": cached_source,
@@ -888,8 +1014,20 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
             "provider": cached_provider,
             "cached": True,
         }
+        if layout_payload:
+            response["translation_html"] = layout_payload.get("translation_html") or ""
+            response["layout"] = True
+        return response
 
-    source = extract_single_page_text(doc, page_num)
+    if layout_payload:
+        source = layout_payload.get("source") or ""
+        translated = layout_payload.get("translation") or ""
+        translation_html = layout_payload.get("translation_html") or ""
+    else:
+        source = extract_single_page_text(doc, page_num)
+        translated = ""
+        translation_html = ""
+
     if not source:
         if pdf_source_file_missing(doc):
             error = (
@@ -908,7 +1046,9 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
             "error": error,
         }
 
-    translated = translate_to_language(source, target_lang)
+    if not layout_payload:
+        translated = translate_to_language(source, target_lang)
+
     provider = get_translation_provider()
     if translated:
         if row:
@@ -935,7 +1075,7 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
         except Exception:
             db.session.rollback()
 
-    return {
+    response = {
         "page": page_num,
         "lang": target_lang,
         "source": source,
@@ -943,6 +1083,10 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
         "provider": provider,
         "cached": False,
     }
+    if layout_payload:
+        response["translation_html"] = translation_html
+        response["layout"] = True
+    return response
 
 
 def count_pdf_pages(doc):
@@ -1646,45 +1790,40 @@ def normalize_excel_sheet(raw_df, max_rows=200):
     for bad in ("nan", "NaN", "None", "<NA>"):
         sheet = sheet.replace(bad, "")
 
-    header_row_idx = None
-    for idx in range(min(len(sheet), 25)):
-        row_values = [str(value).strip() for value in sheet.iloc[idx].tolist()]
-        non_empty = [value for value in row_values if value]
-        if len(non_empty) >= 2:
-            header_row_idx = idx
-            break
+    if sheet.empty:
+        return pd.DataFrame()
 
-    if header_row_idx is None:
-        return clean_dataframe_for_display(sheet, max_rows=max_rows)
+    scan_rows = min(len(sheet), 40)
+    header_row_idx = max(
+        range(scan_rows),
+        key=lambda idx: sum(1 for value in sheet.iloc[idx].tolist() if normalize_cell_text(value)),
+        default=0,
+    )
+    header_cells = [normalize_cell_text(value) for value in sheet.iloc[header_row_idx].tolist()]
+    if sum(1 for value in header_cells if value) < 2:
+        return finalize_display_dataframe(sheet, max_rows=max_rows)
 
+    data_end_row = min(len(sheet), header_row_idx + max_rows + 5)
+    block = sheet.iloc[header_row_idx:data_end_row]
+
+    keep_col_indexes = []
+    for col_idx in range(block.shape[1]):
+        column_values = [normalize_cell_text(block.iloc[row_idx, col_idx]) for row_idx in range(len(block))]
+        if any(column_values):
+            keep_col_indexes.append(col_idx)
+
+    if not keep_col_indexes:
+        return pd.DataFrame()
+
+    block = block.iloc[:, keep_col_indexes].copy()
     headers = []
-    for col_idx, value in enumerate(sheet.iloc[header_row_idx].tolist()):
-        label = str(value).strip()
-        headers.append(label or f"Column {col_idx + 1}")
+    for col_idx, value in enumerate(block.iloc[0].tolist()):
+        label = normalize_cell_text(value) or f"Column {col_idx + 1}"
+        headers.append(label)
 
-    body = sheet.iloc[header_row_idx + 1 :].copy()
-    body = body.iloc[:, : len(headers)]
+    body = block.iloc[1:].copy()
     body.columns = headers
-    body = clean_dataframe_for_display(body, max_rows=max_rows)
-    if body.empty:
-        return body
-
-    title_lines = []
-    for idx in range(header_row_idx):
-        row_text = " ".join(
-            str(value).strip()
-            for value in sheet.iloc[idx].tolist()
-            if str(value).strip()
-        )
-        if row_text:
-            title_lines.append(row_text)
-
-    if title_lines:
-        title_row = {col: "" for col in body.columns}
-        title_row[body.columns[0]] = " | ".join(title_lines)
-        body = pd.concat([pd.DataFrame([title_row]), body], ignore_index=True)
-
-    return body.head(max_rows)
+    return finalize_display_dataframe(body, max_rows=max_rows)
 
 def ocr_pdf(path):
     if not TESSERACT_AVAILABLE or pytesseract is None or convert_from_path is None:
@@ -2012,13 +2151,19 @@ def create_default_admin():
         db.session.commit()
         print(f"Created initial admin user '{admin_username}'.")
 
-def trim_sparse_display_columns(df, min_fill_ratio=0.2):
+def normalize_cell_text(value):
+    text = str(value or "").strip()
+    text = text.replace("\\n", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def trim_sparse_display_columns(df, min_fill_ratio=0.05):
     if df is None or df.empty:
         return df
     keep_cols = []
     for col in df.columns:
-        col_name = str(col).strip()
-        values = [str(v).strip() for v in df[col].tolist()]
+        col_name = normalize_cell_text(col)
+        values = [normalize_cell_text(v) for v in df[col].tolist()]
         filled = sum(1 for value in values if value)
         if filled == 0:
             continue
@@ -2032,9 +2177,31 @@ def trim_sparse_display_columns(df, min_fill_ratio=0.2):
     return df.loc[:, keep_cols]
 
 
+def finalize_display_dataframe(df, max_rows=40):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    cleaned = df.copy()
+    cleaned.columns = [
+        normalize_cell_text(col) or f"Column {idx + 1}"
+        for idx, col in enumerate(cleaned.columns)
+    ]
+    for col in cleaned.columns:
+        cleaned[col] = cleaned[col].map(normalize_cell_text)
+
+    cleaned = clean_dataframe_for_display(cleaned, max_rows=max_rows)
+    cleaned = trim_sparse_display_columns(cleaned)
+    if cleaned.empty:
+        return cleaned
+
+    keep_cols = [col for col in cleaned.columns if any(cleaned[col].str.strip())]
+    if keep_cols:
+        cleaned = cleaned.loc[:, keep_cols]
+    return cleaned.head(max_rows).reset_index(drop=True)
+
+
 def build_table_html(df):
-    preview_df = clean_dataframe_for_display(df, max_rows=40)
-    preview_df = trim_sparse_display_columns(preview_df)
+    preview_df = finalize_display_dataframe(df, max_rows=40)
     if preview_df.empty:
         return "", pd.DataFrame()
     html_table = preview_df.to_html(
@@ -2054,7 +2221,7 @@ def translate_preview_df(preview_df, target_lang="en"):
             cache_set=store_cached_translation,
             max_cells=TRANSLATE_MAX_CELLS,
         )
-        translated_df = clean_dataframe_for_display(translated_df, max_rows=40)
+        translated_df = finalize_display_dataframe(translated_df, max_rows=40)
         csv_buf = io.StringIO()
         translated_df.to_csv(csv_buf, index=False)
         html_table = translated_df.to_html(
@@ -3070,22 +3237,20 @@ button { background:#0069d9; }
   background:#fff;
 }
 .table-scroll-wrap .data-table {
-  display:block;
-  min-width:max-content;
+  display: inline-block;
+  width: auto;
+  max-width: 100%;
 }
 .table-scroll-wrap .data-table table {
-  width:max-content;
-  min-width:100%;
-  table-layout:auto;
-  margin:0;
+  width: auto;
+  max-width: none;
+  table-layout: auto;
+  margin: 0;
 }
 .table-scroll-wrap .data-table th,
 .table-scroll-wrap .data-table td {
-  white-space:nowrap;
-  padding:5px 8px;
-}
-.table-scroll-wrap .data-table td:empty {
-  display:none;
+  white-space: nowrap;
+  padding: 5px 8px;
 }
 .table-result-panel {
   min-width:0;
@@ -3994,8 +4159,22 @@ body { margin:0; }
 iframe { width:100%; height:100%; border:none; }
 .file-missing { padding:24px; color:#842029; background:#f8d7da; border:1px solid #f5c2c7; margin:16px; border-radius:8px; line-height:1.6; }
 .original-text-box { margin:16px; padding:16px; background:white; border:1px solid #e2e8f0; border-radius:8px; white-space:pre-wrap; line-height:1.55; }
-.translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; white-space:pre-wrap; line-height:1.55; margin-bottom:14px; }
+.translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; line-height:1.55; margin-bottom:14px; }
 .translation-box h4 { margin:0 0 8px 0; color:#334155; }
+#translated-text { white-space:pre-wrap; line-height:1.55; }
+.translation-layout-flow { display:flex; flex-direction:column; gap:8px; }
+.translation-flow-row { display:flex; gap:10px; align-items:flex-start; width:100%; }
+.translation-flow-cell {
+  min-width:0;
+  font-size:12px;
+  line-height:1.45;
+  white-space:pre-wrap;
+  word-break:break-word;
+  padding:6px 8px;
+  background:#f8fafc;
+  border:1px solid #e2e8f0;
+  border-radius:4px;
+}
 .translation-status { color:#64748b; font-size:13px; margin-bottom:12px; }
 .btn-small { padding:6px 10px; font-size:13px; }
 .page-nav { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
@@ -4104,6 +4283,7 @@ iframe { width:100%; height:100%; border:none; }
     async function loadCurrentTranslation() {
         statusEl.textContent = `Translating ${pageLabel.toLowerCase()} ${pageNum} of ${totalPages}...`;
         translatedEl.textContent = "...";
+        translatedEl.innerHTML = "";
         currentTranslation = "";
         exportBtn.disabled = true;
 
@@ -4115,7 +4295,11 @@ iframe { width:100%; height:100%; border:none; }
             }
 
             currentTranslation = data.translation || "";
-            translatedEl.textContent = currentTranslation || "(Translation unavailable)";
+            if (data.translation_html) {
+                translatedEl.innerHTML = data.translation_html;
+            } else {
+                translatedEl.textContent = currentTranslation || "(Translation unavailable)";
+            }
             const provider = data.provider || "unknown";
             statusEl.textContent = data.cached
                 ? `${pageLabel} ${pageNum} — cached (${provider}). Use Next to translate the following page.`
@@ -4127,6 +4311,7 @@ iframe { width:100%; height:100%; border:none; }
         } catch (err) {
             statusEl.textContent = "Translation error: " + err.message;
             translatedEl.textContent = "";
+            translatedEl.innerHTML = "";
             exportBtn.disabled = true;
         }
     }
