@@ -2481,10 +2481,16 @@ def count_exact_term_hits_simple(result_item, query, exact_terms):
     return hits
 
 
+def is_spreadsheet_document(doc):
+    return (doc.extension or "").lower() in {"csv", "xlsx"}
+
+
 def build_document_fallback_results(query, active_terms, seen_keys, top_k=10):
     exact_terms = default_exact_search_terms(query)
     results = []
     for doc in DocumentRecord.query.all():
+        if is_spreadsheet_document(doc):
+            continue
         score = score_document_text(doc, query, active_terms, exact_terms)
         if score <= 0:
             continue
@@ -2590,6 +2596,8 @@ def search_requirements(query, top_k=30, active_terms=None):
 
     for row, score, _exact_hits in scored[:top_k]:
         doc = row.document
+        if is_spreadsheet_document(doc):
+            continue
         seen_keys.add((doc.id, row.page or 1, row.requirement_id or row.title))
         display_page = resolve_result_page(
             doc,
@@ -2997,6 +3005,47 @@ button { background:#0069d9; }
 .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
 .data-table table, table.data-table { width:100%; border-collapse:collapse; }
 .data-table th, .data-table td, table.data-table th, table.data-table td { border:1px solid #ddd; padding:6px 8px; font-size:14px; vertical-align:top; }
+.table-result-columns {
+  display:flex;
+  flex-direction:column;
+  gap:20px;
+  margin-top:10px;
+}
+.table-result-panel {
+  min-width:0;
+  width:100%;
+}
+.table-result-panel > strong {
+  display:block;
+  margin-bottom:8px;
+}
+.table-scroll-wrap {
+  overflow-x:auto;
+  overflow-y:visible;
+  max-width:100%;
+  -webkit-overflow-scrolling:touch;
+  border:1px solid #e5e7eb;
+  border-radius:6px;
+  background:#fff;
+}
+.table-scroll-wrap .data-table {
+  display:block;
+  min-width:max-content;
+}
+.table-scroll-wrap .data-table table {
+  width:max-content;
+  min-width:100%;
+  table-layout:auto;
+  margin:0;
+}
+.table-scroll-wrap .data-table th,
+.table-scroll-wrap .data-table td {
+  white-space:nowrap;
+}
+.table-scroll-wrap .data-table td:last-child,
+.table-scroll-wrap .data-table th:last-child {
+  padding-right:12px;
+}
 a { color:#0069d9; text-decoration:none; }
 a:hover { text-decoration:underline; }
 .small { font-size:13px; color:#666; }
@@ -3292,15 +3341,19 @@ HOME_TEMPLATE = """
                     <div class="meta-item">Sheet: <strong>{{ t.sheet_name }}</strong></div>
                     <div class="meta-item">Format: <strong>{{ t.table_format }}</strong></div>
                 </div>
-                <div class="snippet-columns">
-                    <div class="snippet-panel snippet-panel-original">
+                <div class="table-result-columns">
+                    <div class="table-result-panel snippet-panel-original">
                         <strong>Table 1 / Dutch (Original)</strong>
-                        <div class="data-table">{{ t.html_table|safe }}</div>
+                        <div class="table-scroll-wrap">
+                            <div class="data-table">{{ t.html_table|safe }}</div>
+                        </div>
                     </div>
                     {% if t.html_table_en %}
-                    <div class="snippet-panel snippet-panel-translation">
+                    <div class="table-result-panel snippet-panel-translation">
                         <strong>Table 2 / English (Translation)</strong>
-                        <div class="data-table">{{ t.html_table_en|safe }}</div>
+                        <div class="table-scroll-wrap">
+                            <div class="data-table">{{ t.html_table_en|safe }}</div>
+                        </div>
                     </div>
                     {% endif %}
                 </div>
@@ -4108,10 +4161,14 @@ TABLE_TEMPLATE = """
                 <div class="filename">{{ t.preview_title }}</div>
                 <div class="meta">Format: {{ t.table_format }} | Sheet: {{ t.sheet_name }}</div>
                 <h3>Table 1 - Dutch (Original)</h3>
-                <div class="data-table">{{ t.html_table|safe }}</div>
+                <div class="table-scroll-wrap">
+                    <div class="data-table">{{ t.html_table|safe }}</div>
+                </div>
                 {% if t.html_table_en %}
                 <h3 style="margin-top:18px;">Table 2 - English (Translation)</h3>
-                <div class="data-table">{{ t.html_table_en|safe }}</div>
+                <div class="table-scroll-wrap">
+                    <div class="data-table">{{ t.html_table_en|safe }}</div>
+                </div>
                 {% else %}
                 <div class="notice" style="margin-top:12px;">English translation not available yet. Reindex the document to generate it.</div>
                 {% endif %}
@@ -4178,6 +4235,12 @@ def home():
             table_results = search_table_results(query, active_terms=selected_terms)
         if "text" in result_types:
             all_results, _ = search_requirements(query, active_terms=selected_terms)
+            if table_results:
+                table_doc_ids = {t["document_id"] for t in table_results}
+                all_results = [
+                    r for r in all_results
+                    if r.get("document_id") not in table_doc_ids
+                ]
             summary = grouped_search_summary(all_results)
             total_results = len(all_results)
             total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
