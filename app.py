@@ -3894,8 +3894,7 @@ HOME_TEMPLATE = """
             {% if current_user.is_authenticated %}
                 <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
                 {% if current_user.is_admin %}
-                    <a class="btn btn-purple" href="{{ url_for('upload_files') }}">Upload</a>
-                    <a class="btn btn-orange" href="{{ url_for('admin_documents') }}">Documents</a>
+                    <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
                     <a class="btn btn-green" href="{{ url_for('admin_users') }}">Users</a>
                 {% endif %}
             {% else %}
@@ -4341,59 +4340,36 @@ STORAGE_USAGE_PANEL = """
     </div>
 """
 
-UPLOAD_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Upload files</title>
-""" + BASE_CSS + """
-</head>
-<body>
-<div class="container">
-    <h2>Upload files</h2>
-
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for msg in messages %}
-          <div class="flash">{{ msg }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
-
-    """ + STORAGE_USAGE_PANEL + """
-
-    <div class="info">
-        Allowed types: {{ allowed_extensions }}<br>
-        Max size: 100 MB per request<br>
-        Storage backend: <strong>{{ storage_backend }}</strong>
-        {% if storage_status.persistent %}
-        <br>Bucket: <strong>{{ storage_status.bucket }}</strong>
-        {% if storage_status.key_prefix and storage_status.key_prefix != '(root)' %}
-        <br>Key prefix: <strong>{{ storage_status.key_prefix }}</strong>
+UPLOAD_PANEL = """
+    <div class="stats-panel" id="upload-panel">
+        <div class="panel-title">Upload files</div>
+        <div class="info" style="margin-bottom:12px;">
+            Allowed types: {{ allowed_extensions }}<br>
+            Max size: 100 MB per request<br>
+            Storage backend: <strong>{{ storage_backend }}</strong>
+            {% if storage_status.persistent %}
+            <br>Bucket: <strong>{{ storage_status.bucket }}</strong>
+            {% if storage_status.key_prefix and storage_status.key_prefix != '(root)' %}
+            <br>Key prefix: <strong>{{ storage_status.key_prefix }}</strong>
+            {% endif %}
+            {% endif %}
+            {% if not storage_persistent %}
+            <br><span style="color:#b45309;"><strong>Warning:</strong> Files are stored on temporary disk and will be lost after a Render restart. Configure Supabase S3 for persistent PDF storage.</span>
+            {% endif %}
+        </div>
+        {% if storage_status.persistent and not storage_status.ok %}
+        <div class="flash" style="background:#fdecea; border-left-color:#dc3545;">
+            <strong>Storage not ready:</strong> {{ storage_status.message }}<br>
+            {{ storage_status.hint }}
+        </div>
         {% endif %}
-        {% endif %}
-        {% if not storage_persistent %}
-        <br><span style="color:#b45309;"><strong>Warning:</strong> Files are stored on temporary disk and will be lost after a Render restart. Configure Supabase S3 for persistent PDF storage.</span>
-        {% endif %}
+        <form method="POST" action="{{ url_for('upload_files') }}" enctype="multipart/form-data"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% endif %}>
+            <input type="file" name="files" multiple required>
+            <div style="margin-top:12px;">
+                <button type="submit" class="btn btn-green">Upload and index</button>
+            </div>
+        </form>
     </div>
-
-    {% if storage_status.persistent and not storage_status.ok %}
-    <div class="flash" style="background:#fdecea; border-left-color:#dc3545;">
-        <strong>Storage not ready:</strong> {{ storage_status.message }}<br>
-        {{ storage_status.hint }}
-    </div>
-    {% endif %}
-
-    <form method="POST" enctype="multipart/form-data"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% endif %}>
-        <input type="file" name="files" multiple required>
-        <br><br>
-        <button type="submit">Upload and index</button>
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
-    </form>
-</div>
-</body>
-</html>
 """
 
 DOCS_TEMPLATE = """
@@ -4406,9 +4382,23 @@ DOCS_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>Indexed documents</h2>
+    <h2>Documents &amp; upload</h2>
+
+    <div style="margin-bottom:16px;">
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
+    </div>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for msg in messages %}
+          <div class="flash">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
 
     """ + STORAGE_USAGE_PANEL + """
+
+    """ + UPLOAD_PANEL + """
 
     <div class="stats-panel">
         <div class="panel-title">Index statistics</div>
@@ -4428,19 +4418,8 @@ DOCS_TEMPLATE = """
         </div>
     </div>
 
-    <div style="margin-bottom:16px;">
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
-    </div>
-
-    {% with messages = get_flashed_messages() %}
-      {% if messages %}
-        {% for msg in messages %}
-          <div class="flash">{{ msg }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
-
     <form method="POST" action="{{ url_for('bulk_delete_documents') }}">
+        <div class="panel-title" style="margin-top:8px;">Indexed documents</div>
         <div style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             <button type="submit" formaction="{{ url_for('bulk_reindex_documents') }}" class="btn btn-green" onclick="return confirmBulkReindex();">Reindex Selected</button>
             <button type="submit" class="btn btn-orange" onclick="return confirmBulkDelete();">Delete Selected</button>
@@ -4694,7 +4673,8 @@ def build_document_view_context(doc, page=1, highlight_image_index=None):
         "docx_image_indexes": docx_image_indexes,
         "highlight_image_index": highlight_image_index,
         "translation_enabled": translation.translation_enabled(),
-        "page_label": "Page" if ext == "pdf" else "Section",
+        "page_label": "Page" if ext in {"pdf", "docx"} else "Section",
+        "supports_page_jump": total_pages > 1 and ext in {"pdf", "docx", "txt"},
         "viewer_route": "document_view",
     }
 
@@ -4900,7 +4880,7 @@ iframe { width:100%; height:100%; border:none; }
                 {% if page < total_pages %}
                 <a class="btn btn-gray btn-small" href="{{ url_for(viewer_route, document_id=document_id, page=page+1) }}">Next</a>
                 {% endif %}
-                {% if total_pages > 1 %}
+                {% if supports_page_jump %}
                 <form class="jump-form" method="get" action="{{ url_for(viewer_route, document_id=document_id) }}">
                     <input
                         class="jump-input"
@@ -5526,41 +5506,55 @@ def admin_users():
     users = User.query.order_by(User.id).all()
     return render_template_string(USERS_TEMPLATE, users=users)
 
+def build_admin_documents_page_context():
+    docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
+    return {
+        "doc_rows": [
+            {
+                "record": doc,
+                "file_available": storage.document_exists(doc.stored_filename, DOC_FOLDER),
+            }
+            for doc in docs
+        ],
+        "doc_count": DocumentRecord.query.count(),
+        "block_count": RequirementBlock.query.count(),
+        "table_count": TablePreview.query.count(),
+        "storage_usage": build_storage_usage_summary(),
+        "allowed_extensions": ", ".join(sorted(ALLOWED_EXTENSIONS)),
+        "storage_backend": storage.storage_backend_name(),
+        "storage_persistent": storage.object_storage_enabled(),
+        "storage_status": storage.get_storage_status(),
+    }
+
+
 @app.route("/upload", methods=["GET", "POST"])
 @login_required
 def upload_files():
     if not is_admin():
         abort(403)
 
-    if request.method == "POST":
-        try:
-            return _handle_upload_post()
-        except Exception as exc:
-            db.session.rollback()
-            print(f"Upload route error: {exc}")
-            flash(f"Upload failed: {exc}")
-            return redirect(url_for("upload_files"))
+    if request.method == "GET":
+        return redirect(url_for("admin_documents"))
 
-    return render_template_string(
-        UPLOAD_TEMPLATE,
-        allowed_extensions=", ".join(sorted(ALLOWED_EXTENSIONS)),
-        storage_backend=storage.storage_backend_name(),
-        storage_persistent=storage.object_storage_enabled(),
-        storage_status=storage.get_storage_status(),
-        storage_usage=build_storage_usage_summary(),
-    )
+    try:
+        return _handle_upload_post()
+    except Exception as exc:
+        db.session.rollback()
+        print(f"Upload route error: {exc}")
+        flash(f"Upload failed: {exc}")
+        return redirect(url_for("admin_documents"))
 
 
 def _handle_upload_post():
     storage_status = storage.get_storage_status()
     if storage.object_storage_enabled() and not storage_status.get("ok"):
         flash(storage_status.get("hint") or storage_status.get("message") or "Storage is not configured.")
-        return redirect(url_for("upload_files"))
+        return redirect(url_for("admin_documents"))
 
     files = request.files.getlist("files")
     if not files or all(f.filename == "" for f in files):
         flash("No files selected.")
-        return redirect(url_for("upload_files"))
+        return redirect(url_for("admin_documents"))
 
     uploaded_count = 0
     skipped_count = 0
@@ -5657,7 +5651,7 @@ def _handle_upload_post():
         if summary_parts
         else "No files were uploaded."
     )
-    return redirect(url_for("upload_files"))
+    return redirect(url_for("admin_documents"))
 
 @app.route("/admin/documents")
 @login_required
@@ -5665,22 +5659,7 @@ def admin_documents():
     if not is_admin():
         abort(403)
 
-    docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
-    doc_rows = [
-        {
-            "record": doc,
-            "file_available": storage.document_exists(doc.stored_filename, DOC_FOLDER),
-        }
-        for doc in docs
-    ]
-    return render_template_string(
-        DOCS_TEMPLATE,
-        doc_rows=doc_rows,
-        doc_count=DocumentRecord.query.count(),
-        block_count=RequirementBlock.query.count(),
-        table_count=TablePreview.query.count(),
-        storage_usage=build_storage_usage_summary(),
-    )
+    return render_template_string(DOCS_TEMPLATE, **build_admin_documents_page_context())
 
 @app.route("/reindex/<int:document_id>")
 @login_required
