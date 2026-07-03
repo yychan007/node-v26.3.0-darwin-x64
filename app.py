@@ -1829,11 +1829,11 @@ def clean_dataframe_for_display(df, max_rows=50):
 
     if not cleaned.empty:
         row_keep = cleaned.apply(
-            lambda row: any(str(value).strip() for value in row), axis=1
+            lambda row: any(normalize_cell_text(value) for value in row), axis=1
         )
         cleaned = cleaned.loc[row_keep]
         col_keep = cleaned.apply(
-            lambda col: any(str(value).strip() for value in col), axis=0
+            lambda col: any(normalize_cell_text(value) for value in col), axis=0
         )
         cleaned = cleaned.loc[:, col_keep]
 
@@ -2241,8 +2241,15 @@ def create_default_admin():
 
 def normalize_cell_text(value):
     text = str(value or "").strip()
+    text = text.replace("\x00", "")
+    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+    text = text.replace("\xa0", " ")
     text = text.replace("\\n", " ").replace("\n", " ")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def sanitize_text_for_db(value):
+    return str(value or "").replace("\x00", "").strip()
 
 
 def dedupe_column_names(columns):
@@ -2266,6 +2273,12 @@ def trim_sparse_display_columns(df, min_fill_ratio=0.05):
         values = [normalize_cell_text(v) for v in series.tolist()]
         filled = sum(1 for value in values if value)
         if filled == 0:
+            continue
+        non_empty_values = [value for value in values if value]
+        has_alpha_content = any(any(ch.isalpha() for ch in value) for value in non_empty_values)
+        max_len = max((len(value) for value in non_empty_values), default=0)
+        # Drop noise columns that only carry a single numeric marker (e.g. page index).
+        if filled <= 1 and not has_alpha_content and max_len <= 8:
             continue
         if (col_name.startswith("Column ") or col_name.startswith("Unnamed:")) and (
             filled / max(len(values), 1) < min_fill_ratio
@@ -2551,8 +2564,18 @@ def _index_document_record_impl(doc_record):
     pending = 0
 
     for b in blocks:
+        requirement_id = sanitize_text_for_db(b.get("requirement_id", ""))
+        title = sanitize_text_for_db(b.get("title", ""))
+        section = sanitize_text_for_db(b.get("section", ""))
+        major_section = sanitize_text_for_db(b.get("major_section", ""))
+        category = sanitize_text_for_db(b.get("category", ""))
+        definition = sanitize_text_for_db(b.get("definition", ""))
+        summary = sanitize_text_for_db(b.get("summary", ""))
+        full_text = sanitize_text_for_db(b.get("full_text", ""))
+        token_blob = sanitize_text_for_db(b.get("token_blob", ""))
+
         th = hashlib.sha256(
-            b["full_text"].encode("utf-8", errors="ignore")
+            full_text.encode("utf-8", errors="ignore")
         ).hexdigest()
         if th in seen_hashes:
             continue
@@ -2561,19 +2584,19 @@ def _index_document_record_impl(doc_record):
         req_block_cls = cast(Any, RequirementBlock)
         row = req_block_cls(
             document_id=doc_record.id,
-            requirement_id=b["requirement_id"],
-            title=b["title"],
-            section=b["section"],
-            major_section=b.get("major_section", ""),
+            requirement_id=requirement_id,
+            title=title,
+            section=section,
+            major_section=major_section,
             page=b["page"],
             char_start=b.get("char_start", 0),
-            category=b["category"],
-            definition=b["definition"],
-            summary=b["summary"],
-            full_text=b["full_text"],
-            token_blob=b["token_blob"],
+            category=category,
+            definition=definition,
+            summary=summary,
+            full_text=full_text,
+            token_blob=token_blob,
             text_hash=th,
-            semantic_text=" ".join([b["title"], b["summary"], b["definition"], b["full_text"][:2000]]),
+            semantic_text=" ".join([title, summary, definition, full_text[:2000]]),
         )
         db.session.add(row)
         pending += 1
