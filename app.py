@@ -2975,6 +2975,8 @@ DICTIONARY_ABBREV_TERM_HEADERS = {
     "code",
 }
 CABINET_CODE_RE = re.compile(r"=\__\+A", re.IGNORECASE)
+CABINET_LOOSE_CODE_RE = re.compile(r"^A\d[\w]*$", re.IGNORECASE)
+CABINET_SUFFIX_CODE_RE = re.compile(r"^\d+[A-Z]?$", re.IGNORECASE)
 
 
 def normalize_dictionary_header(value):
@@ -2988,8 +2990,8 @@ def cell_to_dictionary_text(value):
     return text
 
 
-def find_dictionary_header_row(df_raw, sheet_name="", max_rows=8):
-    if sheet_is_cabinet_data(df_raw, sheet_name):
+def find_dictionary_header_row(df_raw, sheet_name="", original_filename="", max_rows=8):
+    if sheet_is_cabinet_data(df_raw, sheet_name, original_filename):
         return None
     for row_idx in range(min(max_rows, len(df_raw))):
         row_values = [
@@ -3006,44 +3008,113 @@ def find_dictionary_header_row(df_raw, sheet_name="", max_rows=8):
     return 0
 
 
-def is_cabinet_code(text):
+def is_cabinet_code(text, cabinet_context=False):
     value = (text or "").strip()
     if not value:
         return False
-    return bool(CABINET_CODE_RE.search(value))
+    if CABINET_CODE_RE.search(value):
+        return True
+    if re.search(r"__\+A", value, re.IGNORECASE):
+        return True
+    if cabinet_context and CABINET_LOOSE_CODE_RE.fullmatch(value):
+        return True
+    if cabinet_context and CABINET_SUFFIX_CODE_RE.fullmatch(value):
+        return True
+    return False
 
 
-def sheet_is_cabinet_data(df_raw, sheet_name=""):
+def normalize_cabinet_term(text):
+    value = (text or "").strip()
+    if not value:
+        return value
+    if CABINET_CODE_RE.search(value) or re.search(r"__\+A", value, re.IGNORECASE):
+        if not value.startswith("=") and value.startswith("__+"):
+            return f"={value}"
+        return value
+    if CABINET_SUFFIX_CODE_RE.fullmatch(value):
+        return f"=__+A{value.upper()}"
+    if CABINET_LOOSE_CODE_RE.fullmatch(value):
+        return f"=__+{value.upper()}"
+    return value
+
+
+def sheet_is_glossary_data(df_raw, sheet_name=""):
+    name = (sheet_name or "").lower()
+    if any(token in name for token in ("acronim", "glossary", "abbrev", "acronym")):
+        return True
+    for row_idx in range(min(8, len(df_raw))):
+        row_values = [
+            normalize_dictionary_header(value) for value in df_raw.iloc[row_idx].tolist()
+        ]
+        if "abreviation" in row_values or "abbreviation" in row_values:
+            return True
+    return False
+
+
+def sheet_is_cabinet_data(df_raw, sheet_name="", original_filename=""):
     if "cabinet" in (sheet_name or "").lower():
+        return True
+    if "cabinet" in Path(original_filename or "").stem.lower():
         return True
     for row_idx in range(min(8, len(df_raw))):
         for value in df_raw.iloc[row_idx].tolist():
-            if is_cabinet_code(cell_to_dictionary_text(value)):
+            if is_cabinet_code(cell_to_dictionary_text(value), cabinet_context=True):
                 return True
     return False
 
 
 def build_cabinet_search_keys(term):
-    text = (term or "").strip()
+    text = normalize_cabinet_term((term or "").strip())
     keys = set()
     if not text:
         return []
     keys.update({text, text.lower(), text.upper()})
-    match = re.search(r"\+A(.+)$", text, re.IGNORECASE)
-    if match:
+    for pattern in (r"\+A(.+)$", r"__\+A(.+)$"):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
         suffix = match.group(1).strip()
-        if suffix:
-            keys.update(
-                {
-                    suffix,
-                    suffix.lower(),
-                    suffix.upper(),
-                    f"A{suffix}",
-                    f"a{suffix}",
-                    f"A{suffix}".upper(),
-                }
-            )
+        if not suffix:
+            continue
+        keys.update(
+            {
+                suffix,
+                suffix.lower(),
+                suffix.upper(),
+                f"A{suffix}",
+                f"a{suffix}",
+                f"A{suffix}".upper(),
+            }
+        )
     return [key for key in keys if key]
+
+
+def extract_cabinet_row_fields(row_values, cabinet_context=False):
+    cells = [cell_to_dictionary_text(value) for value in (row_values or [])]
+    if cells and normalize_dictionary_header(cells[0]) in DICTIONARY_TERM_HEADERS:
+        return None
+
+    term = ""
+    content_nl = ""
+    content_en = ""
+
+    for cell in cells:
+        if not cell:
+            continue
+        if normalize_dictionary_header(cell) == "cabinets":
+            continue
+        if not term and is_cabinet_code(cell, cabinet_context=cabinet_context):
+            term = normalize_cabinet_term(cell)
+            continue
+        if not content_nl:
+            content_nl = cell
+        elif not content_en and cell != content_nl:
+            content_en = cell
+            break
+
+    if term and content_nl:
+        return term, content_nl, content_en
+    return None
 
 
 def pack_dictionary_search_keys(keys):
@@ -3053,12 +3124,12 @@ def pack_dictionary_search_keys(keys):
     return "|" + "|".join(normalized) + "|"
 
 
-def ensure_dictionary_english_text(nl_text, en_text=""):
+def ensure_dictionary_english_text(nl_text, en_text="", translate_if_missing=True):
     english = (en_text or "").strip()
     dutch = (nl_text or "").strip()
     if english:
         return english
-    if not dutch:
+    if not dutch or not translate_if_missing:
         return ""
     if not translation.translation_enabled():
         return ""
@@ -3107,16 +3178,41 @@ def detect_dictionary_columns(df):
         entry_kind = "abbreviation"
     elif content_nl_col and content_en_col and term_col:
         entry_kind = "abbreviation"
+    elif term_col and content_en_col and not content_nl_col:
+        entry_kind = "abbreviation"
     elif term_col and content_nl_col and not content_en_col:
         sample_term = ""
         for _, row in df.head(5).iterrows():
             sample_term = cell_to_dictionary_text(row.get(term_col))
             if sample_term:
                 break
-        if is_cabinet_code(sample_term):
+        if is_cabinet_code(sample_term, cabinet_context=True):
             entry_kind = "cabinet"
 
     return term_col, content_nl_col, content_en_col, entry_kind
+
+
+def build_dictionary_dataframe_from_raw(raw_df, header_row):
+    header_values = raw_df.iloc[header_row].tolist()
+    headers = []
+    seen = {}
+    for idx, value in enumerate(header_values):
+        label = cell_to_dictionary_text(value) or f"Column {idx + 1}"
+        base = label
+        count = seen.get(base, 0)
+        if count:
+            label = f"{base}_{count + 1}"
+        seen[base] = count + 1
+        headers.append(label)
+
+    data = raw_df.iloc[header_row + 1 :].copy()
+    data = data.dropna(how="all")
+    if data.empty:
+        return pd.DataFrame()
+
+    width = data.shape[1]
+    data.columns = headers[:width]
+    return data
 
 
 def load_dictionary_sheet_matrix(file_path, sheet_name):
@@ -3125,14 +3221,19 @@ def load_dictionary_sheet_matrix(file_path, sheet_name):
     except ImportError:
         return []
 
-    wb = load_workbook(file_path, data_only=False, read_only=True)
+    wb = load_workbook(file_path, data_only=False, read_only=False)
     try:
         if sheet_name not in wb.sheetnames:
             return []
         ws = wb[sheet_name]
         matrix = []
         for row in ws.iter_rows():
-            row_values = [cell_to_dictionary_text(cell.value) for cell in row]
+            row_values = []
+            for cell in row:
+                value = cell.value
+                if value is None and getattr(cell, "data_type", None) == "f":
+                    value = cell.value
+                row_values.append(cell_to_dictionary_text(value))
             if any(row_values):
                 matrix.append(row_values)
         return matrix
@@ -3140,16 +3241,19 @@ def load_dictionary_sheet_matrix(file_path, sheet_name):
         wb.close()
 
 
-def parse_cabinet_matrix(matrix):
+def parse_cabinet_matrix(matrix, sheet_name="", original_filename=""):
     entries = []
+    cabinet_context = sheet_is_cabinet_data(
+        pd.DataFrame(matrix or []), sheet_name, original_filename
+    )
     for row_idx, row_values in enumerate(matrix or []):
-        values = [value for value in row_values if value]
-        if len(values) < 2:
+        parsed = extract_cabinet_row_fields(row_values, cabinet_context=cabinet_context)
+        if not parsed:
             continue
-        term, content_nl = values[0], values[1]
-        if not term or not is_cabinet_code(term):
-            continue
-        content_en = ensure_dictionary_english_text(content_nl)
+        term, content_nl, content_en = parsed
+        content_en = ensure_dictionary_english_text(
+            content_nl, content_en, translate_if_missing=False
+        )
         entries.append(
             {
                 "term": term,
@@ -3164,11 +3268,11 @@ def parse_cabinet_matrix(matrix):
     return entries, "cabinet"
 
 
-def parse_cabinet_sheet(df_raw):
+def parse_cabinet_sheet(df_raw, sheet_name="", original_filename=""):
     matrix = []
     for _, row in df_raw.iterrows():
         matrix.append([cell_to_dictionary_text(value) for value in row.tolist()])
-    return parse_cabinet_matrix(matrix)
+    return parse_cabinet_matrix(matrix, sheet_name=sheet_name, original_filename=original_filename)
 
 
 def parse_dictionary_sheet(df, entry_kind=None):
@@ -3201,10 +3305,16 @@ def parse_dictionary_sheet(df, entry_kind=None):
                 content_nl = content_en
                 content_en = ""
         elif kind == "cabinet":
-            content_en = ensure_dictionary_english_text(content_nl, content_en)
+            content_en = ensure_dictionary_english_text(
+                content_nl, content_en, translate_if_missing=False
+            )
 
         legacy_content = content_nl or content_en
-        search_keys = pack_dictionary_search_keys(build_cabinet_search_keys(term)) if kind == "cabinet" else pack_dictionary_search_keys([term])
+        search_keys = (
+            pack_dictionary_search_keys(build_cabinet_search_keys(term))
+            if kind == "cabinet"
+            else pack_dictionary_search_keys([term])
+        )
 
         entries.append(
             {
@@ -3226,24 +3336,38 @@ def import_dictionary_excel(file_path, original_filename):
     skipped_sheets = []
 
     for sheet_name in workbook.sheet_names:
-        matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
-        raw_df = pd.DataFrame(matrix) if matrix else pd.DataFrame()
-        if raw_df.empty:
-            raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
+        raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
         if raw_df.empty:
             skipped_sheets.append(sheet_name)
             continue
 
-        header_row = find_dictionary_header_row(raw_df, sheet_name=sheet_name)
-        if sheet_is_cabinet_data(raw_df, sheet_name):
-            entries, entry_kind = parse_cabinet_matrix(matrix or raw_df.values.tolist())
-        elif header_row is None:
-            entries, entry_kind = parse_cabinet_matrix(matrix or raw_df.values.tolist())
-        else:
-            df = pd.read_excel(
-                file_path, sheet_name=sheet_name, header=header_row, dtype=object
+        matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
+        header_row = find_dictionary_header_row(
+            raw_df, sheet_name=sheet_name, original_filename=original_filename
+        )
+        cabinet_sheet = sheet_is_cabinet_data(
+            raw_df, sheet_name, original_filename
+        )
+        if cabinet_sheet:
+            entries, entry_kind = parse_cabinet_matrix(
+                matrix, sheet_name=sheet_name, original_filename=original_filename
             )
-            entries, entry_kind = parse_dictionary_sheet(df)
+            if not entries and matrix:
+                entries, entry_kind = parse_cabinet_matrix(
+                    raw_df.values.tolist(),
+                    sheet_name=sheet_name,
+                    original_filename=original_filename,
+                )
+        elif header_row is None:
+            entries, entry_kind = parse_cabinet_matrix(
+                matrix or raw_df.values.tolist(),
+                sheet_name=sheet_name,
+                original_filename=original_filename,
+            )
+        else:
+            df = build_dictionary_dataframe_from_raw(raw_df, header_row)
+            forced_kind = "abbreviation" if sheet_is_glossary_data(raw_df, sheet_name) else None
+            entries, entry_kind = parse_dictionary_sheet(df, entry_kind=forced_kind)
         if not entries:
             skipped_sheets.append(sheet_name)
             continue
@@ -5895,9 +6019,9 @@ ADMIN_DICTIONARIES_TEMPLATE = """
         <div class="panel-title">Upload definitions Excel</div>
         <div class="info" style="margin-bottom:12px;">
             Use a two-column or three-column sheet:<br>
-            <strong>Abbreviation file:</strong> Abreviation | Full Name | English Translation<br>
+            <strong>Glossary (3 columns):</strong> Abreviation | Full Name | English Translation<br>
             <strong>Cabinet file:</strong> <code>=__+A001</code> | Dutch function (English auto-translated on upload)<br>
-            <strong>Reference file:</strong> Document | Content<br>
+            <strong>Project documents:</strong> Document | Content<br>
             Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.
         </div>
         <form method="POST" enctype="multipart/form-data" onsubmit="return handleDictUploadSubmit(this);">
@@ -6042,6 +6166,8 @@ def build_dictionary_result_rows(entries):
                 content_en = legacy_content
             else:
                 content_nl = legacy_content
+        if entry.entry_kind == "cabinet" and content_nl and not content_en:
+            content_en = ensure_dictionary_english_text(content_nl, "", translate_if_missing=True)
         rows.append(
             {
                 "term": entry.term,
@@ -6105,9 +6231,14 @@ def admin_dictionaries():
                 temp_path, original_filename
             )
             if not imported_sources:
+                detail = ""
+                if skipped_sheets:
+                    detail = f" Sheets skipped: {', '.join(skipped_sheets)}."
                 flash(
-                    "No definition rows found. Check that the sheet has two columns such as "
-                    "Abreviation | English Translation or Document | Content.",
+                    "No definition rows found."
+                    + detail
+                    + " For Cabinets, use column A = cabinet code (e.g. =__+A001) "
+                    "and column B = Dutch description. Filename or sheet name should contain 'Cabinets'.",
                     "error",
                 )
             else:
