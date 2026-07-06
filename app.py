@@ -162,12 +162,13 @@ STORAGE_QUOTA_MB = env_int("STORAGE_QUOTA_MB", 1024)
 DEFAULT_DATA_DIR = BASE_DIR / "data"
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
 DOC_FOLDER = DATA_DIR / "documents"
+DICT_FOLDER = DATA_DIR / "dictionaries"
 PREVIEW_FOLDER = DATA_DIR / "previews"
 DATABASE_PATH = Path(
     os.environ.get("DATABASE_PATH", str(DATA_DIR / "search_portal.db"))
 ).expanduser()
 
-for path in (DATA_DIR, DOC_FOLDER, PREVIEW_FOLDER, DATABASE_PATH.parent):
+for path in (DATA_DIR, DOC_FOLDER, DICT_FOLDER, PREVIEW_FOLDER, DATABASE_PATH.parent):
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -435,6 +436,41 @@ class DocumentPageTranslation(db.Model):
     translated_text = db.Column(db.Text, default="")
     translated_text_es = db.Column(db.Text, default="")
     provider = db.Column(db.String(32), default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class DictionarySource(db.Model):
+    __tablename__ = "dictionary_sources"
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(500), nullable=False, index=True)
+    stored_filename = db.Column(db.String(500), nullable=False, unique=True)
+    sheet_name = db.Column(db.String(255), default="")
+    entry_kind = db.Column(db.String(32), default="abbreviation")
+    entry_count = db.Column(db.Integer, default=0)
+    uploaded_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    entries = db.relationship(
+        "DictionaryEntry", backref="source", cascade="all, delete-orphan"
+    )
+
+
+class DictionaryEntry(db.Model):
+    __tablename__ = "dictionary_entries"
+
+    id = db.Column(db.Integer, primary_key=True)
+    source_id = db.Column(
+        db.Integer,
+        db.ForeignKey("dictionary_sources.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    term = db.Column(db.String(500), nullable=False, index=True)
+    content = db.Column(db.Text, default="")
+    entry_kind = db.Column(db.String(32), default="abbreviation")
+    row_number = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -2887,6 +2923,259 @@ def build_storage_usage_summary():
 
 
 # =========================================================
+# Dictionary / reference lookup
+# =========================================================
+DICTIONARY_TERM_HEADERS = {
+    "abreviation",
+    "abbreviation",
+    "abbrev",
+    "abbr",
+    "code",
+    "document",
+    "term",
+    "key",
+    "query",
+    "title",
+    "name",
+}
+DICTIONARY_CONTENT_HEADERS = {
+    "english translation",
+    "english",
+    "translation",
+    "content",
+    "result",
+    "definition",
+    "meaning",
+    "description",
+}
+DICTIONARY_ABBREV_TERM_HEADERS = {
+    "abreviation",
+    "abbreviation",
+    "abbrev",
+    "abbr",
+    "code",
+}
+
+
+def normalize_dictionary_header(value):
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def cell_to_dictionary_text(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text
+
+
+def find_dictionary_header_row(df_raw, max_rows=8):
+    for row_idx in range(min(max_rows, len(df_raw))):
+        row_values = [
+            normalize_dictionary_header(value) for value in df_raw.iloc[row_idx].tolist()
+        ]
+        has_term = any(value in DICTIONARY_TERM_HEADERS for value in row_values if value)
+        has_content = any(
+            value in DICTIONARY_CONTENT_HEADERS for value in row_values if value
+        )
+        if has_term and has_content:
+            return row_idx
+    return 0
+
+
+def detect_dictionary_columns(df):
+    columns = list(df.columns)
+    normalized = {normalize_dictionary_header(col): col for col in columns}
+
+    term_col = None
+    content_col = None
+    for header in DICTIONARY_TERM_HEADERS:
+        if header in normalized:
+            term_col = normalized[header]
+            break
+    for header in DICTIONARY_CONTENT_HEADERS:
+        if header in normalized:
+            content_col = normalized[header]
+            break
+
+    usable_columns = [
+        col
+        for col in columns
+        if df[col].apply(lambda value: bool(cell_to_dictionary_text(value))).any()
+    ]
+    if not term_col and usable_columns:
+        term_col = usable_columns[0]
+    if not content_col and len(usable_columns) >= 2:
+        content_col = usable_columns[1]
+
+    entry_kind = "reference"
+    for header in normalized:
+        if header in DICTIONARY_ABBREV_TERM_HEADERS:
+            entry_kind = "abbreviation"
+            break
+
+    return term_col, content_col, entry_kind
+
+
+def parse_dictionary_sheet(df, entry_kind=None):
+    df = df.copy()
+    df = df.dropna(how="all")
+    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed", na=False)]
+    df = df.dropna(axis=1, how="all")
+    if df.empty:
+        return [], entry_kind or "reference"
+
+    term_col, content_col, detected_kind = detect_dictionary_columns(df)
+    if not term_col or not content_col:
+        return [], entry_kind or detected_kind
+
+    kind = entry_kind or detected_kind
+    entries = []
+    for row_idx, row in df.iterrows():
+        term = cell_to_dictionary_text(row.get(term_col))
+        content = cell_to_dictionary_text(row.get(content_col))
+        if not term and not content:
+            continue
+        if normalize_dictionary_header(term) in DICTIONARY_TERM_HEADERS:
+            continue
+        if not term:
+            continue
+        entries.append(
+            {
+                "term": term,
+                "content": content,
+                "entry_kind": kind,
+                "row_number": int(row_idx) + 1,
+            }
+        )
+    return entries, kind
+
+
+def import_dictionary_excel(file_path, original_filename):
+    workbook = pd.ExcelFile(file_path)
+    imported_sources = []
+    skipped_sheets = []
+
+    for sheet_name in workbook.sheet_names:
+        raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
+        if raw_df.empty:
+            skipped_sheets.append(sheet_name)
+            continue
+
+        header_row = find_dictionary_header_row(raw_df)
+        df = pd.read_excel(
+            file_path, sheet_name=sheet_name, header=header_row, dtype=object
+        )
+        entries, entry_kind = parse_dictionary_sheet(df)
+        if not entries:
+            skipped_sheets.append(sheet_name)
+            continue
+
+        display_name = f"{Path(original_filename).stem}"
+        if len(workbook.sheet_names) > 1:
+            display_name = f"{display_name} ({sheet_name})"
+
+        existing = DictionarySource.query.filter_by(
+            original_filename=original_filename,
+            sheet_name=sheet_name,
+        ).first()
+        if existing:
+            DictionaryEntry.query.filter_by(source_id=existing.id).delete()
+            source = existing
+            source.name = display_name
+            source.entry_kind = entry_kind
+            source.uploaded_at = datetime.utcnow()
+            storage.save_document(existing.stored_filename, file_path, DICT_FOLDER)
+        else:
+            stored_filename = f"{uuid.uuid4().hex}.xlsx"
+            source = DictionarySource(
+                name=display_name,
+                original_filename=original_filename,
+                stored_filename=stored_filename,
+                sheet_name=sheet_name,
+                entry_kind=entry_kind,
+            )
+            db.session.add(source)
+            db.session.flush()
+            storage.save_document(stored_filename, file_path, DICT_FOLDER)
+
+        for entry in entries:
+            db.session.add(
+                DictionaryEntry(
+                    source_id=source.id,
+                    term=entry["term"],
+                    content=entry["content"],
+                    entry_kind=entry["entry_kind"],
+                    row_number=entry["row_number"],
+                )
+            )
+
+        source.entry_count = len(entries)
+        imported_sources.append(
+            {
+                "source": source,
+                "entry_count": len(entries),
+                "entry_kind": entry_kind,
+            }
+        )
+
+    db.session.commit()
+    return imported_sources, skipped_sheets
+
+
+def dictionary_entry_kind_label(entry_kind):
+    return "Abbreviation" if entry_kind == "abbreviation" else "Reference"
+
+
+def search_dictionary_entries(query, limit=50):
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    q_lower = q.lower()
+    seen_ids = set()
+    ranked = []
+
+    def add_matches(matches, score):
+        for entry in matches:
+            if entry.id in seen_ids:
+                continue
+            seen_ids.add(entry.id)
+            ranked.append((score, entry))
+
+    exact_matches = (
+        DictionaryEntry.query.filter(db.func.lower(DictionaryEntry.term) == q_lower)
+        .limit(limit)
+        .all()
+    )
+    add_matches(exact_matches, 100)
+
+    if len(q) <= 12:
+        prefix_matches = (
+            DictionaryEntry.query.filter(DictionaryEntry.term.ilike(f"{q}%"))
+            .limit(limit)
+            .all()
+        )
+        add_matches(prefix_matches, 80)
+
+    term_contains = (
+        DictionaryEntry.query.filter(DictionaryEntry.term.ilike(f"%{q}%"))
+        .limit(limit)
+        .all()
+    )
+    add_matches(term_contains, 60)
+
+    content_contains = (
+        DictionaryEntry.query.filter(DictionaryEntry.content.ilike(f"%{q}%"))
+        .limit(limit)
+        .all()
+    )
+    add_matches(content_contains, 40)
+
+    ranked.sort(key=lambda item: (-item[0], item[1].term.lower(), item[1].id))
+    return [entry for _, entry in ranked[:limit]]
+
+
+# =========================================================
 # Search
 # =========================================================
 def lexical_score(block, query, active_terms, exact_terms=None):
@@ -3520,6 +3809,13 @@ button { background:#0069d9; }
 .flash-info, .flash-message { background:#eef6ff; border-left:4px solid #339af0; }
 .admin-feedback-panel { margin:16px 0; }
 .admin-feedback-panel .flash { font-size:15px; font-weight:500; }
+.dict-search-panel { margin:16px 0; padding:16px 18px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; }
+.dict-result-card { margin-top:16px; padding:16px 18px; border:1px solid #e2e8f0; border-left:4px solid #6f42c1; border-radius:8px; background:#fff; }
+.dict-result-kind { display:inline-block; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:#6f42c1; margin-bottom:8px; }
+.dict-result-term { font-size:22px; font-weight:800; color:#1f2937; margin-bottom:8px; }
+.dict-result-content { font-size:16px; line-height:1.6; color:#334155; white-space:pre-wrap; overflow-wrap:anywhere; }
+.dict-result-meta { margin-top:10px; font-size:13px; color:#64748b; }
+.dict-empty { margin-top:16px; padding:14px 16px; background:#fff3cd; border-left:4px solid #ffc107; border-radius:6px; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
 .info { background:#eef6ff; border-left:4px solid #339af0; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
@@ -3897,11 +4193,13 @@ HOME_TEMPLATE = """
             <div class="small">Requirement-level search for PDF, TXT, CSV, XLSX, DOCX</div>
         </div>
         <div class="actions">
+            <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Dictionary</a>
             {% if current_user.is_authenticated %}
                 <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
                 {% if current_user.is_admin %}
                     <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
                     <a class="btn btn-green" href="{{ url_for('admin_users') }}">Users</a>
+                    <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Dictionaries</a>
                 {% endif %}
             {% else %}
                 <a class="btn btn-gray" href="{{ url_for('login') }}">Login</a>
@@ -3918,7 +4216,9 @@ HOME_TEMPLATE = """
     {% endwith %}
 
     <div class="notice">
-        Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>
+        Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>.
+        For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Dictionary</strong></a>
+        (e.g. <strong>AC</strong>, <strong>declaration of performance</strong>).
     </div>
 
     <form method="GET" action="/" id="search-form">
@@ -5248,6 +5548,158 @@ TABLE_TEMPLATE = """
 """
 
 
+DICTIONARY_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dictionary</title>
+""" + BASE_CSS + """
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>Dictionary</h1>
+            <div class="small">Look up abbreviations and reference text</div>
+        </div>
+        <div class="actions">
+            <a class="btn btn-gray" href="{{ url_for('home') }}">Back to search</a>
+            {% if current_user.is_authenticated and current_user.is_admin %}
+            <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage dictionaries</a>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="dict-search-panel">
+        <form method="GET" action="{{ url_for('dictionary_lookup') }}">
+            <input type="text" name="q" value="{{ query }}" placeholder="Abbreviation or keyword, e.g. AC or declaration of performance" style="width:72%; min-width:280px;">
+            <button type="submit">Look up</button>
+        </form>
+        <div class="small" style="margin-top:10px;">
+            Abbreviations match exactly first (e.g. <strong>AC</strong>).
+            Longer phrases search document titles and full text content.
+        </div>
+    </div>
+
+    {% if query %}
+        {% if results %}
+            <div class="small" style="margin-top:8px;">{{ results|length }} result(s) for <strong>{{ query }}</strong></div>
+            {% for entry in results %}
+            <div class="dict-result-card">
+                <div class="dict-result-kind">{{ entry.kind_label }}</div>
+                <div class="dict-result-term">{{ entry.term }}</div>
+                {% if entry.content %}
+                <div class="dict-result-content">{{ entry.content }}</div>
+                {% endif %}
+                <div class="dict-result-meta">Source: {{ entry.source_name }}</div>
+            </div>
+            {% endfor %}
+        {% else %}
+            <div class="dict-empty">No dictionary entries found for <strong>{{ query }}</strong>.</div>
+        {% endif %}
+    {% else %}
+        <div class="notice">
+            Examples: <strong>AC</strong>, <strong>AK</strong>, <strong>declaration of performance</strong>
+        </div>
+    {% endif %}
+</div>
+</body>
+</html>
+"""
+
+
+ADMIN_DICTIONARIES_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Dictionaries</title>
+""" + BASE_CSS + """
+</head>
+<body>
+<div class="container">
+    <h2>Dictionaries</h2>
+    <div style="margin-bottom:16px;">
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Open dictionary</a>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div id="admin-feedback" class="admin-feedback-panel">
+        {% for category, msg in messages %}
+          <div class="flash flash-{{ category if category != 'message' else 'info' }}">{{ msg }}</div>
+        {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <div class="stats-panel" id="upload-panel">
+        <div class="panel-title">Upload dictionary Excel</div>
+        <div class="info" style="margin-bottom:12px;">
+            Use a two-column sheet:<br>
+            <strong>Abbreviation file:</strong> Abreviation | English Translation<br>
+            <strong>Reference file:</strong> Document | Content<br>
+            Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.
+        </div>
+        <form method="POST" enctype="multipart/form-data" onsubmit="return handleDictUploadSubmit(this);">
+            <input type="file" name="dictionary_file" accept=".xlsx,.xls" required>
+            <div style="margin-top:12px;">
+                <button type="submit" id="dict-upload-btn" class="btn btn-green">Upload dictionary</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="stats-panel">
+        <div class="panel-title">Uploaded dictionaries</div>
+        {% if sources %}
+        <table class="data-table" style="width:100%; margin-top:12px;">
+            <tr>
+                <th>Name</th>
+                <th>Filename</th>
+                <th>Sheet</th>
+                <th>Type</th>
+                <th>Entries</th>
+                <th>Uploaded</th>
+                <th>Actions</th>
+            </tr>
+            {% for row in sources %}
+            <tr>
+                <td>{{ row.name }}</td>
+                <td>{{ row.original_filename }}</td>
+                <td>{{ row.sheet_name or '-' }}</td>
+                <td>{{ row.kind_label }}</td>
+                <td>{{ row.entry_count }}</td>
+                <td>{{ row.uploaded_at }}</td>
+                <td>
+                    <a class="btn btn-orange" href="{{ url_for('delete_dictionary_source', source_id=row.id) }}"
+                       onclick="return confirm('Delete this dictionary and all {{ row.entry_count }} entries?');">Delete</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+        {% else %}
+        <div class="notice" style="margin-top:12px;">No dictionaries uploaded yet.</div>
+        {% endif %}
+    </div>
+</div>
+<script>
+function handleDictUploadSubmit(form) {
+    const btn = form.querySelector('#dict-upload-btn');
+    if (!btn || btn.disabled) {
+        return false;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Uploading…';
+    return true;
+}
+</script>
+</body>
+</html>
+"""
+
+
 # =========================================================
 # Routes
 # =========================================================
@@ -5319,6 +5771,117 @@ def home():
         block_count=RequirementBlock.query.count(),
         table_count=TablePreview.query.count(),
     )
+
+
+def build_dictionary_result_rows(entries):
+    rows = []
+    for entry in entries:
+        source = entry.source
+        rows.append(
+            {
+                "term": entry.term,
+                "content": entry.content,
+                "kind_label": dictionary_entry_kind_label(entry.entry_kind),
+                "source_name": source.name if source else "",
+            }
+        )
+    return rows
+
+
+@app.route("/dictionary")
+def dictionary_lookup():
+    query = request.args.get("q", "").strip()
+    entries = search_dictionary_entries(query) if query else []
+    return render_template_string(
+        DICTIONARY_TEMPLATE,
+        query=query,
+        results=build_dictionary_result_rows(entries),
+    )
+
+
+@app.route("/admin/dictionaries", methods=["GET", "POST"])
+@login_required
+def admin_dictionaries():
+    if not is_admin():
+        abort(403)
+
+    if request.method == "POST":
+        upload = request.files.get("dictionary_file")
+        if not upload or not upload.filename:
+            flash("No dictionary file selected.", "warning")
+            return redirect(url_for("admin_dictionaries"))
+
+        original_filename = secure_filename(upload.filename or "")
+        ext = file_ext(original_filename)
+        if ext not in {"xlsx", "xls"}:
+            flash("Dictionary upload must be an Excel file (.xlsx).", "error")
+            return redirect(url_for("admin_dictionaries"))
+
+        temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
+        os.close(temp_fd)
+        try:
+            upload.save(temp_path)
+            imported_sources, skipped_sheets = import_dictionary_excel(
+                temp_path, original_filename
+            )
+            if not imported_sources:
+                flash(
+                    "No dictionary rows found. Check that the sheet has two columns such as "
+                    "Abreviation | English Translation or Document | Content.",
+                    "error",
+                )
+            else:
+                parts = [
+                    f"{item['entry_count']} {dictionary_entry_kind_label(item['entry_kind']).lower()} "
+                    f"from {item['source'].sheet_name or item['source'].name}"
+                    for item in imported_sources
+                ]
+                message = "Dictionary imported: " + "; ".join(parts) + "."
+                if skipped_sheets:
+                    message += f" Skipped empty sheets: {', '.join(skipped_sheets)}."
+                flash(message, "success")
+        except Exception as exc:
+            db.session.rollback()
+            print(f"Dictionary import error: {exc}")
+            flash(f"Dictionary import failed: {exc}", "error")
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        return redirect(url_for("admin_dictionaries"))
+
+    sources = DictionarySource.query.order_by(DictionarySource.uploaded_at.desc()).all()
+    source_rows = [
+        {
+            "id": source.id,
+            "name": source.name,
+            "original_filename": source.original_filename,
+            "sheet_name": source.sheet_name,
+            "entry_count": source.entry_count,
+            "uploaded_at": source.uploaded_at,
+            "kind_label": dictionary_entry_kind_label(source.entry_kind),
+        }
+        for source in sources
+    ]
+    return render_template_string(ADMIN_DICTIONARIES_TEMPLATE, sources=source_rows)
+
+
+@app.route("/admin/dictionaries/delete/<int:source_id>")
+@login_required
+def delete_dictionary_source(source_id):
+    if not is_admin():
+        abort(403)
+
+    source = db.session.get(DictionarySource, source_id)
+    if not source:
+        flash("Dictionary not found.", "error")
+        return redirect(url_for("admin_dictionaries"))
+
+    storage.delete_document(source.stored_filename, DICT_FOLDER)
+    db.session.delete(source)
+    db.session.commit()
+    flash(f"Deleted dictionary: {source.name}", "success")
+    return redirect(url_for("admin_dictionaries"))
 
 
 @app.route("/healthz")
