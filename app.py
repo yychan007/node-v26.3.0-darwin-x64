@@ -449,6 +449,7 @@ class DictionarySource(db.Model):
     sheet_name = db.Column(db.String(255), default="")
     entry_kind = db.Column(db.String(32), default="abbreviation")
     entry_count = db.Column(db.Integer, default=0)
+    size_bytes = db.Column(db.Integer, default=0)
     uploaded_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     uploaded_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -469,6 +470,9 @@ class DictionaryEntry(db.Model):
     )
     term = db.Column(db.String(500), nullable=False, index=True)
     content = db.Column(db.Text, default="")
+    content_nl = db.Column(db.Text, default="")
+    content_en = db.Column(db.Text, default="")
+    search_keys = db.Column(db.Text, default="")
     entry_kind = db.Column(db.String(32), default="abbreviation")
     row_number = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -2903,10 +2907,14 @@ def build_storage_usage_summary():
     from sqlalchemy import func
 
     quota_bytes = max(STORAGE_QUOTA_MB, 1) * 1024 * 1024
-    used_bytes = int(
+    doc_bytes = int(
         db.session.query(func.coalesce(func.sum(DocumentRecord.size_bytes), 0)).scalar() or 0
     )
-    used_bytes = max(used_bytes, 0)
+    dict_bytes = int(
+        db.session.query(func.coalesce(func.sum(DictionarySource.size_bytes), 0)).scalar()
+        or 0
+    )
+    used_bytes = max(doc_bytes + dict_bytes, 0)
     percent = (used_bytes / quota_bytes) * 100 if quota_bytes else 0.0
     remaining_bytes = max(quota_bytes - used_bytes, 0)
     return {
@@ -2917,6 +2925,7 @@ def build_storage_usage_summary():
         "remaining_label": format_storage_size(remaining_bytes),
         "percent": round(min(percent, 999.9), 1),
         "doc_count": DocumentRecord.query.count(),
+        "dict_count": DictionarySource.query.count(),
         "near_limit": percent >= 85,
         "over_limit": used_bytes > quota_bytes,
     }
@@ -2948,6 +2957,16 @@ DICTIONARY_CONTENT_HEADERS = {
     "meaning",
     "description",
 }
+DICTIONARY_NL_HEADERS = {
+    "full name",
+    "naam",
+    "dutch",
+    "nl",
+    "omschrijving",
+    "function",
+    "beschrijving",
+    "description nl",
+}
 DICTIONARY_ABBREV_TERM_HEADERS = {
     "abreviation",
     "abbreviation",
@@ -2955,6 +2974,7 @@ DICTIONARY_ABBREV_TERM_HEADERS = {
     "abbr",
     "code",
 }
+CABINET_CODE_RE = re.compile(r"=\__\+A", re.IGNORECASE)
 
 
 def normalize_dictionary_header(value):
@@ -2968,18 +2988,86 @@ def cell_to_dictionary_text(value):
     return text
 
 
-def find_dictionary_header_row(df_raw, max_rows=8):
+def find_dictionary_header_row(df_raw, sheet_name="", max_rows=8):
+    if sheet_is_cabinet_data(df_raw, sheet_name):
+        return None
     for row_idx in range(min(max_rows, len(df_raw))):
         row_values = [
             normalize_dictionary_header(value) for value in df_raw.iloc[row_idx].tolist()
         ]
         has_term = any(value in DICTIONARY_TERM_HEADERS for value in row_values if value)
         has_content = any(
-            value in DICTIONARY_CONTENT_HEADERS for value in row_values if value
+            value in DICTIONARY_CONTENT_HEADERS | DICTIONARY_NL_HEADERS
+            for value in row_values
+            if value
         )
         if has_term and has_content:
             return row_idx
     return 0
+
+
+def is_cabinet_code(text):
+    value = (text or "").strip()
+    if not value:
+        return False
+    return bool(CABINET_CODE_RE.search(value))
+
+
+def sheet_is_cabinet_data(df_raw, sheet_name=""):
+    if "cabinet" in (sheet_name or "").lower():
+        return True
+    for row_idx in range(min(8, len(df_raw))):
+        for value in df_raw.iloc[row_idx].tolist():
+            if is_cabinet_code(cell_to_dictionary_text(value)):
+                return True
+    return False
+
+
+def build_cabinet_search_keys(term):
+    text = (term or "").strip()
+    keys = set()
+    if not text:
+        return []
+    keys.update({text, text.lower(), text.upper()})
+    match = re.search(r"\+A(.+)$", text, re.IGNORECASE)
+    if match:
+        suffix = match.group(1).strip()
+        if suffix:
+            keys.update(
+                {
+                    suffix,
+                    suffix.lower(),
+                    suffix.upper(),
+                    f"A{suffix}",
+                    f"a{suffix}",
+                    f"A{suffix}".upper(),
+                }
+            )
+    return [key for key in keys if key]
+
+
+def pack_dictionary_search_keys(keys):
+    normalized = sorted({(key or "").strip().lower() for key in keys if (key or "").strip()})
+    if not normalized:
+        return ""
+    return "|" + "|".join(normalized) + "|"
+
+
+def ensure_dictionary_english_text(nl_text, en_text=""):
+    english = (en_text or "").strip()
+    dutch = (nl_text or "").strip()
+    if english:
+        return english
+    if not dutch:
+        return ""
+    if not translation.translation_enabled():
+        return ""
+    try:
+        translated = translate_to_english(dutch)
+        return (translated or "").strip()
+    except Exception as exc:
+        print(f"Dictionary translation error: {exc}")
+        return ""
 
 
 def detect_dictionary_columns(df):
@@ -2987,14 +3075,19 @@ def detect_dictionary_columns(df):
     normalized = {normalize_dictionary_header(col): col for col in columns}
 
     term_col = None
-    content_col = None
+    content_nl_col = None
+    content_en_col = None
     for header in DICTIONARY_TERM_HEADERS:
         if header in normalized:
             term_col = normalized[header]
             break
+    for header in DICTIONARY_NL_HEADERS:
+        if header in normalized:
+            content_nl_col = normalized[header]
+            break
     for header in DICTIONARY_CONTENT_HEADERS:
         if header in normalized:
-            content_col = normalized[header]
+            content_en_col = normalized[header]
             break
 
     usable_columns = [
@@ -3004,16 +3097,78 @@ def detect_dictionary_columns(df):
     ]
     if not term_col and usable_columns:
         term_col = usable_columns[0]
-    if not content_col and len(usable_columns) >= 2:
-        content_col = usable_columns[1]
+    if not content_nl_col and len(usable_columns) >= 2:
+        content_nl_col = usable_columns[1]
+    if not content_en_col and len(usable_columns) >= 3:
+        content_en_col = usable_columns[2]
 
     entry_kind = "reference"
-    for header in normalized:
-        if header in DICTIONARY_ABBREV_TERM_HEADERS:
-            entry_kind = "abbreviation"
-            break
+    if any(header in DICTIONARY_ABBREV_TERM_HEADERS for header in normalized):
+        entry_kind = "abbreviation"
+    elif content_nl_col and content_en_col and term_col:
+        entry_kind = "abbreviation"
+    elif term_col and content_nl_col and not content_en_col:
+        sample_term = ""
+        for _, row in df.head(5).iterrows():
+            sample_term = cell_to_dictionary_text(row.get(term_col))
+            if sample_term:
+                break
+        if is_cabinet_code(sample_term):
+            entry_kind = "cabinet"
 
-    return term_col, content_col, entry_kind
+    return term_col, content_nl_col, content_en_col, entry_kind
+
+
+def load_dictionary_sheet_matrix(file_path, sheet_name):
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return []
+
+    wb = load_workbook(file_path, data_only=False, read_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return []
+        ws = wb[sheet_name]
+        matrix = []
+        for row in ws.iter_rows():
+            row_values = [cell_to_dictionary_text(cell.value) for cell in row]
+            if any(row_values):
+                matrix.append(row_values)
+        return matrix
+    finally:
+        wb.close()
+
+
+def parse_cabinet_matrix(matrix):
+    entries = []
+    for row_idx, row_values in enumerate(matrix or []):
+        values = [value for value in row_values if value]
+        if len(values) < 2:
+            continue
+        term, content_nl = values[0], values[1]
+        if not term or not is_cabinet_code(term):
+            continue
+        content_en = ensure_dictionary_english_text(content_nl)
+        entries.append(
+            {
+                "term": term,
+                "content": content_nl,
+                "content_nl": content_nl,
+                "content_en": content_en,
+                "search_keys": pack_dictionary_search_keys(build_cabinet_search_keys(term)),
+                "entry_kind": "cabinet",
+                "row_number": row_idx + 1,
+            }
+        )
+    return entries, "cabinet"
+
+
+def parse_cabinet_sheet(df_raw):
+    matrix = []
+    for _, row in df_raw.iterrows():
+        matrix.append([cell_to_dictionary_text(value) for value in row.tolist()])
+    return parse_cabinet_matrix(matrix)
 
 
 def parse_dictionary_sheet(df, entry_kind=None):
@@ -3024,25 +3179,40 @@ def parse_dictionary_sheet(df, entry_kind=None):
     if df.empty:
         return [], entry_kind or "reference"
 
-    term_col, content_col, detected_kind = detect_dictionary_columns(df)
-    if not term_col or not content_col:
+    term_col, content_nl_col, content_en_col, detected_kind = detect_dictionary_columns(df)
+    if not term_col or not (content_nl_col or content_en_col):
         return [], entry_kind or detected_kind
 
     kind = entry_kind or detected_kind
     entries = []
     for row_idx, row in df.iterrows():
         term = cell_to_dictionary_text(row.get(term_col))
-        content = cell_to_dictionary_text(row.get(content_col))
-        if not term and not content:
+        content_nl = cell_to_dictionary_text(row.get(content_nl_col)) if content_nl_col else ""
+        content_en = cell_to_dictionary_text(row.get(content_en_col)) if content_en_col else ""
+        if not term and not content_nl and not content_en:
             continue
         if normalize_dictionary_header(term) in DICTIONARY_TERM_HEADERS:
             continue
         if not term:
             continue
+
+        if kind == "reference":
+            if content_en and not content_nl:
+                content_nl = content_en
+                content_en = ""
+        elif kind == "cabinet":
+            content_en = ensure_dictionary_english_text(content_nl, content_en)
+
+        legacy_content = content_nl or content_en
+        search_keys = pack_dictionary_search_keys(build_cabinet_search_keys(term)) if kind == "cabinet" else pack_dictionary_search_keys([term])
+
         entries.append(
             {
                 "term": term,
-                "content": content,
+                "content": legacy_content,
+                "content_nl": content_nl,
+                "content_en": content_en,
+                "search_keys": search_keys,
                 "entry_kind": kind,
                 "row_number": int(row_idx) + 1,
             }
@@ -3056,16 +3226,24 @@ def import_dictionary_excel(file_path, original_filename):
     skipped_sheets = []
 
     for sheet_name in workbook.sheet_names:
-        raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
+        matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
+        raw_df = pd.DataFrame(matrix) if matrix else pd.DataFrame()
+        if raw_df.empty:
+            raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
         if raw_df.empty:
             skipped_sheets.append(sheet_name)
             continue
 
-        header_row = find_dictionary_header_row(raw_df)
-        df = pd.read_excel(
-            file_path, sheet_name=sheet_name, header=header_row, dtype=object
-        )
-        entries, entry_kind = parse_dictionary_sheet(df)
+        header_row = find_dictionary_header_row(raw_df, sheet_name=sheet_name)
+        if sheet_is_cabinet_data(raw_df, sheet_name):
+            entries, entry_kind = parse_cabinet_matrix(matrix or raw_df.values.tolist())
+        elif header_row is None:
+            entries, entry_kind = parse_cabinet_matrix(matrix or raw_df.values.tolist())
+        else:
+            df = pd.read_excel(
+                file_path, sheet_name=sheet_name, header=header_row, dtype=object
+            )
+            entries, entry_kind = parse_dictionary_sheet(df)
         if not entries:
             skipped_sheets.append(sheet_name)
             continue
@@ -3073,6 +3251,7 @@ def import_dictionary_excel(file_path, original_filename):
         display_name = f"{Path(original_filename).stem}"
         if len(workbook.sheet_names) > 1:
             display_name = f"{display_name} ({sheet_name})"
+        file_size = os.path.getsize(file_path)
 
         existing = DictionarySource.query.filter_by(
             original_filename=original_filename,
@@ -3083,6 +3262,7 @@ def import_dictionary_excel(file_path, original_filename):
             source = existing
             source.name = display_name
             source.entry_kind = entry_kind
+            source.size_bytes = file_size
             source.uploaded_at = datetime.utcnow()
             storage.save_document(existing.stored_filename, file_path, DICT_FOLDER)
         else:
@@ -3093,6 +3273,7 @@ def import_dictionary_excel(file_path, original_filename):
                 stored_filename=stored_filename,
                 sheet_name=sheet_name,
                 entry_kind=entry_kind,
+                size_bytes=file_size,
             )
             db.session.add(source)
             db.session.flush()
@@ -3104,6 +3285,9 @@ def import_dictionary_excel(file_path, original_filename):
                     source_id=source.id,
                     term=entry["term"],
                     content=entry["content"],
+                    content_nl=entry.get("content_nl", ""),
+                    content_en=entry.get("content_en", ""),
+                    search_keys=entry.get("search_keys", ""),
                     entry_kind=entry["entry_kind"],
                     row_number=entry["row_number"],
                 )
@@ -3123,7 +3307,11 @@ def import_dictionary_excel(file_path, original_filename):
 
 
 def dictionary_entry_kind_label(entry_kind):
-    return "Abbreviation" if entry_kind == "abbreviation" else "Reference"
+    return {
+        "abbreviation": "Abbreviation",
+        "cabinet": "Cabinet",
+        "reference": "Reference",
+    }.get(entry_kind, "Definition")
 
 
 def search_dictionary_entries(query, limit=50):
@@ -3149,6 +3337,13 @@ def search_dictionary_entries(query, limit=50):
     )
     add_matches(exact_matches, 100)
 
+    key_matches = (
+        DictionaryEntry.query.filter(DictionaryEntry.search_keys.ilike(f"%|{q_lower}|%"))
+        .limit(limit)
+        .all()
+    )
+    add_matches(key_matches, 98)
+
     if len(q) <= 12:
         prefix_matches = (
             DictionaryEntry.query.filter(DictionaryEntry.term.ilike(f"{q}%"))
@@ -3164,12 +3359,15 @@ def search_dictionary_entries(query, limit=50):
     )
     add_matches(term_contains, 60)
 
-    content_contains = (
-        DictionaryEntry.query.filter(DictionaryEntry.content.ilike(f"%{q}%"))
-        .limit(limit)
-        .all()
-    )
-    add_matches(content_contains, 40)
+    for column in (
+        DictionaryEntry.content_nl,
+        DictionaryEntry.content_en,
+        DictionaryEntry.content,
+    ):
+        content_contains = (
+            DictionaryEntry.query.filter(column.ilike(f"%{q}%")).limit(limit).all()
+        )
+        add_matches(content_contains, 40)
 
     ranked.sort(key=lambda item: (-item[0], item[1].term.lower(), item[1].id))
     return [entry for _, entry in ranked[:limit]]
@@ -3814,6 +4012,8 @@ button { background:#0069d9; }
 .dict-result-kind { display:inline-block; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:#6f42c1; margin-bottom:8px; }
 .dict-result-term { font-size:22px; font-weight:800; color:#1f2937; margin-bottom:8px; }
 .dict-result-content { font-size:16px; line-height:1.6; color:#334155; white-space:pre-wrap; overflow-wrap:anywhere; }
+.dict-result-lang { margin-top:8px; font-size:16px; line-height:1.6; color:#334155; white-space:pre-wrap; overflow-wrap:anywhere; }
+.dict-result-lang-label { display:inline-block; min-width:2.6em; font-weight:800; color:#475569; }
 .dict-result-meta { margin-top:10px; font-size:13px; color:#64748b; }
 .dict-empty { margin-top:16px; padding:14px 16px; background:#fff3cd; border-left:4px solid #ffc107; border-radius:6px; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
@@ -4193,15 +4393,16 @@ HOME_TEMPLATE = """
             <div class="small">Requirement-level search for PDF, TXT, CSV, XLSX, DOCX</div>
         </div>
         <div class="actions">
-            <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Dictionary</a>
             {% if current_user.is_authenticated %}
-                <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
                 {% if current_user.is_admin %}
                     <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
+                    <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
                     <a class="btn btn-green" href="{{ url_for('admin_users') }}">Users</a>
-                    <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Dictionaries</a>
                 {% endif %}
+                <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+                <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
             {% else %}
+                <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
                 <a class="btn btn-gray" href="{{ url_for('login') }}">Login</a>
             {% endif %}
         </div>
@@ -4217,7 +4418,7 @@ HOME_TEMPLATE = """
 
     <div class="notice">
         Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>.
-        For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Dictionary</strong></a>
+        For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Definitions</strong></a>
         (e.g. <strong>AC</strong>, <strong>declaration of performance</strong>).
     </div>
 
@@ -4637,18 +4838,19 @@ STORAGE_USAGE_PANEL = """
         <div class="panel-title">Storage usage</div>
         <div class="storage-usage-summary">
             <strong>{{ storage_usage.used_label }}</strong> / {{ storage_usage.quota_label }}
-            <span class="small">({{ storage_usage.percent }}% · {{ storage_usage.doc_count }} indexed files)</span>
+            <span class="small">({{ storage_usage.percent }}% · {{ storage_usage.doc_count }} documents{% if storage_usage.dict_count %} · {{ storage_usage.dict_count }} definition files{% endif %})</span>
         </div>
         <div class="storage-usage-bar" aria-hidden="true">
             <div class="storage-usage-fill" style="width: {% if storage_usage.percent > 100 %}100{% else %}{{ storage_usage.percent }}{% endif %}%;"></div>
         </div>
-        <div class="storage-usage-note">{{ storage_usage.remaining_label }} remaining · based on indexed document sizes</div>
+        <div class="storage-usage-note">{{ storage_usage.remaining_label }} remaining · documents and definition files</div>
     </div>
 """
 
 UPLOAD_PANEL = """
     <div class="stats-panel" id="upload-panel">
         <div class="panel-title">Upload files</div>
+        """ + STORAGE_USAGE_PANEL + """
         <div class="info" style="margin-bottom:12px;">
             Allowed types: {{ allowed_extensions }}<br>
             Max size: 100 MB per request<br>
@@ -4693,8 +4895,6 @@ DOCS_TEMPLATE = """
     <div style="margin-bottom:16px;">
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
     </div>
-
-    """ + STORAGE_USAGE_PANEL + """
 
     """ + UPLOAD_PANEL + """
 
@@ -5553,32 +5753,32 @@ DICTIONARY_TEMPLATE = """
 <html>
 <head>
 <meta charset="utf-8">
-<title>Dictionary</title>
+<title>Definitions</title>
 """ + BASE_CSS + """
 </head>
 <body>
 <div class="container">
     <div class="topbar">
         <div class="topbar-brand">
-            <h1>Dictionary</h1>
-            <div class="small">Look up abbreviations and reference text</div>
+            <h1>Definitions</h1>
+            <div class="small">Abbreviations and reference text lookup</div>
         </div>
         <div class="actions">
             <a class="btn btn-gray" href="{{ url_for('home') }}">Back to search</a>
             {% if current_user.is_authenticated and current_user.is_admin %}
-            <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage dictionaries</a>
+            <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
             {% endif %}
         </div>
     </div>
 
     <div class="dict-search-panel">
         <form method="GET" action="{{ url_for('dictionary_lookup') }}">
-            <input type="text" name="q" value="{{ query }}" placeholder="Abbreviation or keyword, e.g. AC or declaration of performance" style="width:72%; min-width:280px;">
+            <input type="text" name="q" value="{{ query }}" placeholder="Abbreviation, cabinet code (e.g. 001), or keyword" style="width:72%; min-width:280px;">
             <button type="submit">Look up</button>
         </form>
         <div class="small" style="margin-top:10px;">
-            Abbreviations match exactly first (e.g. <strong>AC</strong>).
-            Longer phrases search document titles and full text content.
+            Abbreviations and cabinet codes match first (e.g. <strong>AC</strong>, <strong>001</strong>, <strong>=__+A001</strong>).
+            Results show Dutch and English where available.
         </div>
     </div>
 
@@ -5589,18 +5789,30 @@ DICTIONARY_TEMPLATE = """
             <div class="dict-result-card">
                 <div class="dict-result-kind">{{ entry.kind_label }}</div>
                 <div class="dict-result-term">{{ entry.term }}</div>
-                {% if entry.content %}
+                {% if entry.kind_label == 'Reference' %}
+                    {% if entry.content_nl %}
+                    <div class="dict-result-content">{{ entry.content_nl }}</div>
+                    {% endif %}
+                {% else %}
+                    {% if entry.content_nl %}
+                    <div class="dict-result-lang"><span class="dict-result-lang-label">NL:</span> {{ entry.content_nl }}</div>
+                    {% endif %}
+                    {% if entry.content_en %}
+                    <div class="dict-result-lang"><span class="dict-result-lang-label">EN:</span> {{ entry.content_en }}</div>
+                    {% endif %}
+                {% endif %}
+                {% if not entry.content_nl and not entry.content_en and entry.content %}
                 <div class="dict-result-content">{{ entry.content }}</div>
                 {% endif %}
                 <div class="dict-result-meta">Source: {{ entry.source_name }}</div>
             </div>
             {% endfor %}
         {% else %}
-            <div class="dict-empty">No dictionary entries found for <strong>{{ query }}</strong>.</div>
+            <div class="dict-empty">No definitions found for <strong>{{ query }}</strong>.</div>
         {% endif %}
     {% else %}
         <div class="notice">
-            Examples: <strong>AC</strong>, <strong>AK</strong>, <strong>declaration of performance</strong>
+            Examples: <strong>AC</strong>, <strong>001</strong>, <strong>declaration of performance</strong>
         </div>
     {% endif %}
 </div>
@@ -5614,15 +5826,15 @@ ADMIN_DICTIONARIES_TEMPLATE = """
 <html>
 <head>
 <meta charset="utf-8">
-<title>Dictionaries</title>
+<title>Manage definitions</title>
 """ + BASE_CSS + """
 </head>
 <body>
 <div class="container">
-    <h2>Dictionaries</h2>
+    <h2>Manage definitions</h2>
     <div style="margin-bottom:16px;">
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
-        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Open dictionary</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
     </div>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -5635,24 +5847,27 @@ ADMIN_DICTIONARIES_TEMPLATE = """
       {% endif %}
     {% endwith %}
 
+    """ + STORAGE_USAGE_PANEL + """
+
     <div class="stats-panel" id="upload-panel">
-        <div class="panel-title">Upload dictionary Excel</div>
+        <div class="panel-title">Upload definitions Excel</div>
         <div class="info" style="margin-bottom:12px;">
-            Use a two-column sheet:<br>
-            <strong>Abbreviation file:</strong> Abreviation | English Translation<br>
+            Use a two-column or three-column sheet:<br>
+            <strong>Abbreviation file:</strong> Abreviation | Full Name | English Translation<br>
+            <strong>Cabinet file:</strong> <code>=__+A001</code> | Dutch function (English auto-translated on upload)<br>
             <strong>Reference file:</strong> Document | Content<br>
             Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.
         </div>
         <form method="POST" enctype="multipart/form-data" onsubmit="return handleDictUploadSubmit(this);">
             <input type="file" name="dictionary_file" accept=".xlsx,.xls" required>
             <div style="margin-top:12px;">
-                <button type="submit" id="dict-upload-btn" class="btn btn-green">Upload dictionary</button>
+                <button type="submit" id="dict-upload-btn" class="btn btn-green">Upload</button>
             </div>
         </form>
     </div>
 
     <div class="stats-panel">
-        <div class="panel-title">Uploaded dictionaries</div>
+        <div class="panel-title">Uploaded definition files</div>
         {% if sources %}
         <table class="data-table" style="width:100%; margin-top:12px;">
             <tr>
@@ -5674,13 +5889,13 @@ ADMIN_DICTIONARIES_TEMPLATE = """
                 <td>{{ row.uploaded_at }}</td>
                 <td>
                     <a class="btn btn-orange" href="{{ url_for('delete_dictionary_source', source_id=row.id) }}"
-                       onclick="return confirm('Delete this dictionary and all {{ row.entry_count }} entries?');">Delete</a>
+                       onclick="return confirm('Delete this definition file and all {{ row.entry_count }} entries?');">Delete</a>
                 </td>
             </tr>
             {% endfor %}
         </table>
         {% else %}
-        <div class="notice" style="margin-top:12px;">No dictionaries uploaded yet.</div>
+        <div class="notice" style="margin-top:12px;">No definition files uploaded yet.</div>
         {% endif %}
     </div>
 </div>
@@ -5777,10 +5992,20 @@ def build_dictionary_result_rows(entries):
     rows = []
     for entry in entries:
         source = entry.source
+        content_nl = (entry.content_nl or "").strip()
+        content_en = (entry.content_en or "").strip()
+        legacy_content = (entry.content or "").strip()
+        if not content_nl and not content_en and legacy_content:
+            if entry.entry_kind == "abbreviation":
+                content_en = legacy_content
+            else:
+                content_nl = legacy_content
         rows.append(
             {
                 "term": entry.term,
-                "content": entry.content,
+                "content": legacy_content,
+                "content_nl": content_nl,
+                "content_en": content_en,
                 "kind_label": dictionary_entry_kind_label(entry.entry_kind),
                 "source_name": source.name if source else "",
             }
@@ -5808,13 +6033,13 @@ def admin_dictionaries():
     if request.method == "POST":
         upload = request.files.get("dictionary_file")
         if not upload or not upload.filename:
-            flash("No dictionary file selected.", "warning")
+            flash("No definition file selected.", "warning")
             return redirect(url_for("admin_dictionaries"))
 
         original_filename = secure_filename(upload.filename or "")
         ext = file_ext(original_filename)
         if ext not in {"xlsx", "xls"}:
-            flash("Dictionary upload must be an Excel file (.xlsx).", "error")
+            flash("Definition upload must be an Excel file (.xlsx).", "error")
             return redirect(url_for("admin_dictionaries"))
 
         temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
@@ -5826,7 +6051,7 @@ def admin_dictionaries():
             )
             if not imported_sources:
                 flash(
-                    "No dictionary rows found. Check that the sheet has two columns such as "
+                    "No definition rows found. Check that the sheet has two columns such as "
                     "Abreviation | English Translation or Document | Content.",
                     "error",
                 )
@@ -5836,14 +6061,14 @@ def admin_dictionaries():
                     f"from {item['source'].sheet_name or item['source'].name}"
                     for item in imported_sources
                 ]
-                message = "Dictionary imported: " + "; ".join(parts) + "."
+                message = "Definitions imported: " + "; ".join(parts) + "."
                 if skipped_sheets:
                     message += f" Skipped empty sheets: {', '.join(skipped_sheets)}."
                 flash(message, "success")
         except Exception as exc:
             db.session.rollback()
             print(f"Dictionary import error: {exc}")
-            flash(f"Dictionary import failed: {exc}", "error")
+            flash(f"Definition import failed: {exc}", "error")
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -5863,7 +6088,7 @@ def admin_dictionaries():
         }
         for source in sources
     ]
-    return render_template_string(ADMIN_DICTIONARIES_TEMPLATE, sources=source_rows)
+    return render_template_string(ADMIN_DICTIONARIES_TEMPLATE, sources=source_rows, storage_usage=build_storage_usage_summary())
 
 
 @app.route("/admin/dictionaries/delete/<int:source_id>")
@@ -5874,13 +6099,13 @@ def delete_dictionary_source(source_id):
 
     source = db.session.get(DictionarySource, source_id)
     if not source:
-        flash("Dictionary not found.", "error")
+        flash("Definition file not found.", "error")
         return redirect(url_for("admin_dictionaries"))
 
     storage.delete_document(source.stored_filename, DICT_FOLDER)
     db.session.delete(source)
     db.session.commit()
-    flash(f"Deleted dictionary: {source.name}", "success")
+    flash(f"Deleted definition file: {source.name}", "success")
     return redirect(url_for("admin_dictionaries"))
 
 
@@ -6933,6 +7158,30 @@ def ensure_schema():
     if cache_cols and "provider" not in cache_cols:
         db.session.execute(text("ALTER TABLE translation_cache ADD COLUMN provider VARCHAR(32)"))
         db.session.commit()
+
+    if "dictionary_sources" in inspector.get_table_names():
+        dict_source_cols = {
+            col["name"] for col in inspector.get_columns("dictionary_sources")
+        }
+        if "size_bytes" not in dict_source_cols:
+            db.session.execute(
+                text("ALTER TABLE dictionary_sources ADD COLUMN size_bytes INTEGER DEFAULT 0")
+            )
+            db.session.commit()
+
+    if "dictionary_entries" in inspector.get_table_names():
+        dict_entry_cols = {
+            col["name"] for col in inspector.get_columns("dictionary_entries")
+        }
+        if "content_nl" not in dict_entry_cols:
+            db.session.execute(text("ALTER TABLE dictionary_entries ADD COLUMN content_nl TEXT"))
+            db.session.commit()
+        if "content_en" not in dict_entry_cols:
+            db.session.execute(text("ALTER TABLE dictionary_entries ADD COLUMN content_en TEXT"))
+            db.session.commit()
+        if "search_keys" not in dict_entry_cols:
+            db.session.execute(text("ALTER TABLE dictionary_entries ADD COLUMN search_keys TEXT"))
+            db.session.commit()
 
     if "document_page_translations" not in inspector.get_table_names():
         db.create_all()
