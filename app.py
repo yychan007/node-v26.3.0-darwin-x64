@@ -3308,20 +3308,46 @@ def import_dictionary_excel(file_path, original_filename):
 
 def dictionary_entry_kind_label(entry_kind):
     return {
-        "abbreviation": "Abbreviation",
-        "cabinet": "Cabinet",
-        "reference": "Reference",
+        "abbreviation": "Glossary",
+        "cabinet": "Cabinets",
+        "reference": "Project Documents",
     }.get(entry_kind, "Definition")
 
 
-def search_dictionary_entries(query, limit=50):
+DICTIONARY_TYPE_OPTIONS = [
+    {"id": "glossary", "label": "Glossary", "kinds": ["abbreviation"]},
+    {"id": "project_documents", "label": "Project Documents", "kinds": ["reference"]},
+    {"id": "cabinets", "label": "Cabinets", "kinds": ["cabinet"]},
+]
+DICTIONARY_TYPE_IDS = {option["id"] for option in DICTIONARY_TYPE_OPTIONS}
+
+
+def resolve_dictionary_entry_kinds(selected_types):
+    if not selected_types:
+        return []
+    kinds = []
+    for option in DICTIONARY_TYPE_OPTIONS:
+        if option["id"] in selected_types:
+            kinds.extend(option["kinds"])
+    return kinds
+
+
+def search_dictionary_entries(query, limit=50, entry_kinds=None):
     q = (query or "").strip()
     if not q:
+        return []
+    if entry_kinds is not None and not entry_kinds:
         return []
 
     q_lower = q.lower()
     seen_ids = set()
     ranked = []
+
+    def scoped_query():
+        query_obj = DictionaryEntry.query
+        if entry_kinds:
+            query_obj = query_obj.filter(DictionaryEntry.entry_kind.in_(entry_kinds))
+        return query_obj
 
     def add_matches(matches, score):
         for entry in matches:
@@ -3331,14 +3357,16 @@ def search_dictionary_entries(query, limit=50):
             ranked.append((score, entry))
 
     exact_matches = (
-        DictionaryEntry.query.filter(db.func.lower(DictionaryEntry.term) == q_lower)
+        scoped_query()
+        .filter(db.func.lower(DictionaryEntry.term) == q_lower)
         .limit(limit)
         .all()
     )
     add_matches(exact_matches, 100)
 
     key_matches = (
-        DictionaryEntry.query.filter(DictionaryEntry.search_keys.ilike(f"%|{q_lower}|%"))
+        scoped_query()
+        .filter(DictionaryEntry.search_keys.ilike(f"%|{q_lower}|%"))
         .limit(limit)
         .all()
     )
@@ -3346,14 +3374,16 @@ def search_dictionary_entries(query, limit=50):
 
     if len(q) <= 12:
         prefix_matches = (
-            DictionaryEntry.query.filter(DictionaryEntry.term.ilike(f"{q}%"))
+            scoped_query()
+            .filter(DictionaryEntry.term.ilike(f"{q}%"))
             .limit(limit)
             .all()
         )
         add_matches(prefix_matches, 80)
 
     term_contains = (
-        DictionaryEntry.query.filter(DictionaryEntry.term.ilike(f"%{q}%"))
+        scoped_query()
+        .filter(DictionaryEntry.term.ilike(f"%{q}%"))
         .limit(limit)
         .all()
     )
@@ -3365,7 +3395,7 @@ def search_dictionary_entries(query, limit=50):
         DictionaryEntry.content,
     ):
         content_contains = (
-            DictionaryEntry.query.filter(column.ilike(f"%{q}%")).limit(limit).all()
+            scoped_query().filter(column.ilike(f"%{q}%")).limit(limit).all()
         )
         add_matches(content_contains, 40)
 
@@ -5775,6 +5805,18 @@ DICTIONARY_TEMPLATE = """
         <form method="GET" action="{{ url_for('dictionary_lookup') }}">
             <input type="text" name="q" value="{{ query }}" placeholder="Abbreviation, cabinet code (e.g. 001), or keyword" style="width:72%; min-width:280px;">
             <button type="submit">Look up</button>
+            <div class="search-filter-panel" style="margin-top:12px;">
+                <div class="panel-title">Types</div>
+                <div class="term-filter-row">
+                    {% for opt in type_options %}
+                    <label>
+                        <input type="checkbox" name="type" value="{{ opt.id }}"
+                            {% if opt.id in selected_types %}checked{% endif %}>
+                        <span>{{ opt.label }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
         </form>
         <div class="small" style="margin-top:10px;">
             Abbreviations and cabinet codes match first (e.g. <strong>AC</strong>, <strong>001</strong>, <strong>=__+A001</strong>).
@@ -5789,7 +5831,7 @@ DICTIONARY_TEMPLATE = """
             <div class="dict-result-card">
                 <div class="dict-result-kind">{{ entry.kind_label }}</div>
                 <div class="dict-result-term">{{ entry.term }}</div>
-                {% if entry.kind_label == 'Reference' %}
+                {% if entry.kind_label == 'Project Documents' %}
                     {% if entry.content_nl %}
                     <div class="dict-result-content">{{ entry.content_nl }}</div>
                     {% endif %}
@@ -5808,7 +5850,7 @@ DICTIONARY_TEMPLATE = """
             </div>
             {% endfor %}
         {% else %}
-            <div class="dict-empty">No definitions found for <strong>{{ query }}</strong>.</div>
+            <div class="dict-empty">No definitions found for <strong>{{ query }}</strong>{% if not selected_types %} (no types selected){% endif %}.</div>
         {% endif %}
     {% else %}
         <div class="notice">
@@ -6016,11 +6058,24 @@ def build_dictionary_result_rows(entries):
 @app.route("/dictionary")
 def dictionary_lookup():
     query = request.args.get("q", "").strip()
-    entries = search_dictionary_entries(query) if query else []
+    if "type" in request.args:
+        selected_types = [
+            value for value in request.args.getlist("type") if value in DICTIONARY_TYPE_IDS
+        ]
+    else:
+        selected_types = list(DICTIONARY_TYPE_IDS)
+    entry_kinds = resolve_dictionary_entry_kinds(selected_types)
+    entries = (
+        search_dictionary_entries(query, entry_kinds=entry_kinds)
+        if query
+        else []
+    )
     return render_template_string(
         DICTIONARY_TEMPLATE,
         query=query,
         results=build_dictionary_result_rows(entries),
+        type_options=DICTIONARY_TYPE_OPTIONS,
+        selected_types=selected_types,
     )
 
 
