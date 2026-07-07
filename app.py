@@ -3377,44 +3377,117 @@ def parse_dictionary_sheet(df, entry_kind=None):
     return entries, kind
 
 
+def import_dictionary_sheet(file_path, sheet_name, original_filename, forced_entry_kind=None):
+    raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
+    if raw_df.empty:
+        return [], forced_entry_kind or "reference"
+
+    matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
+    header_row = find_dictionary_header_row(
+        raw_df, sheet_name=sheet_name, original_filename=original_filename
+    )
+
+    if forced_entry_kind == "cabinet":
+        entries, entry_kind = parse_cabinet_matrix(
+            matrix, sheet_name=sheet_name, original_filename=original_filename
+        )
+        if not entries and matrix:
+            entries, entry_kind = parse_cabinet_matrix(
+                raw_df.values.tolist(),
+                sheet_name=sheet_name,
+                original_filename=original_filename,
+            )
+        return entries, entry_kind
+
+    if forced_entry_kind in {"abbreviation", "reference"}:
+        if header_row is None:
+            return [], forced_entry_kind
+        df = build_dictionary_dataframe_from_raw(raw_df, header_row)
+        return parse_dictionary_sheet(df, entry_kind=forced_entry_kind)
+
+    cabinet_sheet = sheet_is_cabinet_data(raw_df, sheet_name, original_filename)
+    if cabinet_sheet:
+        entries, entry_kind = parse_cabinet_matrix(
+            matrix, sheet_name=sheet_name, original_filename=original_filename
+        )
+        if not entries and matrix:
+            entries, entry_kind = parse_cabinet_matrix(
+                raw_df.values.tolist(),
+                sheet_name=sheet_name,
+                original_filename=original_filename,
+            )
+        return entries, entry_kind
+
+    if header_row is None:
+        entries, entry_kind = parse_cabinet_matrix(
+            matrix or raw_df.values.tolist(),
+            sheet_name=sheet_name,
+            original_filename=original_filename,
+        )
+        return entries, entry_kind
+
+    df = build_dictionary_dataframe_from_raw(raw_df, header_row)
+    forced_kind = "abbreviation" if sheet_is_glossary_data(raw_df, sheet_name) else None
+    return parse_dictionary_sheet(df, entry_kind=forced_kind)
+
+
+def persist_dictionary_entries(source, entries, entry_kind):
+    DictionaryEntry.query.filter_by(source_id=source.id).delete()
+    for entry in entries:
+        db.session.add(
+            DictionaryEntry(
+                source_id=source.id,
+                term=entry["term"],
+                content=entry["content"],
+                content_nl=entry.get("content_nl", ""),
+                content_en=entry.get("content_en", ""),
+                search_keys=entry.get("search_keys", ""),
+                entry_kind=entry["entry_kind"],
+                row_number=entry["row_number"],
+            )
+        )
+    source.entry_kind = entry_kind
+    source.entry_count = len(entries)
+
+
+def reimport_dictionary_source(source, entry_kind):
+    if entry_kind not in VALID_DICTIONARY_ENTRY_KINDS:
+        raise ValueError("Invalid definition type.")
+    if not storage.document_exists(source.stored_filename, DICT_FOLDER):
+        raise FileNotFoundError("Stored definition file not found.")
+
+    sheet_name = source.sheet_name or ""
+    with storage.open_document_local_path(source.stored_filename, DICT_FOLDER) as path:
+        if not sheet_name:
+            workbook = pd.ExcelFile(path)
+            sheet_name = workbook.sheet_names[0] if workbook.sheet_names else ""
+        entries, parsed_kind = import_dictionary_sheet(
+            path,
+            sheet_name,
+            source.original_filename,
+            forced_entry_kind=entry_kind,
+        )
+
+    if not entries:
+        raise ValueError(
+            f"No rows found when parsing as {dictionary_entry_kind_label(entry_kind)}. "
+            "Check that the sheet columns match the selected type."
+        )
+
+    persist_dictionary_entries(source, entries, parsed_kind)
+    db.session.commit()
+    return len(entries)
+
+
 def import_dictionary_excel(file_path, original_filename):
     workbook = pd.ExcelFile(file_path)
     imported_sources = []
     skipped_sheets = []
 
     for sheet_name in workbook.sheet_names:
-        raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
-        if raw_df.empty:
-            skipped_sheets.append(sheet_name)
-            continue
-
-        matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
-        header_row = find_dictionary_header_row(
-            raw_df, sheet_name=sheet_name, original_filename=original_filename
+        entries, entry_kind = import_dictionary_sheet(
+            file_path, sheet_name, original_filename
         )
-        cabinet_sheet = sheet_is_cabinet_data(
-            raw_df, sheet_name, original_filename
-        )
-        if cabinet_sheet:
-            entries, entry_kind = parse_cabinet_matrix(
-                matrix, sheet_name=sheet_name, original_filename=original_filename
-            )
-            if not entries and matrix:
-                entries, entry_kind = parse_cabinet_matrix(
-                    raw_df.values.tolist(),
-                    sheet_name=sheet_name,
-                    original_filename=original_filename,
-                )
-        elif header_row is None:
-            entries, entry_kind = parse_cabinet_matrix(
-                matrix or raw_df.values.tolist(),
-                sheet_name=sheet_name,
-                original_filename=original_filename,
-            )
-        else:
-            df = build_dictionary_dataframe_from_raw(raw_df, header_row)
-            forced_kind = "abbreviation" if sheet_is_glossary_data(raw_df, sheet_name) else None
-            entries, entry_kind = parse_dictionary_sheet(df, entry_kind=forced_kind)
         if not entries:
             skipped_sheets.append(sheet_name)
             continue
@@ -3450,21 +3523,7 @@ def import_dictionary_excel(file_path, original_filename):
             db.session.flush()
             storage.save_document(stored_filename, file_path, DICT_FOLDER)
 
-        for entry in entries:
-            db.session.add(
-                DictionaryEntry(
-                    source_id=source.id,
-                    term=entry["term"],
-                    content=entry["content"],
-                    content_nl=entry.get("content_nl", ""),
-                    content_en=entry.get("content_en", ""),
-                    search_keys=entry.get("search_keys", ""),
-                    entry_kind=entry["entry_kind"],
-                    row_number=entry["row_number"],
-                )
-            )
-
-        source.entry_count = len(entries)
+        persist_dictionary_entries(source, entries, entry_kind)
         imported_sources.append(
             {
                 "source": source,
@@ -3483,6 +3542,15 @@ def dictionary_entry_kind_label(entry_kind):
         "cabinet": "Cabinets",
         "reference": "Project Documents",
     }.get(entry_kind, "Definition")
+
+
+VALID_DICTIONARY_ENTRY_KINDS = {"abbreviation", "reference", "cabinet"}
+
+DICTIONARY_ENTRY_KIND_OPTIONS = [
+    {"kind": "abbreviation", "label": "Glossary"},
+    {"kind": "cabinet", "label": "Cabinets"},
+    {"kind": "reference", "label": "Project Documents"},
+]
 
 
 DICTIONARY_TYPE_OPTIONS = [
@@ -4747,7 +4815,25 @@ HOME_TEMPLATE = """
                     <div class="summary-box" style="margin-top:10px;">
                         <div><strong>{{ t.document_name }}</strong></div>
                         <div class="meta">Sheet: {{ t.sheet_name }} · Format: {{ t.table_format }}</div>
-                        <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open table</a>
+                        <div class="table-result-columns" style="margin-top:12px;">
+                            <div class="table-result-panel snippet-panel-original">
+                                <strong>Dutch (Original)</strong>
+                                <div class="table-scroll-wrap">
+                                    <div class="data-table">{{ t.html_table|safe }}</div>
+                                </div>
+                            </div>
+                            {% if t.html_table_en %}
+                            <div class="table-result-panel snippet-panel-translation">
+                                <strong>English (Translation)</strong>
+                                <div class="table-scroll-wrap">
+                                    <div class="data-table">{{ t.html_table_en|safe }}</div>
+                                </div>
+                            </div>
+                            {% endif %}
+                        </div>
+                        <div class="meta" style="margin-top:8px;">
+                            <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open full table preview</a>
+                        </div>
                     </div>
                     {% endfor %}
                 </div>
@@ -6170,7 +6256,8 @@ ADMIN_DICTIONARIES_TEMPLATE = """
             <strong>Glossary (3 columns):</strong> Abreviation | Full Name | English Translation<br>
             <strong>Cabinet file:</strong> <code>=__+A001</code> | Dutch function (English auto-translated on upload)<br>
             <strong>Project documents:</strong> Document | Content<br>
-            Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.
+            Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.<br>
+            If the auto-detected <strong>Type</strong> is wrong, change it in the table below and click <strong>Save</strong>.
         </div>
         <form method="POST" enctype="multipart/form-data" onsubmit="return handleDictUploadSubmit(this);">
             <input type="file" name="dictionary_file" accept=".xlsx,.xls" required>
@@ -6198,7 +6285,16 @@ ADMIN_DICTIONARIES_TEMPLATE = """
                 <td>{{ row.name }}</td>
                 <td>{{ row.original_filename }}</td>
                 <td>{{ row.sheet_name or '-' }}</td>
-                <td>{{ row.kind_label }}</td>
+                <td>
+                    <form method="POST" action="{{ url_for('update_dictionary_source_type', source_id=row.id) }}" style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                        <select name="entry_kind" style="padding:6px; min-width:160px;">
+                            {% for option in dictionary_kind_options %}
+                            <option value="{{ option.kind }}" {% if row.entry_kind == option.kind %}selected{% endif %}>{{ option.label }}</option>
+                            {% endfor %}
+                        </select>
+                        <button type="submit" class="btn btn-gray" style="padding:6px 10px;">Save</button>
+                    </form>
+                </td>
                 <td>{{ row.entry_count }}</td>
                 <td>{{ row.uploaded_at }}</td>
                 <td>
@@ -6493,6 +6589,8 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                     "document_name": doc.original_filename if doc else f"Document {row.document_id}",
                     "sheet_name": row.sheet_name or "-",
                     "table_format": row.table_format or "-",
+                    "html_table": render_table_preview_html(row, "nl"),
+                    "html_table_en": render_table_preview_html(row, "en"),
                 }
             )
             if len(table_rows) >= table_limit:
@@ -6726,11 +6824,52 @@ def admin_dictionaries():
             "sheet_name": source.sheet_name,
             "entry_count": source.entry_count,
             "uploaded_at": source.uploaded_at,
+            "entry_kind": source.entry_kind,
             "kind_label": dictionary_entry_kind_label(source.entry_kind),
         }
         for source in sources
     ]
-    return render_template_string(ADMIN_DICTIONARIES_TEMPLATE, sources=source_rows, storage_usage=build_storage_usage_summary())
+    return render_template_string(
+        ADMIN_DICTIONARIES_TEMPLATE,
+        sources=source_rows,
+        dictionary_kind_options=DICTIONARY_ENTRY_KIND_OPTIONS,
+        storage_usage=build_storage_usage_summary(),
+    )
+
+
+@app.route("/admin/dictionaries/<int:source_id>/type", methods=["POST"])
+@login_required
+def update_dictionary_source_type(source_id):
+    if not is_admin():
+        abort(403)
+
+    source = db.session.get(DictionarySource, source_id)
+    if not source:
+        flash("Definition file not found.", "error")
+        return redirect(url_for("admin_dictionaries"))
+
+    entry_kind = (request.form.get("entry_kind") or "").strip().lower()
+    if entry_kind not in VALID_DICTIONARY_ENTRY_KINDS:
+        flash("Invalid definition type selected.", "error")
+        return redirect(url_for("admin_dictionaries"))
+
+    if source.entry_kind == entry_kind:
+        flash(f"Type for {source.name} is already {dictionary_entry_kind_label(entry_kind)}.", "info")
+        return redirect(url_for("admin_dictionaries"))
+
+    try:
+        entry_count = reimport_dictionary_source(source, entry_kind)
+        flash(
+            f"Updated {source.name} to {dictionary_entry_kind_label(entry_kind)} "
+            f"({entry_count} entries re-indexed).",
+            "success",
+        )
+    except Exception as exc:
+        db.session.rollback()
+        print(f"Dictionary type update error for source {source_id}: {exc}")
+        flash(f"Could not change type for {source.name}: {exc}", "error")
+
+    return redirect(url_for("admin_dictionaries"))
 
 
 @app.route("/admin/dictionaries/delete/<int:source_id>")
