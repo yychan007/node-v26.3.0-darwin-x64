@@ -328,6 +328,16 @@ DOCX_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 REQ_ID_REGEX = re.compile(r'\b([A-Z]{1,10}-Req-\d+(?:\.\d+)?)\b', re.IGNORECASE)
 
+DOCUMENT_TYPE_STANDARD = "standard"
+DOCUMENT_TYPE_REQUIREMENT_MASTER = "requirement_master"
+
+DOCUMENT_TYPE_OPTIONS = [
+    {"id": DOCUMENT_TYPE_STANDARD, "label": "Standard document"},
+    {"id": DOCUMENT_TYPE_REQUIREMENT_MASTER, "label": "Requirement master table (總表)"},
+]
+DOCUMENT_TYPE_IDS = {option["id"] for option in DOCUMENT_TYPE_OPTIONS}
+DOCUMENT_TYPE_SPREADSHEET_ONLY = {DOCUMENT_TYPE_REQUIREMENT_MASTER}
+
 # =========================================================
 # Database models
 # =========================================================
@@ -366,9 +376,26 @@ class DocumentRecord(db.Model):
     text_preview = db.Column(db.Text, default="")
     page_offsets_json = db.Column(db.Text, default="")
     status = db.Column(db.String(50), default="indexed")
+    document_type = db.Column(db.String(50), default=DOCUMENT_TYPE_STANDARD, nullable=False)
 
     requirements = db.relationship("RequirementBlock", backref="document", cascade="all, delete-orphan")
     tables = db.relationship("TablePreview", backref="document", cascade="all, delete-orphan")
+
+
+def normalize_document_type(value):
+    text = (value or "").strip().lower()
+    return text if text in DOCUMENT_TYPE_IDS else DOCUMENT_TYPE_STANDARD
+
+
+def document_type_label(document_type):
+    for option in DOCUMENT_TYPE_OPTIONS:
+        if option["id"] == document_type:
+            return option["label"]
+    return DOCUMENT_TYPE_OPTIONS[0]["label"]
+
+
+def is_requirement_master_document(doc):
+    return normalize_document_type(getattr(doc, "document_type", None)) == DOCUMENT_TYPE_REQUIREMENT_MASTER
 
 
 class RequirementBlock(db.Model):
@@ -3953,7 +3980,7 @@ def search_table_results(query, top_k=20, active_terms=None):
     results = []
     for row in TablePreview.query.all():
         doc = row.document
-        if not doc:
+        if not doc or is_requirement_master_document(doc):
             continue
 
         searchable_parts = [
@@ -4017,6 +4044,8 @@ def search_documents(query, top_k=10, active_terms=None):
     scored = []
 
     for doc in DocumentRecord.query.all():
+        if is_requirement_master_document(doc):
+            continue
         score = score_document_text(doc, query, active_terms, exact_terms)
         filename = (doc.original_filename or "").lower()
         stored = (doc.stored_filename or "").lower()
@@ -5120,6 +5149,19 @@ UPLOAD_PANEL = """
         </div>
         {% endif %}
         <form method="POST" action="{{ url_for('upload_files') }}" enctype="multipart/form-data" id="upload-form"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% else %} onsubmit="return handleUploadSubmit(this);"{% endif %}>
+            <div style="margin-bottom:12px;">
+                <label for="document_type" style="display:block; margin-bottom:6px;"><strong>Document category</strong></label>
+                <select name="document_type" id="document_type" style="min-width:320px; padding:8px;">
+                    {% for option in document_type_options %}
+                    <option value="{{ option.id }}">{{ option.label }}</option>
+                    {% endfor %}
+                </select>
+                <div class="small" style="margin-top:6px;">
+                    Use <strong>Requirement master table (總表)</strong> for Tennet Requirements Excel files.
+                    These rows appear in the Requirement Browser on the home page.
+                    Individual AM-Req spreadsheets should use <strong>Standard document</strong>.
+                </div>
+            </div>
             <input type="file" name="files" multiple required>
             <div style="margin-top:12px;">
                 <button type="submit" id="upload-submit-btn" class="btn btn-green">Upload and index</button>
@@ -5193,7 +5235,8 @@ DOCS_TEMPLATE = """
                 </th>
                 <th>ID</th>
                 <th>Filename</th>
-                <th>Type</th>
+                <th>Category</th>
+                <th>Format</th>
                 <th>Size</th>
                 <th>OCR</th>
                 <th>Status</th>
@@ -5209,6 +5252,7 @@ DOCS_TEMPLATE = """
                 </td>
                 <td>{{ d.id }}</td>
                 <td>{{ d.original_filename }}</td>
+                <td>{{ document_type_label(d.document_type) }}</td>
                 <td>{{ d.extension }}</td>
                 <td>{{ d.size_bytes }}</td>
                 <td>{{ 'Yes' if d.is_ocr else 'No' }}</td>
@@ -6205,7 +6249,9 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         return []
 
     candidates = (
-        TablePreview.query.filter(
+        TablePreview.query.join(DocumentRecord)
+        .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
+        .filter(
             db.or_(
                 TablePreview.csv_text.ilike(f"%{req_id}%"),
                 TablePreview.csv_text_en.ilike(f"%{req_id}%"),
@@ -6289,12 +6335,13 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
 
     requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
     matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
-    matched_doc_ids.update(row["document_id"] for row in requirement_rows if row.get("document_id"))
     filename_docs = DocumentRecord.query.filter(
-        DocumentRecord.original_filename.ilike(f"%{normalized}%")
+        DocumentRecord.original_filename.ilike(f"%{normalized}%"),
+        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
     ).all()
     stored_name_docs = DocumentRecord.query.filter(
-        DocumentRecord.stored_filename.ilike(f"%{normalized}%")
+        DocumentRecord.stored_filename.ilike(f"%{normalized}%"),
+        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
     ).all()
     matched_doc_ids.update(d.id for d in filename_docs)
     matched_doc_ids.update(d.id for d in stored_name_docs)
@@ -6820,6 +6867,8 @@ def build_admin_documents_page_context():
         "storage_backend": storage.storage_backend_name(),
         "storage_persistent": storage.object_storage_enabled(),
         "storage_status": storage.get_storage_status(),
+        "document_type_options": DOCUMENT_TYPE_OPTIONS,
+        "document_type_label": document_type_label,
     }
 
 
@@ -6876,6 +6925,7 @@ def _handle_upload_post():
     skipped_count = 0
     restored_count = 0
     results = []
+    selected_document_type = normalize_document_type(request.form.get("document_type"))
 
     for file in files:
         if not file or file.filename == "":
@@ -6889,6 +6939,15 @@ def _handle_upload_post():
             results.append(("error", "Invalid filename."))
             continue
         ext = file_ext(original_filename)
+
+        if selected_document_type in DOCUMENT_TYPE_SPREADSHEET_ONLY and ext not in {"csv", "xlsx"}:
+            results.append(
+                (
+                    "error",
+                    f"Category '{document_type_label(selected_document_type)}' only supports CSV/XLSX: {original_filename}",
+                )
+            )
+            continue
 
         temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
         os.close(temp_fd)
@@ -6944,6 +7003,7 @@ def _handle_upload_post():
                 file_hash=file_hash,
                 size_bytes=size_bytes,
                 uploaded_by=current_user.id,
+                document_type=selected_document_type,
             )
             db.session.add(doc)
             try:
@@ -7585,6 +7645,11 @@ def ensure_schema():
     doc_cols = {col["name"] for col in inspector.get_columns("documents")}
     if "page_offsets_json" not in doc_cols:
         db.session.execute(text("ALTER TABLE documents ADD COLUMN page_offsets_json TEXT"))
+        db.session.commit()
+    if "document_type" not in doc_cols:
+        db.session.execute(
+            text("ALTER TABLE documents ADD COLUMN document_type VARCHAR(50) DEFAULT 'standard'")
+        )
         db.session.commit()
 
     block_cols = {col["name"] for col in inspector.get_columns("requirement_blocks")}
