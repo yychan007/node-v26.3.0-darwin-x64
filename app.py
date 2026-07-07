@@ -3227,7 +3227,10 @@ def load_dictionary_sheet_matrix(file_path, sheet_name):
             return []
         ws = wb[sheet_name]
         matrix = []
-        for row in ws.iter_rows():
+        iter_rows_fn = getattr(ws, "iter_rows", None)
+        if not callable(iter_rows_fn):
+            return []
+        for row in cast(Any, iter_rows_fn()):
             row_values = []
             for cell in row:
                 value = cell.value
@@ -4626,6 +4629,66 @@ HOME_TEMPLATE = """
         </div>
         {% endif %}
     </form>
+
+    <div class="search-meta-panel" style="margin-top:16px;">
+        <div class="panel-title">Requirement Browser</div>
+        <form method="GET" action="/" id="requirement-browser-form">
+            <input type="text" name="req_lookup" value="{{ req_lookup_query }}" placeholder="Find one requirement, e.g. AM-Req-0286.06">
+            <button type="submit">Browse</button>
+        </form>
+        <div class="small" style="margin-top:8px;">
+            Browse all indexed information for one requirement, including related Excel tables.
+        </div>
+
+        {% if req_lookup_query %}
+            {% if req_lookup and req_lookup.found %}
+                <div class="meta" style="margin-top:10px;">
+                    Requirement: <strong>{{ req_lookup.normalized_id or req_lookup_query }}</strong>
+                    · Records: <strong>{{ req_lookup.block_count }}</strong>
+                    · Related documents: <strong>{{ req_lookup.document_count }}</strong>
+                    · Tables: <strong>{{ req_lookup.table_count }}</strong>
+                </div>
+
+                {% if req_lookup.blocks %}
+                <div class="result-item" style="margin-top:12px;">
+                    <strong>Requirement information</strong>
+                    {% for item in req_lookup.blocks %}
+                    <div class="summary-box" style="margin-top:10px;">
+                        <div class="meta"><strong>{{ item.requirement_id or '-' }}</strong> · {{ item.document_name }}</div>
+                        {% if item.title %}<div><strong>Title:</strong> {{ item.title }}</div>{% endif %}
+                        {% if item.section %}<div><strong>Section:</strong> {{ item.section }}</div>{% endif %}
+                        {% if item.summary %}<div><strong>Summary:</strong> {{ item.summary }}</div>{% endif %}
+                        {% if item.definition %}<div><strong>Definition:</strong> {{ item.definition }}</div>{% endif %}
+                        {% if item.full_text %}
+                        <div style="margin-top:8px; white-space:pre-wrap;">{{ item.full_text }}</div>
+                        {% endif %}
+                        <div class="meta" style="margin-top:8px;">
+                            <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if req_lookup.tables %}
+                <div class="result-item" style="margin-top:12px;">
+                    <strong>Related tables</strong>
+                    {% for t in req_lookup.tables %}
+                    <div class="summary-box" style="margin-top:10px;">
+                        <div><strong>{{ t.document_name }}</strong></div>
+                        <div class="meta">Sheet: {{ t.sheet_name }} · Format: {{ t.table_format }}</div>
+                        <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open table</a>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            {% else %}
+                <div class="warning" style="margin-top:12px;">
+                    No matching requirement data found for <strong>{{ req_lookup_query }}</strong>.
+                </div>
+            {% endif %}
+        {% endif %}
+    </div>
 
     <script>
     function selectAllTerms(checked) {
@@ -6084,9 +6147,119 @@ function handleDictUploadSubmit(form) {
 # =========================================================
 # Routes
 # =========================================================
+def normalize_requirement_lookup_id(raw_query):
+    query = (raw_query or "").strip()
+    if not query:
+        return ""
+    match = REQ_ID_REGEX.search(query)
+    if match:
+        return match.group(1)
+    return query
+
+
+def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
+    query = (raw_query or "").strip()
+    normalized = normalize_requirement_lookup_id(query)
+    if not normalized:
+        return {
+            "found": False,
+            "normalized_id": "",
+            "blocks": [],
+            "tables": [],
+            "block_count": 0,
+            "table_count": 0,
+            "document_count": 0,
+        }
+
+    key = normalized.lower()
+    exact_blocks = RequirementBlock.query.filter(
+        db.func.lower(RequirementBlock.requirement_id) == key
+    ).all()
+    if exact_blocks:
+        matched_blocks = exact_blocks
+    else:
+        matched_blocks = (
+            RequirementBlock.query.filter(RequirementBlock.requirement_id.ilike(f"%{normalized}%"))
+            .order_by(RequirementBlock.id.desc())
+            .all()
+        )
+
+    matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
+    filename_docs = DocumentRecord.query.filter(
+        DocumentRecord.original_filename.ilike(f"%{normalized}%")
+    ).all()
+    stored_name_docs = DocumentRecord.query.filter(
+        DocumentRecord.stored_filename.ilike(f"%{normalized}%")
+    ).all()
+    matched_doc_ids.update(d.id for d in filename_docs)
+    matched_doc_ids.update(d.id for d in stored_name_docs)
+
+    table_rows = []
+    if matched_doc_ids:
+        tables = (
+            TablePreview.query.filter(TablePreview.document_id.in_(matched_doc_ids))
+            .order_by(TablePreview.id.desc())
+            .all()
+        )
+        seen_table_keys = set()
+        for row in tables:
+            key_tuple = (row.document_id, row.sheet_name or "", row.table_format or "")
+            if key_tuple in seen_table_keys:
+                continue
+            seen_table_keys.add(key_tuple)
+            doc = row.document
+            table_rows.append(
+                {
+                    "document_id": row.document_id,
+                    "document_name": doc.original_filename if doc else f"Document {row.document_id}",
+                    "sheet_name": row.sheet_name or "-",
+                    "table_format": row.table_format or "-",
+                }
+            )
+            if len(table_rows) >= max_tables:
+                break
+
+    block_rows = []
+    seen_blocks = set()
+    for block in sorted(
+        matched_blocks,
+        key=lambda b: ((b.page or 0), (b.char_start or 0), -(b.id or 0)),
+    ):
+        if block.id in seen_blocks:
+            continue
+        seen_blocks.add(block.id)
+        doc = block.document
+        block_rows.append(
+            {
+                "block_id": block.id,
+                "requirement_id": block.requirement_id or "",
+                "title": block.title or "",
+                "section": block.section or "",
+                "summary": block.summary or "",
+                "definition": block.definition or "",
+                "full_text": block.full_text or "",
+                "document_name": doc.original_filename if doc else f"Document {block.document_id}",
+            }
+        )
+        if len(block_rows) >= max_blocks:
+            break
+
+    return {
+        "found": bool(block_rows or table_rows),
+        "normalized_id": normalized,
+        "blocks": block_rows,
+        "tables": table_rows,
+        "block_count": len(matched_blocks),
+        "table_count": len(table_rows),
+        "document_count": len(matched_doc_ids),
+    }
+
+
 @app.route("/")
 def home():
     query = request.args.get("q", "").strip()
+    req_lookup_query = request.args.get("req_lookup", "").strip()
+    req_lookup = build_requirement_lookup_result(req_lookup_query) if req_lookup_query else None
     current_page = max(1, request.args.get("page", 1, type=int) or 1)
     total_pages = 1
     total_results = 0
@@ -6148,6 +6321,8 @@ def home():
         total_pages=total_pages,
         total_results=total_results,
         results_per_page=RESULTS_PER_PAGE,
+        req_lookup_query=req_lookup_query,
+        req_lookup=req_lookup,
         doc_count=DocumentRecord.query.count(),
         block_count=RequirementBlock.query.count(),
         table_count=TablePreview.query.count(),
