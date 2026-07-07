@@ -337,6 +337,9 @@ DOCUMENT_TYPE_OPTIONS = [
 ]
 DOCUMENT_TYPE_IDS = {option["id"] for option in DOCUMENT_TYPE_OPTIONS}
 DOCUMENT_TYPE_SPREADSHEET_ONLY = {DOCUMENT_TYPE_REQUIREMENT_MASTER}
+REQUIREMENT_MASTER_MAX_ROWS = 20000
+DEFAULT_EXCEL_MAX_ROWS = 200
+DEFAULT_TABLE_DISPLAY_ROWS = 40
 
 # =========================================================
 # Database models
@@ -1968,13 +1971,13 @@ def clean_dataframe_for_display(df, max_rows=50):
     return cleaned.head(max_rows).reset_index(drop=True)
 
 
-def extract_text_from_xlsx(path):
+def extract_text_from_xlsx(path, max_sheet_rows=DEFAULT_EXCEL_MAX_ROWS):
     workbook = pd.ExcelFile(path)
     all_parts = []
     tables = []
     for sheet_name in workbook.sheet_names:
         raw_df = pd.read_excel(workbook, sheet_name=sheet_name, header=None, dtype=object)
-        df = normalize_excel_sheet(raw_df)
+        df = normalize_excel_sheet(raw_df, max_rows=max_sheet_rows)
         if df.empty:
             continue
         tables.append((sheet_name, df))
@@ -2065,7 +2068,7 @@ def ocr_pdf(path):
 
     return full_text, page_offsets
 
-def extract_text_by_extension(path):
+def extract_text_by_extension(path, excel_max_rows=DEFAULT_EXCEL_MAX_ROWS):
     ext = file_ext(path)
 
     if ext == "pdf":
@@ -2102,7 +2105,7 @@ def extract_text_by_extension(path):
         return text, page_offsets, tables, False
 
     if ext == "xlsx":
-        text, page_offsets, tables = extract_text_from_xlsx(path)
+        text, page_offsets, tables = extract_text_from_xlsx(path, max_sheet_rows=excel_max_rows)
         return text, page_offsets, tables, False
 
     if ext in {"png", "jpg", "jpeg"}:
@@ -2619,8 +2622,8 @@ def prepare_table_display(full_df, footnotes_override=None):
     return html_table, preview_df, footnotes
 
 
-def build_table_html(df):
-    full_df = finalize_display_dataframe(df, max_rows=40)
+def build_table_html(df, max_rows=DEFAULT_TABLE_DISPLAY_ROWS):
+    full_df = finalize_display_dataframe(df, max_rows=max_rows)
     if full_df.empty:
         return "", pd.DataFrame()
 
@@ -2710,11 +2713,11 @@ def translate_preview_df_to_html(preview_df, target_lang="en"):
     return html_table
 
 
-def save_table_previews(doc_id, tables):
+def save_table_previews(doc_id, tables, max_display_rows=DEFAULT_TABLE_DISPLAY_ROWS):
     for sheet_name, df in tables:
         if df is None:
             continue
-        html_table, full_df = build_table_html(df)
+        html_table, full_df = build_table_html(df, max_rows=max_display_rows)
         if full_df.empty:
             continue
         html_table_en = ""
@@ -2802,8 +2805,10 @@ def regenerate_table_previews(doc_record):
         doc_record.stored_filename, DOC_FOLDER
     ) as full_path:
         ensure_indexable_file(full_path)
+        master_doc = is_requirement_master_document(doc_record)
+        excel_max_rows = REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_EXCEL_MAX_ROWS
         if ext == "xlsx":
-            _, _, tables = extract_text_from_xlsx(full_path)
+            _, _, tables = extract_text_from_xlsx(full_path, max_sheet_rows=excel_max_rows)
         else:
             _, _, tables = extract_text_from_csv(full_path)
 
@@ -2811,7 +2816,11 @@ def regenerate_table_previews(doc_record):
         return []
 
     TablePreview.query.filter_by(document_id=doc_record.id).delete()
-    save_table_previews(doc_record.id, tables)
+    save_table_previews(
+        doc_record.id,
+        tables,
+        max_display_rows=REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_TABLE_DISPLAY_ROWS,
+    )
     db.session.commit()
     return TablePreview.query.filter_by(document_id=doc_record.id).all()
 
@@ -2839,7 +2848,11 @@ def _index_document_record_impl(doc_record):
         doc_record.stored_filename, DOC_FOLDER
     ) as full_path:
         ensure_indexable_file(full_path)
-        text, page_offsets, tables, used_ocr = extract_text_by_extension(full_path)
+        master_doc = is_requirement_master_document(doc_record)
+        excel_max_rows = REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_EXCEL_MAX_ROWS
+        text, page_offsets, tables, used_ocr = extract_text_by_extension(
+            full_path, excel_max_rows=excel_max_rows
+        )
 
     doc_record.is_ocr = used_ocr
     doc_record.text_preview = text[:TEXT_PREVIEW_LIMIT]
@@ -2903,7 +2916,11 @@ def _index_document_record_impl(doc_record):
             db.session.commit()
             pending = 0
 
-    save_table_previews(doc_record.id, tables)
+    save_table_previews(
+        doc_record.id,
+        tables,
+        max_display_rows=REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_TABLE_DISPLAY_ROWS,
+    )
     db.session.commit()
     dedupe_requirement_blocks_by_id()
 
@@ -4685,25 +4702,18 @@ HOME_TEMPLATE = """
                     {% for row in req_lookup.requirement_rows %}
                     <div class="summary-box" style="margin-top:10px;">
                         <div class="meta">
-                            <strong>{{ row.document_name }}</strong>
+                            <strong>{{ row.spec_code or ('Row ' ~ row.row_number) }}</strong>
+                            · {{ row.document_name }}
                             · Sheet: {{ row.sheet_name }}
                             · Row: {{ row.row_number }}
                             · <a href="{{ url_for('table_preview', document_id=row.document_id) }}" target="_blank">Open table</a>
                         </div>
-                        <div class="table-scroll-wrap" style="margin-top:8px;">
-                            <table class="data-table" style="width:max-content; min-width:100%;">
-                                <tr>
-                                    {% for cell in row.cells %}
-                                    <th>{{ cell.column }}</th>
-                                    {% endfor %}
-                                </tr>
-                                <tr>
-                                    {% for cell in row.cells %}
-                                    <td style="white-space:pre-wrap; min-width:160px;">{{ cell.value }}</td>
-                                    {% endfor %}
-                                </tr>
-                            </table>
+                        {% for cell in row.cells %}
+                        <div style="margin-top:8px;">
+                            <div class="meta"><strong>{{ cell.column }}</strong></div>
+                            <div style="white-space:pre-wrap; margin-top:4px;">{{ cell.value }}</div>
                         </div>
+                        {% endfor %}
                     </div>
                     {% endfor %}
                 </div>
@@ -6232,7 +6242,40 @@ def normalize_requirement_lookup_id(raw_query):
     return query
 
 
+def extract_requirement_spec_code(text):
+    match = REQ_ID_REGEX.search(text or "")
+    return match.group(1) if match else ""
+
+
+def is_base_requirement_lookup_id(req_id):
+    normalized = normalize_requirement_lookup_id(req_id)
+    match = REQ_ID_REGEX.search(normalized)
+    if not match:
+        return "." not in normalized.rsplit("-", 1)[-1]
+    numeric_part = match.group(1).rsplit("-", 1)[-1]
+    return "." not in numeric_part
+
+
+def requirement_spec_matches_lookup(lookup_id, spec_text):
+    lookup = normalize_requirement_lookup_id(lookup_id)
+    spec = extract_requirement_spec_code(spec_text) or (spec_text or "").strip()
+    if not lookup or not spec:
+        return False
+    lookup_key = lookup.lower()
+    spec_key = spec.lower()
+    if spec_key == lookup_key:
+        return True
+    if spec_key.startswith(lookup_key + "."):
+        return True
+    if is_base_requirement_lookup_id(lookup) and spec_key.startswith(lookup_key):
+        suffix = spec_key[len(lookup_key):]
+        return not suffix or suffix.startswith(".")
+    return False
+
+
 def requirement_id_matches_text(req_id, text):
+    if requirement_spec_matches_lookup(req_id, text):
+        return True
     req = (req_id or "").strip().lower()
     value = (text or "").strip().lower()
     if not req or not value:
@@ -6244,65 +6287,135 @@ def requirement_id_matches_text(req_id, text):
     return bool(req_compact and req_compact in value_compact)
 
 
-def build_requirement_rows_from_tables(req_id, max_rows=10):
+def find_spec_code_column(columns):
+    for col in columns:
+        norm = re.sub(r"[^a-z0-9]", "", str(col).lower())
+        if norm in {"speccode", "requirementid", "reqid"}:
+            return col
+    for col in columns:
+        lowered = str(col).lower()
+        if "spec" in lowered and "code" in lowered:
+            return col
+    return None
+
+
+def row_spec_code_value(df, row_idx, spec_col, columns):
+    if spec_col is not None:
+        value = cell_to_dictionary_text(df.iloc[row_idx].get(spec_col))
+        if value and value.lower() not in {"speccode", "spec code"}:
+            return value
+    for col in columns:
+        value = cell_to_dictionary_text(df.iloc[row_idx].get(col))
+        code = extract_requirement_spec_code(value)
+        if code:
+            return code
+    return ""
+
+
+def build_merged_row_cells(df, row_indices, columns):
+    merged = {}
+    for col in columns:
+        parts = []
+        for row_idx in row_indices:
+            value = cell_to_dictionary_text(df.iloc[row_idx].get(col))
+            if not value:
+                continue
+            if not parts or value != parts[-1]:
+                parts.append(value)
+        if parts:
+            merged[col] = "\n".join(parts)
+    return merged
+
+
+def document_matches_requirement_lookup(doc, lookup_id):
+    if not doc or is_requirement_master_document(doc):
+        return False
+    filename = doc.original_filename or ""
+    stored = doc.stored_filename or ""
+    file_req = requirement_id_from_filename(filename)
+    if file_req and requirement_spec_matches_lookup(lookup_id, file_req):
+        return True
+    if requirement_id_matches_text(lookup_id, filename):
+        return True
+    if requirement_id_matches_text(lookup_id, stored):
+        return True
+    return False
+
+
+def build_requirement_rows_from_tables(req_id, max_rows=100):
     if not req_id:
         return []
 
-    candidates = (
+    master_tables = (
         TablePreview.query.join(DocumentRecord)
         .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
-        .filter(
-            db.or_(
-                TablePreview.csv_text.ilike(f"%{req_id}%"),
-                TablePreview.csv_text_en.ilike(f"%{req_id}%"),
-                TablePreview.html_table.ilike(f"%{req_id}%"),
-                TablePreview.html_table_en.ilike(f"%{req_id}%"),
-            )
-        )
         .order_by(TablePreview.id.desc())
         .all()
     )
 
     rows = []
     seen = set()
-    for table in candidates:
+    for table in master_tables:
         df = table_preview_to_dataframe(table, "nl")
         if df is None or df.empty:
             continue
 
         columns = [str(col) for col in df.columns]
-        for row_idx, row in df.iterrows():
-            values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
-            if not any(requirement_id_matches_text(req_id, value) for value in values):
+        spec_col = find_spec_code_column(columns)
+        row_idx = 0
+        while row_idx < len(df):
+            spec_value = row_spec_code_value(df, row_idx, spec_col, columns)
+            if not spec_value or not requirement_spec_matches_lookup(req_id, spec_value):
+                row_idx += 1
                 continue
+
+            group_indices = [row_idx]
+            primary_spec = extract_requirement_spec_code(spec_value) or spec_value
+            primary_key = normalize_requirement_lookup_id(primary_spec).lower()
+            next_idx = row_idx + 1
+            while next_idx < len(df):
+                next_spec = row_spec_code_value(df, next_idx, spec_col, columns)
+                if next_spec:
+                    next_code = extract_requirement_spec_code(next_spec) or next_spec
+                    next_key = normalize_requirement_lookup_id(next_code).lower()
+                    if next_key == primary_key:
+                        group_indices.append(next_idx)
+                        next_idx += 1
+                        continue
+                    if requirement_spec_matches_lookup(req_id, next_spec):
+                        break
+                    break
+                group_indices.append(next_idx)
+                next_idx += 1
 
             row_position = int(cast(Any, row_idx))
             row_key = (table.document_id, table.sheet_name or "", row_position)
-            if row_key in seen:
-                continue
-            seen.add(row_key)
+            if row_key not in seen:
+                seen.add(row_key)
+                merged_cells = build_merged_row_cells(df, group_indices, columns)
+                cells = [
+                    {"column": col_name, "value": value}
+                    for col_name, value in merged_cells.items()
+                    if value
+                ]
+                if cells:
+                    doc = table.document
+                    rows.append(
+                        {
+                            "document_id": table.document_id,
+                            "document_name": doc.original_filename if doc else f"Document {table.document_id}",
+                            "sheet_name": table.sheet_name or "-",
+                            "table_format": table.table_format or "-",
+                            "row_number": row_position + 1,
+                            "spec_code": extract_requirement_spec_code(spec_value) or spec_value,
+                            "cells": cells,
+                        }
+                    )
 
-            cells = []
-            for col_name, value in zip(columns, values):
-                if not value:
-                    continue
-                cells.append({"column": col_name, "value": value})
-            if not cells:
-                continue
-
-            doc = table.document
-            rows.append(
-                {
-                    "document_id": table.document_id,
-                    "document_name": doc.original_filename if doc else f"Document {table.document_id}",
-                    "sheet_name": table.sheet_name or "-",
-                    "table_format": table.table_format or "-",
-                    "row_number": row_position + 1,
-                    "cells": cells,
-                }
-            )
+            row_idx = next_idx if next_idx > row_idx else row_idx + 1
             if len(rows) >= max_rows:
                 return rows
+    rows.sort(key=lambda item: (item.get("spec_code") or "", item.get("row_number") or 0))
     return rows
 
 
@@ -6321,35 +6434,49 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         }
 
     key = normalized.lower()
-    exact_blocks = RequirementBlock.query.filter(
-        db.func.lower(RequirementBlock.requirement_id) == key
-    ).all()
-    if exact_blocks:
-        matched_blocks = exact_blocks
-    else:
+    base_lookup = is_base_requirement_lookup_id(normalized)
+    row_limit = 100 if base_lookup else 20
+
+    if base_lookup:
         matched_blocks = (
-            RequirementBlock.query.filter(RequirementBlock.requirement_id.ilike(f"%{normalized}%"))
+            RequirementBlock.query.filter(
+                db.or_(
+                    db.func.lower(RequirementBlock.requirement_id) == key,
+                    RequirementBlock.requirement_id.ilike(f"{normalized}%"),
+                )
+            )
             .order_by(RequirementBlock.id.desc())
             .all()
         )
+    else:
+        exact_blocks = RequirementBlock.query.filter(
+            db.func.lower(RequirementBlock.requirement_id) == key
+        ).all()
+        if exact_blocks:
+            matched_blocks = exact_blocks
+        else:
+            matched_blocks = (
+                RequirementBlock.query.filter(RequirementBlock.requirement_id.ilike(f"%{normalized}%"))
+                .order_by(RequirementBlock.id.desc())
+                .all()
+            )
 
-    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
+    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=row_limit)
     matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
-    filename_docs = DocumentRecord.query.filter(
-        DocumentRecord.original_filename.ilike(f"%{normalized}%"),
-        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
-    ).all()
-    stored_name_docs = DocumentRecord.query.filter(
-        DocumentRecord.stored_filename.ilike(f"%{normalized}%"),
-        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
-    ).all()
-    matched_doc_ids.update(d.id for d in filename_docs)
-    matched_doc_ids.update(d.id for d in stored_name_docs)
+    matched_doc_ids.update(row["document_id"] for row in requirement_rows if row.get("document_id"))
+    for doc in DocumentRecord.query.filter(
+        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER
+    ).all():
+        if document_matches_requirement_lookup(doc, normalized):
+            matched_doc_ids.add(doc.id)
 
+    table_limit = max(max_tables, 12 if base_lookup else max_tables)
     table_rows = []
     if matched_doc_ids:
         tables = (
             TablePreview.query.filter(TablePreview.document_id.in_(matched_doc_ids))
+            .join(DocumentRecord)
+            .filter(DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER)
             .order_by(TablePreview.id.desc())
             .all()
         )
@@ -6368,7 +6495,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                     "table_format": row.table_format or "-",
                 }
             )
-            if len(table_rows) >= max_tables:
+            if len(table_rows) >= table_limit:
                 break
 
     block_rows = []
