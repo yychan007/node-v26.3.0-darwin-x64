@@ -337,7 +337,7 @@ DOCUMENT_TYPE_OPTIONS = [
 ]
 DOCUMENT_TYPE_IDS = {option["id"] for option in DOCUMENT_TYPE_OPTIONS}
 DOCUMENT_TYPE_SPREADSHEET_ONLY = {DOCUMENT_TYPE_REQUIREMENT_MASTER}
-REQUIREMENT_MASTER_MAX_ROWS = 20000
+REQUIREMENT_MASTER_MAX_ROWS = 35000
 DEFAULT_EXCEL_MAX_ROWS = 200
 DEFAULT_TABLE_DISPLAY_ROWS = 40
 
@@ -399,6 +399,129 @@ def document_type_label(document_type):
 
 def is_requirement_master_document(doc):
     return normalize_document_type(getattr(doc, "document_type", None)) == DOCUMENT_TYPE_REQUIREMENT_MASTER
+
+
+def is_requirement_master_source(doc):
+    if not doc:
+        return False
+    if is_requirement_master_document(doc):
+        return True
+    if (doc.extension or "").lower() not in {"csv", "xlsx"}:
+        return False
+    name = (doc.original_filename or "").lower().replace("_", " ")
+    return "tennet" in name and "requirement" in name
+
+
+def get_requirement_master_documents():
+    candidates = DocumentRecord.query.filter(
+        DocumentRecord.extension.in_(("csv", "xlsx"))
+    ).all()
+    return [doc for doc in candidates if is_requirement_master_source(doc)]
+
+
+def prepare_requirement_master_storage_df(df, max_rows=REQUIREMENT_MASTER_MAX_ROWS):
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    cleaned = df.copy()
+    cleaned.columns = dedupe_column_names(cleaned.columns)
+    for idx in range(cleaned.shape[1]):
+        cleaned.iloc[:, idx] = cleaned.iloc[:, idx].map(normalize_cell_text)
+
+    if not cleaned.empty:
+        row_keep = cleaned.apply(
+            lambda row: any(normalize_cell_text(value) for value in row), axis=1
+        )
+        cleaned = cleaned.loc[row_keep]
+
+    if cleaned.empty:
+        return cleaned
+    return cleaned.head(max_rows).reset_index(drop=True)
+
+
+def requirement_master_english_columns(columns):
+    spec_cols = []
+    english_cols = []
+    neutral_cols = []
+    for col in columns:
+        lowered = str(col).lower().strip()
+        norm = re.sub(r"[^a-z0-9]", "", lowered)
+        if norm in {"speccode", "requirementid", "reqid"}:
+            spec_cols.append(col)
+        elif "english" in lowered:
+            english_cols.append(col)
+        elif "dutch" in lowered:
+            continue
+        elif any(
+            token in norm
+            for token in (
+                "sourcedocument",
+                "vakgebied",
+                "conceptual",
+                "objectname",
+                "fase",
+                "verificatie",
+                "referredstandard",
+                "amstatement",
+            )
+        ):
+            neutral_cols.append(col)
+    ordered = spec_cols + english_cols + neutral_cols
+    return ordered if ordered else list(columns)
+
+
+def build_requirement_master_english_table(df, max_rows=200):
+    if df is None or df.empty:
+        return "", ""
+
+    columns = requirement_master_english_columns(list(df.columns))
+    available = [col for col in columns if col in df.columns]
+    if not available:
+        return "", ""
+
+    subset = df.loc[:, available].head(max_rows).copy()
+    if subset.empty:
+        return "", ""
+
+    html_table, _, _ = prepare_table_display(subset)
+    csv_buf = io.StringIO()
+    subset.to_csv(csv_buf, index=False)
+    return html_table, csv_buf.getvalue()
+
+
+def table_row_is_requirement_master(table_row, doc=None):
+    if doc is None:
+        doc = getattr(table_row, "document", None)
+    if doc is None and getattr(table_row, "document_id", None):
+        doc = db.session.get(DocumentRecord, table_row.document_id)
+    return is_requirement_master_source(doc) if doc else False
+
+
+def load_requirement_master_dataframe(doc, sheet_name=""):
+    if not doc or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return None, ""
+
+    ext = (doc.extension or "").lower()
+    with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as path:
+        if ext == "csv":
+            _text, _offsets, tables = extract_text_from_csv(path)
+            for name, df in tables or []:
+                prepared = prepare_requirement_master_storage_df(df)
+                if not prepared.empty:
+                    return prepared, str(name or "CSV")
+            return None, ""
+
+        workbook = pd.ExcelFile(path)
+        target_sheets = [sheet_name] if sheet_name else list(workbook.sheet_names)
+        for name in target_sheets:
+            if name not in workbook.sheet_names:
+                continue
+            raw_df = pd.read_excel(workbook, sheet_name=name, header=None, dtype=object)
+            df = normalize_excel_sheet(raw_df, max_rows=REQUIREMENT_MASTER_MAX_ROWS)
+            prepared = prepare_requirement_master_storage_df(df)
+            if not prepared.empty:
+                return prepared, str(name)
+    return None, ""
 
 
 class RequirementBlock(db.Model):
@@ -2640,9 +2763,31 @@ def dataframe_from_table_csv(csv_text):
         return None
 
 
-def render_table_preview_html(table_row, lang="nl"):
+def render_table_preview_html(table_row, lang="nl", doc=None):
+    if doc is None:
+        doc = getattr(table_row, "document", None)
+    if doc is None and getattr(table_row, "document_id", None):
+        doc = db.session.get(DocumentRecord, table_row.document_id)
+
     csv_text = (table_row.csv_text or "").strip()
     csv_text_en = (table_row.csv_text_en or "").strip()
+    if lang == "en" and table_row_is_requirement_master(table_row, doc=doc):
+        if csv_text_en:
+            df_en = dataframe_from_table_csv(csv_text_en)
+            if df_en is not None and not df_en.empty:
+                html_table, _, _ = prepare_table_display(
+                    finalize_display_dataframe(df_en, max_rows=200)
+                )
+                if html_table:
+                    return html_table
+        if csv_text:
+            df = dataframe_from_table_csv(csv_text)
+            if df is not None and not df.empty:
+                html_table, _ = build_requirement_master_english_table(df, max_rows=200)
+                if html_table:
+                    return html_table
+        return table_row.html_table_en or table_row.html_table or ""
+
     if lang == "en" and csv_text_en:
         df_en = dataframe_from_table_csv(csv_text_en)
         if df_en is not None and not df_en.empty:
@@ -2713,16 +2858,26 @@ def translate_preview_df_to_html(preview_df, target_lang="en"):
     return html_table
 
 
-def save_table_previews(doc_id, tables, max_display_rows=DEFAULT_TABLE_DISPLAY_ROWS):
+def save_table_previews(doc_id, tables, max_display_rows=DEFAULT_TABLE_DISPLAY_ROWS, skip_translation=False):
     for sheet_name, df in tables:
         if df is None:
             continue
-        html_table, full_df = build_table_html(df, max_rows=max_display_rows)
-        if full_df.empty:
-            continue
+        is_master_storage = skip_translation or max_display_rows >= REQUIREMENT_MASTER_MAX_ROWS
+        if is_master_storage:
+            full_df = prepare_requirement_master_storage_df(df, max_rows=max_display_rows)
+            if full_df.empty:
+                continue
+            preview_df = full_df.head(200)
+            html_table, _, _ = prepare_table_display(preview_df)
+        else:
+            html_table, full_df = build_table_html(df, max_rows=max_display_rows)
+            if full_df.empty:
+                continue
         html_table_en = ""
         csv_text_en = ""
-        if translation.translation_enabled():
+        if is_master_storage:
+            html_table_en, csv_text_en = build_requirement_master_english_table(full_df, max_rows=200)
+        elif translation.translation_enabled():
             html_table_en, csv_text_en = translate_preview_df(full_df, "en")
         csv_buf = io.StringIO()
         full_df.to_csv(csv_buf, index=False)
@@ -2753,18 +2908,26 @@ def table_preview_needs_regenerate(tables):
     return False
 
 
-def table_preview_needs_translation(tables):
+def table_preview_needs_translation(tables, doc=None):
     if not translation.translation_enabled():
         return False
+    if doc and is_requirement_master_source(doc):
+        return False
     for row in tables:
+        if table_row_is_requirement_master(row, doc=doc):
+            continue
         if not (row.html_table_en or "").strip():
             return True
     return False
 
 
-def refresh_table_translations_from_cache(tables):
+def refresh_table_translations_from_cache(tables, doc=None):
     updated = False
+    if doc and is_requirement_master_source(doc):
+        return False
     for row in tables:
+        if table_row_is_requirement_master(row, doc=doc):
+            continue
         needs_en = not (row.html_table_en or "").strip()
         if (
             not needs_en
@@ -2805,7 +2968,7 @@ def regenerate_table_previews(doc_record):
         doc_record.stored_filename, DOC_FOLDER
     ) as full_path:
         ensure_indexable_file(full_path)
-        master_doc = is_requirement_master_document(doc_record)
+        master_doc = is_requirement_master_source(doc_record)
         excel_max_rows = REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_EXCEL_MAX_ROWS
         if ext == "xlsx":
             _, _, tables = extract_text_from_xlsx(full_path, max_sheet_rows=excel_max_rows)
@@ -2820,6 +2983,7 @@ def regenerate_table_previews(doc_record):
         doc_record.id,
         tables,
         max_display_rows=REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_TABLE_DISPLAY_ROWS,
+        skip_translation=master_doc,
     )
     db.session.commit()
     return TablePreview.query.filter_by(document_id=doc_record.id).all()
@@ -2848,7 +3012,7 @@ def _index_document_record_impl(doc_record):
         doc_record.stored_filename, DOC_FOLDER
     ) as full_path:
         ensure_indexable_file(full_path)
-        master_doc = is_requirement_master_document(doc_record)
+        master_doc = is_requirement_master_source(doc_record)
         excel_max_rows = REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_EXCEL_MAX_ROWS
         text, page_offsets, tables, used_ocr = extract_text_by_extension(
             full_path, excel_max_rows=excel_max_rows
@@ -2920,6 +3084,7 @@ def _index_document_record_impl(doc_record):
         doc_record.id,
         tables,
         max_display_rows=REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_TABLE_DISPLAY_ROWS,
+        skip_translation=master_doc,
     )
     db.session.commit()
     dedupe_requirement_blocks_by_id()
@@ -4764,6 +4929,14 @@ HOME_TEMPLATE = """
                     · Tables: <strong>{{ req_lookup.table_count }}</strong>
                 </div>
 
+                {% if req_lookup.requirement_row_count == 0 and req_lookup.master_source_count > 0 %}
+                <div class="warning" style="margin-top:10px;">
+                    No rows matched in the requirement master table for this ID.
+                    Open <strong>Documents &amp; upload</strong>, set Tennet Requirements to
+                    <strong>Requirement master table (總表)</strong>, then click <strong>Reindex</strong>.
+                </div>
+                {% endif %}
+
                 {% if req_lookup.requirement_rows %}
                 <div class="result-item" style="margin-top:12px;">
                     <strong>Requirement information (from Excel rows)</strong>
@@ -5255,6 +5428,7 @@ UPLOAD_PANEL = """
                 <div class="small" style="margin-top:6px;">
                     Use <strong>Requirement master table (總表)</strong> for Tennet Requirements Excel files.
                     These rows appear in the Requirement Browser on the home page.
+                    The master table is not machine-translated because it already includes English columns.
                     Individual AM-Req spreadsheets should use <strong>Standard document</strong>.
                 </div>
             </div>
@@ -6438,79 +6612,111 @@ def document_matches_requirement_lookup(doc, lookup_id):
     return False
 
 
+def collect_requirement_rows_from_dataframe(
+    df,
+    req_id,
+    *,
+    document_id,
+    document_name,
+    sheet_name,
+    table_format,
+    max_rows,
+    seen,
+    rows,
+):
+    if df is None or df.empty:
+        return
+
+    columns = [str(col) for col in df.columns]
+    spec_col = find_spec_code_column(columns)
+    row_idx = 0
+    while row_idx < len(df):
+        spec_value = row_spec_code_value(df, row_idx, spec_col, columns)
+        if not spec_value or not requirement_spec_matches_lookup(req_id, spec_value):
+            row_idx += 1
+            continue
+
+        group_indices = [row_idx]
+        primary_spec = extract_requirement_spec_code(spec_value) or spec_value
+        primary_key = normalize_requirement_lookup_id(primary_spec).lower()
+        next_idx = row_idx + 1
+        while next_idx < len(df):
+            next_spec = row_spec_code_value(df, next_idx, spec_col, columns)
+            if next_spec:
+                next_code = extract_requirement_spec_code(next_spec) or next_spec
+                next_key = normalize_requirement_lookup_id(next_code).lower()
+                if next_key == primary_key:
+                    group_indices.append(next_idx)
+                    next_idx += 1
+                    continue
+                if requirement_spec_matches_lookup(req_id, next_spec):
+                    break
+                break
+            group_indices.append(next_idx)
+            next_idx += 1
+
+        row_position = int(cast(Any, row_idx))
+        row_key = (document_id, sheet_name or "", row_position)
+        if row_key not in seen:
+            seen.add(row_key)
+            merged_cells = build_merged_row_cells(df, group_indices, columns)
+            cells = [
+                {"column": col_name, "value": value}
+                for col_name, value in merged_cells.items()
+                if value
+            ]
+            if cells:
+                rows.append(
+                    {
+                        "document_id": document_id,
+                        "document_name": document_name,
+                        "sheet_name": sheet_name or "-",
+                        "table_format": table_format or "-",
+                        "row_number": row_position + 1,
+                        "spec_code": extract_requirement_spec_code(spec_value) or spec_value,
+                        "cells": cells,
+                    }
+                )
+
+        row_idx = next_idx if next_idx > row_idx else row_idx + 1
+        if len(rows) >= max_rows:
+            return
+
+
 def build_requirement_rows_from_tables(req_id, max_rows=100):
     if not req_id:
         return []
 
-    master_tables = (
-        TablePreview.query.join(DocumentRecord)
-        .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
-        .order_by(TablePreview.id.desc())
-        .all()
-    )
-
     rows = []
     seen = set()
-    for table in master_tables:
-        df = table_preview_to_dataframe(table, "nl")
+    for doc in get_requirement_master_documents():
+        df, sheet_name = load_requirement_master_dataframe(doc, sheet_name="")
+        if df is None or df.empty:
+            table = (
+                TablePreview.query.filter_by(document_id=doc.id)
+                .order_by(TablePreview.id.desc())
+                .first()
+            )
+            if table:
+                df = table_preview_to_dataframe(table, "nl")
+                sheet_name = table.sheet_name or sheet_name
         if df is None or df.empty:
             continue
 
-        columns = [str(col) for col in df.columns]
-        spec_col = find_spec_code_column(columns)
-        row_idx = 0
-        while row_idx < len(df):
-            spec_value = row_spec_code_value(df, row_idx, spec_col, columns)
-            if not spec_value or not requirement_spec_matches_lookup(req_id, spec_value):
-                row_idx += 1
-                continue
+        collect_requirement_rows_from_dataframe(
+            df,
+            req_id,
+            document_id=doc.id,
+            document_name=doc.original_filename or f"Document {doc.id}",
+            sheet_name=sheet_name,
+            table_format=doc.extension or "xlsx",
+            max_rows=max_rows,
+            seen=seen,
+            rows=rows,
+        )
+        if len(rows) >= max_rows:
+            break
 
-            group_indices = [row_idx]
-            primary_spec = extract_requirement_spec_code(spec_value) or spec_value
-            primary_key = normalize_requirement_lookup_id(primary_spec).lower()
-            next_idx = row_idx + 1
-            while next_idx < len(df):
-                next_spec = row_spec_code_value(df, next_idx, spec_col, columns)
-                if next_spec:
-                    next_code = extract_requirement_spec_code(next_spec) or next_spec
-                    next_key = normalize_requirement_lookup_id(next_code).lower()
-                    if next_key == primary_key:
-                        group_indices.append(next_idx)
-                        next_idx += 1
-                        continue
-                    if requirement_spec_matches_lookup(req_id, next_spec):
-                        break
-                    break
-                group_indices.append(next_idx)
-                next_idx += 1
-
-            row_position = int(cast(Any, row_idx))
-            row_key = (table.document_id, table.sheet_name or "", row_position)
-            if row_key not in seen:
-                seen.add(row_key)
-                merged_cells = build_merged_row_cells(df, group_indices, columns)
-                cells = [
-                    {"column": col_name, "value": value}
-                    for col_name, value in merged_cells.items()
-                    if value
-                ]
-                if cells:
-                    doc = table.document
-                    rows.append(
-                        {
-                            "document_id": table.document_id,
-                            "document_name": doc.original_filename if doc else f"Document {table.document_id}",
-                            "sheet_name": table.sheet_name or "-",
-                            "table_format": table.table_format or "-",
-                            "row_number": row_position + 1,
-                            "spec_code": extract_requirement_spec_code(spec_value) or spec_value,
-                            "cells": cells,
-                        }
-                    )
-
-            row_idx = next_idx if next_idx > row_idx else row_idx + 1
-            if len(rows) >= max_rows:
-                return rows
     rows.sort(key=lambda item: (item.get("spec_code") or "", item.get("row_number") or 0))
     return rows
 
@@ -6527,6 +6733,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             "block_count": 0,
             "table_count": 0,
             "document_count": 0,
+            "requirement_rows": [],
+            "requirement_row_count": 0,
+            "master_source_count": len(get_requirement_master_documents()),
         }
 
     key = normalized.lower()
@@ -6631,6 +6840,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
+        "master_source_count": len(get_requirement_master_documents()),
     }
 
 
@@ -7461,8 +7671,8 @@ def table_preview(document_id):
             print(f"Table preview regeneration error for document {document_id}: {exc}")
             error_msg = f"Could not build table preview: {exc}"
 
-    if tables and table_preview_needs_translation(tables):
-        refresh_table_translations_from_cache(tables)
+    if tables and table_preview_needs_translation(tables, doc=doc):
+        refresh_table_translations_from_cache(tables, doc=doc)
         tables = TablePreview.query.filter_by(document_id=document_id).all()
 
     if not tables and not file_available:
