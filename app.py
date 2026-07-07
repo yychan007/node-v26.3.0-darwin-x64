@@ -4644,14 +4644,45 @@ HOME_TEMPLATE = """
             {% if req_lookup and req_lookup.found %}
                 <div class="meta" style="margin-top:10px;">
                     Requirement: <strong>{{ req_lookup.normalized_id or req_lookup_query }}</strong>
+                    · Requirement rows: <strong>{{ req_lookup.requirement_row_count }}</strong>
                     · Records: <strong>{{ req_lookup.block_count }}</strong>
                     · Related documents: <strong>{{ req_lookup.document_count }}</strong>
                     · Tables: <strong>{{ req_lookup.table_count }}</strong>
                 </div>
 
+                {% if req_lookup.requirement_rows %}
+                <div class="result-item" style="margin-top:12px;">
+                    <strong>Requirement information (from Excel rows)</strong>
+                    {% for row in req_lookup.requirement_rows %}
+                    <div class="summary-box" style="margin-top:10px;">
+                        <div class="meta">
+                            <strong>{{ row.document_name }}</strong>
+                            · Sheet: {{ row.sheet_name }}
+                            · Row: {{ row.row_number }}
+                            · <a href="{{ url_for('table_preview', document_id=row.document_id) }}" target="_blank">Open table</a>
+                        </div>
+                        <div class="table-scroll-wrap" style="margin-top:8px;">
+                            <table class="data-table" style="width:max-content; min-width:100%;">
+                                <tr>
+                                    {% for cell in row.cells %}
+                                    <th>{{ cell.column }}</th>
+                                    {% endfor %}
+                                </tr>
+                                <tr>
+                                    {% for cell in row.cells %}
+                                    <td style="white-space:pre-wrap; min-width:160px;">{{ cell.value }}</td>
+                                    {% endfor %}
+                                </tr>
+                            </table>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
                 {% if req_lookup.blocks %}
                 <div class="result-item" style="margin-top:12px;">
-                    <strong>Requirement information</strong>
+                    <strong>Requirement information (indexed text)</strong>
                     {% for item in req_lookup.blocks %}
                     <div class="summary-box" style="margin-top:10px;">
                         <div class="meta"><strong>{{ item.requirement_id or '-' }}</strong> · {{ item.document_name }}</div>
@@ -6157,6 +6188,78 @@ def normalize_requirement_lookup_id(raw_query):
     return query
 
 
+def requirement_id_matches_text(req_id, text):
+    req = (req_id or "").strip().lower()
+    value = (text or "").strip().lower()
+    if not req or not value:
+        return False
+    if req in value:
+        return True
+    req_compact = re.sub(r"[^a-z0-9]+", "", req)
+    value_compact = re.sub(r"[^a-z0-9]+", "", value)
+    return bool(req_compact and req_compact in value_compact)
+
+
+def build_requirement_rows_from_tables(req_id, max_rows=10):
+    if not req_id:
+        return []
+
+    candidates = (
+        TablePreview.query.filter(
+            db.or_(
+                TablePreview.csv_text.ilike(f"%{req_id}%"),
+                TablePreview.csv_text_en.ilike(f"%{req_id}%"),
+                TablePreview.html_table.ilike(f"%{req_id}%"),
+                TablePreview.html_table_en.ilike(f"%{req_id}%"),
+            )
+        )
+        .order_by(TablePreview.id.desc())
+        .all()
+    )
+
+    rows = []
+    seen = set()
+    for table in candidates:
+        df = table_preview_to_dataframe(table, "nl")
+        if df is None or df.empty:
+            continue
+
+        columns = [str(col) for col in df.columns]
+        for row_idx, row in df.iterrows():
+            values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
+            if not any(requirement_id_matches_text(req_id, value) for value in values):
+                continue
+
+            row_position = int(cast(Any, row_idx))
+            row_key = (table.document_id, table.sheet_name or "", row_position)
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+
+            cells = []
+            for col_name, value in zip(columns, values):
+                if not value:
+                    continue
+                cells.append({"column": col_name, "value": value})
+            if not cells:
+                continue
+
+            doc = table.document
+            rows.append(
+                {
+                    "document_id": table.document_id,
+                    "document_name": doc.original_filename if doc else f"Document {table.document_id}",
+                    "sheet_name": table.sheet_name or "-",
+                    "table_format": table.table_format or "-",
+                    "row_number": row_position + 1,
+                    "cells": cells,
+                }
+            )
+            if len(rows) >= max_rows:
+                return rows
+    return rows
+
+
 def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     query = (raw_query or "").strip()
     normalized = normalize_requirement_lookup_id(query)
@@ -6184,7 +6287,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             .all()
         )
 
+    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
     matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
+    matched_doc_ids.update(row["document_id"] for row in requirement_rows if row.get("document_id"))
     filename_docs = DocumentRecord.query.filter(
         DocumentRecord.original_filename.ilike(f"%{normalized}%")
     ).all()
@@ -6245,11 +6350,13 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             break
 
     return {
-        "found": bool(block_rows or table_rows),
+        "found": bool(block_rows or table_rows or requirement_rows),
         "normalized_id": normalized,
+        "requirement_rows": requirement_rows,
         "blocks": block_rows,
         "tables": table_rows,
         "block_count": len(matched_blocks),
+        "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
     }
