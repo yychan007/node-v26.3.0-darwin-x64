@@ -506,26 +506,29 @@ def load_requirement_master_dataframe(doc, sheet_name=""):
     if not doc or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
         return None, ""
 
-    ext = (doc.extension or "").lower()
-    with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as path:
-        if ext == "csv":
-            _text, _offsets, tables = extract_text_from_csv(path)
-            for name, df in tables or []:
+    try:
+        ext = (doc.extension or "").lower()
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as path:
+            if ext == "csv":
+                _text, _offsets, tables = extract_text_from_csv(path)
+                for name, df in tables or []:
+                    prepared = prepare_requirement_master_storage_df(df)
+                    if not prepared.empty:
+                        return prepared, str(name or "CSV")
+                return None, ""
+
+            workbook = pd.ExcelFile(path)
+            target_sheets = [sheet_name] if sheet_name else list(workbook.sheet_names)
+            for name in target_sheets:
+                if name not in workbook.sheet_names:
+                    continue
+                raw_df = pd.read_excel(workbook, sheet_name=name, header=None, dtype=object)
+                df = normalize_excel_sheet(raw_df, max_rows=REQUIREMENT_MASTER_MAX_ROWS)
                 prepared = prepare_requirement_master_storage_df(df)
                 if not prepared.empty:
-                    return prepared, str(name or "CSV")
-            return None, ""
-
-        workbook = pd.ExcelFile(path)
-        target_sheets = [sheet_name] if sheet_name else list(workbook.sheet_names)
-        for name in target_sheets:
-            if name not in workbook.sheet_names:
-                continue
-            raw_df = pd.read_excel(workbook, sheet_name=name, header=None, dtype=object)
-            df = normalize_excel_sheet(raw_df, max_rows=REQUIREMENT_MASTER_MAX_ROWS)
-            prepared = prepare_requirement_master_storage_df(df)
-            if not prepared.empty:
-                return prepared, str(name)
+                    return prepared, str(name)
+    except Exception as exc:
+        print(f"Requirement master load error for {getattr(doc, 'original_filename', 'unknown')}: {exc}")
     return None, ""
 
 
@@ -3803,9 +3806,10 @@ def import_dictionary_sheet(file_path, sheet_name, original_filename, forced_ent
 
 def persist_dictionary_entries(source, entries, entry_kind):
     DictionaryEntry.query.filter_by(source_id=source.id).delete()
+    dict_entry_cls = cast(Any, DictionaryEntry)
     for entry in entries:
         db.session.add(
-            DictionaryEntry(
+            dict_entry_cls(
                 source_id=source.id,
                 term=entry["term"],
                 content=entry["content"],
@@ -3881,7 +3885,8 @@ def import_dictionary_excel(file_path, original_filename):
             storage.save_document(existing.stored_filename, file_path, DICT_FOLDER)
         else:
             stored_filename = f"{uuid.uuid4().hex}.xlsx"
-            source = DictionarySource(
+            dict_source_cls = cast(Any, DictionarySource)
+            source = dict_source_cls(
                 name=display_name,
                 original_filename=original_filename,
                 stored_filename=stored_filename,
@@ -5129,8 +5134,7 @@ HOME_TEMPLATE = """
                 <div class="meta" style="margin-top:10px;">
                     Requirement: <strong>{{ req_lookup.normalized_id or req_lookup_query }}</strong>
                     · Requirement rows: <strong>{{ req_lookup.requirement_row_count }}</strong>
-                    · Records: <strong>{{ req_lookup.block_count }}</strong>
-                    · Related documents: <strong>{{ req_lookup.document_count }}</strong>
+                    · Related Excel files: <strong>{{ req_lookup.document_count }}</strong>
                     · Tables: <strong>{{ req_lookup.table_count }}</strong>
                 </div>
 
@@ -5160,27 +5164,6 @@ HOME_TEMPLATE = """
                             <div style="white-space:pre-wrap; margin-top:4px;">{{ cell.value }}</div>
                         </div>
                         {% endfor %}
-                    </div>
-                    {% endfor %}
-                </div>
-                {% endif %}
-
-                {% if req_lookup.blocks %}
-                <div class="result-item" style="margin-top:12px;">
-                    <strong>Requirement information (indexed text)</strong>
-                    {% for item in req_lookup.blocks %}
-                    <div class="summary-box" style="margin-top:10px;">
-                        <div class="meta"><strong>{{ item.requirement_id or '-' }}</strong> · {{ item.document_name }}</div>
-                        {% if item.title %}<div><strong>Title:</strong> {{ item.title }}</div>{% endif %}
-                        {% if item.section %}<div><strong>Section:</strong> {{ item.section }}</div>{% endif %}
-                        {% if item.summary %}<div><strong>Summary:</strong> {{ item.summary }}</div>{% endif %}
-                        {% if item.definition %}<div><strong>Definition:</strong> {{ item.definition }}</div>{% endif %}
-                        {% if item.full_text %}
-                        <div style="margin-top:8px; white-space:pre-wrap;">{{ item.full_text }}</div>
-                        {% endif %}
-                        <div class="meta" style="margin-top:8px;">
-                            <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
-                        </div>
                     </div>
                     {% endfor %}
                 </div>
@@ -6987,32 +6970,36 @@ def build_requirement_rows_from_tables(req_id, max_rows=100):
     rows = []
     seen = set()
     for doc in get_requirement_master_documents():
-        df, sheet_name = load_requirement_master_dataframe(doc, sheet_name="")
-        if df is None or df.empty:
-            table = (
-                TablePreview.query.filter_by(document_id=doc.id)
-                .order_by(TablePreview.id.desc())
-                .first()
-            )
-            if table:
-                df = table_preview_to_dataframe(table, "nl")
-                sheet_name = table.sheet_name or sheet_name
-        if df is None or df.empty:
-            continue
+        try:
+            df, sheet_name = load_requirement_master_dataframe(doc, sheet_name="")
+            if df is None or df.empty:
+                table = (
+                    TablePreview.query.filter_by(document_id=doc.id)
+                    .order_by(TablePreview.id.desc())
+                    .first()
+                )
+                if table:
+                    df = table_preview_to_dataframe(table, "nl")
+                    sheet_name = table.sheet_name or sheet_name
+            if df is None or df.empty:
+                continue
 
-        collect_requirement_rows_from_dataframe(
-            df,
-            req_id,
-            document_id=doc.id,
-            document_name=doc.original_filename or f"Document {doc.id}",
-            sheet_name=sheet_name,
-            table_format=doc.extension or "xlsx",
-            max_rows=max_rows,
-            seen=seen,
-            rows=rows,
-        )
-        if len(rows) >= max_rows:
-            break
+            collect_requirement_rows_from_dataframe(
+                df,
+                req_id,
+                document_id=doc.id,
+                document_name=doc.original_filename or f"Document {doc.id}",
+                sheet_name=sheet_name,
+                table_format=doc.extension or "xlsx",
+                max_rows=max_rows,
+                seen=seen,
+                rows=rows,
+            )
+            if len(rows) >= max_rows:
+                break
+        except Exception as exc:
+            print(f"Requirement master search error for {getattr(doc, 'original_filename', 'unknown')}: {exc}")
+            continue
 
     rows.sort(key=lambda item: (item.get("spec_code") or "", item.get("row_number") or 0))
     return rows
@@ -7035,39 +7022,13 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             "master_source_count": len(get_requirement_master_documents()),
         }
 
-    key = normalized.lower()
     base_lookup = is_base_requirement_lookup_id(normalized)
     row_limit = 100 if base_lookup else 20
-
-    if base_lookup:
-        matched_blocks = (
-            RequirementBlock.query.filter(
-                db.or_(
-                    db.func.lower(RequirementBlock.requirement_id) == key,
-                    RequirementBlock.requirement_id.ilike(f"{normalized}%"),
-                )
-            )
-            .order_by(RequirementBlock.id.desc())
-            .all()
-        )
-    else:
-        exact_blocks = RequirementBlock.query.filter(
-            db.func.lower(RequirementBlock.requirement_id) == key
-        ).all()
-        if exact_blocks:
-            matched_blocks = exact_blocks
-        else:
-            matched_blocks = (
-                RequirementBlock.query.filter(RequirementBlock.requirement_id.ilike(f"%{normalized}%"))
-                .order_by(RequirementBlock.id.desc())
-                .all()
-            )
-
     requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=row_limit)
-    matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
-    matched_doc_ids.update(row["document_id"] for row in requirement_rows if row.get("document_id"))
+    matched_doc_ids = set()
     for doc in DocumentRecord.query.filter(
-        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER
+        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
+        DocumentRecord.extension.in_(("csv", "xlsx")),
     ).all():
         if document_matches_requirement_lookup(doc, normalized):
             matched_doc_ids.add(doc.id)
@@ -7102,38 +7063,13 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             if len(table_rows) >= table_limit:
                 break
 
-    block_rows = []
-    seen_blocks = set()
-    for block in sorted(
-        matched_blocks,
-        key=lambda b: ((b.page or 0), (b.char_start or 0), -(b.id or 0)),
-    ):
-        if block.id in seen_blocks:
-            continue
-        seen_blocks.add(block.id)
-        doc = block.document
-        block_rows.append(
-            {
-                "block_id": block.id,
-                "requirement_id": block.requirement_id or "",
-                "title": block.title or "",
-                "section": block.section or "",
-                "summary": block.summary or "",
-                "definition": block.definition or "",
-                "full_text": block.full_text or "",
-                "document_name": doc.original_filename if doc else f"Document {block.document_id}",
-            }
-        )
-        if len(block_rows) >= max_blocks:
-            break
-
     return {
-        "found": bool(block_rows or table_rows or requirement_rows),
+        "found": bool(table_rows or requirement_rows),
         "normalized_id": normalized,
         "requirement_rows": requirement_rows,
-        "blocks": block_rows,
+        "blocks": [],
         "tables": table_rows,
-        "block_count": len(matched_blocks),
+        "block_count": 0,
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
