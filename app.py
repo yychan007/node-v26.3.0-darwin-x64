@@ -5723,6 +5723,23 @@ DOCS_TEMPLATE = """
 
     <form method="POST" action="{{ url_for('bulk_delete_documents') }}">
         <div class="panel-title" style="margin-top:8px;">Indexed documents</div>
+        <div class="small" style="margin:6px 0 10px 0; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+            <span>Showing page <strong>{{ docs_page }}</strong> / {{ docs_total_pages }} ({{ docs_page_size }} per page)</span>
+            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=1, check_files=('1' if check_files else '0')) }}">First</a>
+            {% if docs_page > 1 %}
+            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_page-1, check_files=('1' if check_files else '0')) }}">Prev</a>
+            {% endif %}
+            {% if docs_page < docs_total_pages %}
+            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_page+1, check_files=('1' if check_files else '0')) }}">Next</a>
+            {% endif %}
+            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_total_pages, check_files=('1' if check_files else '0')) }}">Last</a>
+            {% if not check_files %}
+            <a class="btn btn-purple btn-small" href="{{ url_for('admin_documents', page=docs_page, check_files=1) }}">Check file availability</a>
+            <span>(This may be slower)</span>
+            {% else %}
+            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_page, check_files=0) }}">Stop checking files</a>
+            {% endif %}
+        </div>
         <div style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             <button type="submit" formaction="{{ url_for('bulk_reindex_documents') }}" class="btn btn-green" onclick="return confirmBulkReindex();">Reindex Selected</button>
             <button type="submit" formaction="{{ url_for('bulk_reindex_documents_async') }}" class="btn btn-purple" onclick="return confirmBulkReindexAsync(this.form);">Reindex Selected (background)</button>
@@ -5762,7 +5779,9 @@ DOCS_TEMPLATE = """
                 <td>{{ 'Yes' if d.is_ocr else 'No' }}</td>
                 <td>{{ d.status }}</td>
                 <td>
-                    {% if row.file_available %}
+                    {% if row.file_available is none %}
+                    <span style="color:#6c757d; font-weight:700;">Unknown</span>
+                    {% elif row.file_available %}
                     <span style="color:#198754; font-weight:700;">OK</span>
                     {% else %}
                     <span style="color:#dc3545; font-weight:700;">Missing</span>
@@ -7607,24 +7626,44 @@ def admin_users():
     return render_template_string(USERS_TEMPLATE, users=users)
 
 def build_admin_documents_page_context():
-    docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
-    stored_files = storage.list_stored_document_filenames(DOC_FOLDER)
-    if stored_files is None:
-        stored_files = {
-            doc.stored_filename
-            for doc in docs
-            if storage.document_exists(doc.stored_filename, DOC_FOLDER)
-        }
+    # This page can become slow if we list or HEAD-check every stored file.
+    # By default we skip storage checks; users can opt-in via ?check_files=1.
+    check_files = request.args.get("check_files", "0").strip() in {"1", "true", "yes", "on"}
+    page = max(1, request.args.get("page", 1, type=int) or 1)
+    page_size = 200
+    total_docs = DocumentRecord.query.count()
+    total_pages = max(1, math.ceil(total_docs / page_size))
+    page = min(page, total_pages)
+    docs = (
+        DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    stored_files = None
+    if check_files:
+        stored_files = storage.list_stored_document_filenames(DOC_FOLDER)
+        if stored_files is None:
+            stored_files = {
+                doc.stored_filename
+                for doc in docs
+                if storage.document_exists(doc.stored_filename, DOC_FOLDER)
+            }
 
     return {
         "doc_rows": [
             {
                 "record": doc,
-                "file_available": doc.stored_filename in stored_files,
+                "file_available": (doc.stored_filename in stored_files) if stored_files is not None else None,
             }
             for doc in docs
         ],
-        "doc_count": len(docs),
+        "doc_count": total_docs,
+        "docs_page": page,
+        "docs_total_pages": total_pages,
+        "docs_page_size": page_size,
+        "check_files": check_files,
         "block_count": RequirementBlock.query.count(),
         "table_count": TablePreview.query.count(),
         "storage_usage": build_storage_usage_summary(),
