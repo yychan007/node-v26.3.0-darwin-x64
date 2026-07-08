@@ -6963,13 +6963,14 @@ def collect_requirement_rows_from_dataframe(
             return
 
 
-def build_requirement_rows_from_tables(req_id, max_rows=100):
+def build_requirement_rows_from_tables(req_id, max_rows=100, master_documents=None):
     if not req_id:
         return []
 
     rows = []
     seen = set()
-    for doc in get_requirement_master_documents():
+    master_documents = master_documents if master_documents is not None else get_requirement_master_documents()
+    for doc in master_documents:
         try:
             df, sheet_name = load_requirement_master_dataframe(doc, sheet_name="")
             if df is None or df.empty:
@@ -7005,9 +7006,32 @@ def build_requirement_rows_from_tables(req_id, max_rows=100):
     return rows
 
 
+def find_matching_requirement_table_document_ids(lookup_id):
+    if not lookup_id:
+        return set()
+
+    candidate_docs = (
+        DocumentRecord.query.filter(
+            DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
+            DocumentRecord.extension.in_(("csv", "xlsx")),
+            db.or_(
+                DocumentRecord.original_filename.ilike(f"%{lookup_id}%"),
+                DocumentRecord.stored_filename.ilike(f"%{lookup_id}%"),
+            ),
+        )
+        .all()
+    )
+    return {
+        doc.id
+        for doc in candidate_docs
+        if document_matches_requirement_lookup(doc, lookup_id)
+    }
+
+
 def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     query = (raw_query or "").strip()
     normalized = normalize_requirement_lookup_id(query)
+    master_documents = get_requirement_master_documents()
     if not normalized:
         return {
             "found": False,
@@ -7019,19 +7043,17 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             "document_count": 0,
             "requirement_rows": [],
             "requirement_row_count": 0,
-            "master_source_count": len(get_requirement_master_documents()),
+            "master_source_count": len(master_documents),
         }
 
     base_lookup = is_base_requirement_lookup_id(normalized)
     row_limit = 100 if base_lookup else 20
-    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=row_limit)
-    matched_doc_ids = set()
-    for doc in DocumentRecord.query.filter(
-        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
-        DocumentRecord.extension.in_(("csv", "xlsx")),
-    ).all():
-        if document_matches_requirement_lookup(doc, normalized):
-            matched_doc_ids.add(doc.id)
+    requirement_rows = build_requirement_rows_from_tables(
+        normalized,
+        max_rows=row_limit,
+        master_documents=master_documents,
+    )
+    matched_doc_ids = find_matching_requirement_table_document_ids(normalized)
 
     table_limit = max(max_tables, 12 if base_lookup else max_tables)
     table_rows = []
@@ -7073,7 +7095,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
-        "master_source_count": len(get_requirement_master_documents()),
+        "master_source_count": len(master_documents),
     }
 
 

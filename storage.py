@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 _s3_client = None
+_storage_status_cache = {"expires_at": 0.0, "value": None}
+_STORAGE_STATUS_TTL_SECONDS = 15.0
 
 
 def r2_enabled():
@@ -86,9 +88,14 @@ def format_storage_error(exc):
 
 
 def get_storage_status():
+    now = time.monotonic()
+    cached = _storage_status_cache.get("value")
+    if cached is not None and now < float(_storage_status_cache.get("expires_at", 0.0)):
+        return dict(cached)
+
     backend = storage_backend_name()
     if not object_storage_enabled():
-        return {
+        status = {
             "ok": True,
             "backend": backend,
             "persistent": False,
@@ -96,6 +103,9 @@ def get_storage_status():
             "key_prefix": "",
             "message": "Files are saved on local disk only (lost after Render restart).",
         }
+        _storage_status_cache["value"] = dict(status)
+        _storage_status_cache["expires_at"] = now + _STORAGE_STATUS_TTL_SECONDS
+        return status
 
     bucket = bucket_name()
     prefix = key_prefix()
@@ -118,6 +128,8 @@ def get_storage_status():
         client.head_bucket(Bucket=bucket)
         status["ok"] = True
         status["message"] = f"Connected to bucket '{bucket}'."
+        _storage_status_cache["value"] = dict(status)
+        _storage_status_cache["expires_at"] = now + _STORAGE_STATUS_TTL_SECONDS
         return status
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
@@ -133,14 +145,20 @@ def get_storage_status():
             )
         else:
             status["hint"] = format_storage_error(exc)
+        _storage_status_cache["value"] = dict(status)
+        _storage_status_cache["expires_at"] = now + _STORAGE_STATUS_TTL_SECONDS
         return status
     except (BotoCoreError, RuntimeError) as exc:
         status["message"] = str(exc)
         status["hint"] = format_storage_error(exc)
+        _storage_status_cache["value"] = dict(status)
+        _storage_status_cache["expires_at"] = now + _STORAGE_STATUS_TTL_SECONDS
         return status
     except Exception as exc:
         status["message"] = str(exc)
         status["hint"] = format_storage_error(exc)
+        _storage_status_cache["value"] = dict(status)
+        _storage_status_cache["expires_at"] = now + _STORAGE_STATUS_TTL_SECONDS
         return status
 
 
