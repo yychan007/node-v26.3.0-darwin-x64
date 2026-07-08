@@ -43,6 +43,9 @@ import zipfile
 import tempfile
 import mimetypes
 import xml.etree.ElementTree as ET
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -157,6 +160,8 @@ MAX_INDEX_FILE_MB = env_int("MAX_INDEX_FILE_MB", 40 if IS_PRODUCTION else 0)
 TEXT_PREVIEW_LIMIT = env_int("TEXT_PREVIEW_LIMIT", 150000)
 TRANSLATE_MAX_CELLS = env_int("TRANSLATE_MAX_CELLS", 500)
 STORAGE_QUOTA_MB = env_int("STORAGE_QUOTA_MB", 1024)
+
+INDEX_JOB_WORKERS = env_int("INDEX_JOB_WORKERS", 1)
 
 
 DEFAULT_DATA_DIR = BASE_DIR / "data"
@@ -564,6 +569,23 @@ class TablePreview(db.Model):
     preview_title = db.Column(db.String(255), default="")
 
 
+class IndexJob(db.Model):
+    __tablename__ = "index_jobs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    job_type = db.Column(db.String(50), default="bulk_reindex")
+    status = db.Column(db.String(20), default="queued", index=True)  # queued|running|completed|failed
+    document_ids_json = db.Column(db.Text, default="[]")
+    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+    progress_current = db.Column(db.Integer, default=0)
+    progress_total = db.Column(db.Integer, default=0)
+    message = db.Column(db.Text, default="")
+    error = db.Column(db.Text, default="")
+
+
 class TranslationCache(db.Model):
     __tablename__ = "translation_cache"
 
@@ -644,6 +666,189 @@ def is_admin():
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+INDEX_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, INDEX_JOB_WORKERS))
+_INDEX_JOB_LOCK = threading.Lock()
+
+
+def _now_utc():
+    return datetime.utcnow()
+
+
+def _safe_json_loads(text, default):
+    try:
+        return json.loads(text or "")
+    except Exception:
+        return default
+
+
+def index_job_status_label(status):
+    return {
+        "queued": "Queued",
+        "running": "Running",
+        "completed": "Completed",
+        "failed": "Failed",
+    }.get(status or "", status or "-")
+
+
+def job_to_dict(job):
+    return {
+        "id": job.id,
+        "job_type": job.job_type,
+        "status": job.status,
+        "status_label": index_job_status_label(job.status),
+        "created_at": (job.created_at.isoformat() if job.created_at else ""),
+        "started_at": (job.started_at.isoformat() if job.started_at else ""),
+        "finished_at": (job.finished_at.isoformat() if job.finished_at else ""),
+        "progress_current": int(job.progress_current or 0),
+        "progress_total": int(job.progress_total or 0),
+        "message": job.message or "",
+        "error": job.error or "",
+        "document_ids": _safe_json_loads(job.document_ids_json, []),
+    }
+
+
+def _set_job(job_id, **fields):
+    job = db.session.get(IndexJob, job_id)
+    if not job:
+        return
+    for key, value in fields.items():
+        setattr(job, key, value)
+    db.session.commit()
+
+
+def run_bulk_reindex_job(job_id):
+    with app.app_context():
+        job = db.session.get(IndexJob, job_id)
+        if not job:
+            return
+
+        doc_ids = []
+        for raw_id in _safe_json_loads(job.document_ids_json, []):
+            try:
+                doc_ids.append(int(raw_id))
+            except Exception:
+                continue
+
+        total = len(doc_ids)
+        _set_job(
+            job_id,
+            status="running",
+            started_at=_now_utc(),
+            progress_current=0,
+            progress_total=total,
+            message=f"Starting reindex for {total} document(s)…",
+            error="",
+        )
+
+        reindexed_count = 0
+        missing_count = 0
+        error_count = 0
+        error_names = []
+
+        for idx, document_id in enumerate(doc_ids, start=1):
+            try:
+                doc = db.session.get(DocumentRecord, document_id)
+                if not doc:
+                    missing_count += 1
+                    _set_job(
+                        job_id,
+                        progress_current=idx,
+                        message=f"Missing document id={document_id} ({idx}/{total})",
+                    )
+                    continue
+
+                _set_job(
+                    job_id,
+                    progress_current=idx - 1,
+                    message=f"Reindexing: {doc.original_filename} ({idx}/{total})",
+                )
+                index_document_record(doc)
+                reindexed_count += 1
+                _set_job(
+                    job_id,
+                    progress_current=idx,
+                    message=f"Reindexed: {doc.original_filename} ({idx}/{total})",
+                )
+            except Exception as exc:
+                db.session.rollback()
+                error_count += 1
+                try:
+                    doc = db.session.get(DocumentRecord, document_id)
+                    if doc:
+                        error_names.append(doc.original_filename)
+                except Exception:
+                    pass
+                _set_job(
+                    job_id,
+                    progress_current=idx,
+                    message=f"Error reindexing document id={document_id} ({idx}/{total})",
+                    error=str(exc),
+                )
+
+        summary = (
+            f"Bulk reindex completed. Reindexed: {reindexed_count}, "
+            f"Missing: {missing_count}, Errors: {error_count}."
+        )
+        if error_names:
+            preview = ", ".join(error_names[:5])
+            if len(error_names) > 5:
+                preview += f" (+{len(error_names) - 5} more)"
+            summary += f" Failed: {preview}."
+
+        _set_job(
+            job_id,
+            status="completed" if error_count == 0 else "failed",
+            finished_at=_now_utc(),
+            progress_current=total,
+            progress_total=total,
+            message=summary,
+        )
+
+
+def enqueue_bulk_reindex_job(document_ids, created_by=None):
+    raw_ids = []
+    for raw in document_ids or []:
+        try:
+            raw_ids.append(int(raw))
+        except Exception:
+            continue
+    if not raw_ids:
+        raise ValueError("No valid documents selected.")
+
+    job_cls = cast(Any, IndexJob)
+    job = job_cls(
+        job_type="bulk_reindex",
+        status="queued",
+        document_ids_json=json.dumps(raw_ids),
+        created_by=created_by,
+        created_at=_now_utc(),
+        progress_current=0,
+        progress_total=len(raw_ids),
+        message=f"Queued reindex for {len(raw_ids)} document(s).",
+        error="",
+    )
+    db.session.add(job)
+    db.session.commit()
+
+    def _submit():
+        try:
+            run_bulk_reindex_job(job.id)
+        except Exception as exc:
+            with app.app_context():
+                db.session.rollback()
+                _set_job(
+                    job.id,
+                    status="failed",
+                    finished_at=_now_utc(),
+                    error=str(exc),
+                    message="Job crashed unexpectedly.",
+                )
+
+    with _INDEX_JOB_LOCK:
+        INDEX_JOB_EXECUTOR.submit(_submit)
+    return job
 
 def sha256_of_file(path, chunk_size=1024 * 1024):
     h = hashlib.sha256()
@@ -5488,10 +5693,39 @@ DOCS_TEMPLATE = """
         </div>
     </div>
 
+    {% if index_jobs %}
+    <div class="stats-panel" id="index-jobs-panel">
+        <div class="panel-title">Background index jobs</div>
+        <div class="small" style="margin-top:6px;">
+            Jobs run in the background to avoid request timeouts. This page auto-refreshes job status.
+        </div>
+        <table class="data-table" style="width:100%; margin-top:12px;">
+            <tr>
+                <th style="width:80px;">Job ID</th>
+                <th style="width:110px;">Status</th>
+                <th style="width:120px;">Progress</th>
+                <th>Message</th>
+                <th style="width:220px;">Created</th>
+            </tr>
+            {% for j in index_jobs %}
+            {% set job = job_to_dict(j) %}
+            <tr data-job-id="{{ job.id }}" class="index-job-row">
+                <td>#{{ job.id }}</td>
+                <td class="job-status">{{ job.status_label }}</td>
+                <td class="job-progress">{{ job.progress_current }}/{{ job.progress_total }}</td>
+                <td class="job-message" style="white-space:pre-wrap;">{{ job.message }}</td>
+                <td>{{ job.created_at }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+    {% endif %}
+
     <form method="POST" action="{{ url_for('bulk_delete_documents') }}">
         <div class="panel-title" style="margin-top:8px;">Indexed documents</div>
         <div style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             <button type="submit" formaction="{{ url_for('bulk_reindex_documents') }}" class="btn btn-green" onclick="return confirmBulkReindex();">Reindex Selected</button>
+            <button type="submit" formaction="{{ url_for('bulk_reindex_documents_async') }}" class="btn btn-purple" onclick="return confirmBulkReindexAsync(this.form);">Reindex Selected (background)</button>
             <button type="submit" class="btn btn-orange" onclick="return confirmBulkDelete();">Delete Selected</button>
             <button type="button" class="btn btn-gray" onclick="toggleAll(true)">Select All</button>
             <button type="button" class="btn btn-gray" onclick="toggleAll(false)">Clear All</button>
@@ -5587,6 +5821,20 @@ function confirmBulkReindex() {
     return confirm('Reindex ' + checked.length + ' selected document(s)? This may take a while.');
 }
 
+function confirmBulkReindexAsync(form) {
+    const checked = document.querySelectorAll('.doc-checkbox:checked');
+    if (checked.length === 0) {
+        alert('Please select at least one document to reindex.');
+        return false;
+    }
+    const ok = confirm(
+        'Queue background reindex for ' + checked.length + ' selected document(s)? ' +
+        'You can leave this page and come back later.'
+    );
+    if (!ok) return false;
+    return true;
+}
+
 function handleUploadSubmit(form) {
     const btn = form.querySelector('#upload-submit-btn');
     if (!btn || btn.disabled) {
@@ -5607,6 +5855,36 @@ function handleUploadSubmit(form) {
             target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
     }
+})();
+
+(function () {
+    const jobRows = Array.from(document.querySelectorAll('.index-job-row'));
+    if (!jobRows.length) return;
+
+    async function refreshOne(row) {
+        const jobId = row.getAttribute('data-job-id');
+        if (!jobId) return;
+        try {
+            const res = await fetch('/api/index-job/' + jobId);
+            if (!res.ok) return;
+            const data = await res.json();
+            const statusEl = row.querySelector('.job-status');
+            const progressEl = row.querySelector('.job-progress');
+            const msgEl = row.querySelector('.job-message');
+            if (statusEl) statusEl.textContent = data.status_label || data.status || '-';
+            if (progressEl) progressEl.textContent = (data.progress_current || 0) + '/' + (data.progress_total || 0);
+            if (msgEl) msgEl.textContent = data.message || '';
+        } catch (e) {
+            // ignore polling errors
+        }
+    }
+
+    async function refreshAll() {
+        await Promise.all(jobRows.map(refreshOne));
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 2500);
 })();
 </script>
 </body>
@@ -7223,6 +7501,17 @@ def api_translate_all(document_id):
     )
 
 
+@app.route("/api/index-job/<int:job_id>")
+@login_required
+def api_index_job(job_id):
+    if not is_admin():
+        abort(403)
+    job = db.session.get(IndexJob, job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job_to_dict(job))
+
+
 @app.route("/document/<int:document_id>/export-translation-pdf")
 @login_required
 def export_translation_pdf(document_id):
@@ -7345,6 +7634,8 @@ def build_admin_documents_page_context():
         "storage_status": storage.get_storage_status(),
         "document_type_options": DOCUMENT_TYPE_OPTIONS,
         "document_type_label": document_type_label,
+        "index_jobs": IndexJob.query.order_by(IndexJob.created_at.desc()).limit(10).all(),
+        "job_to_dict": job_to_dict,
     }
 
 
@@ -7601,6 +7892,30 @@ def bulk_reindex_documents():
         summary += f" Failed: {preview}."
     flash(summary, "success" if error_count == 0 else "warning")
     return redirect_admin_documents("admin-feedback")
+
+
+@app.route("/reindex-multiple-async", methods=["POST"])
+@login_required
+def bulk_reindex_documents_async():
+    if not is_admin():
+        abort(403)
+
+    raw_ids = request.form.getlist("document_ids")
+    if not raw_ids:
+        flash("No documents selected.", "warning")
+        return redirect_admin_documents("admin-feedback")
+
+    try:
+        job = enqueue_bulk_reindex_job(raw_ids, created_by=current_user.id)
+        flash(
+            f"Queued background reindex job #{job.id} for {len(_safe_json_loads(job.document_ids_json, []))} document(s).",
+            "success",
+        )
+    except Exception as exc:
+        db.session.rollback()
+        flash(f"Could not queue background reindex: {exc}", "error")
+
+    return redirect_admin_documents("index-jobs-panel")
 
 
 @app.route("/delete/<int:document_id>")
@@ -8118,6 +8433,7 @@ def ensure_schema():
     from sqlalchemy import inspect, text
 
     inspector = inspect(db.engine)
+    existing_tables = set(inspector.get_table_names())
     doc_cols = {col["name"] for col in inspector.get_columns("documents")}
     if "page_offsets_json" not in doc_cols:
         db.session.execute(text("ALTER TABLE documents ADD COLUMN page_offsets_json TEXT"))
@@ -8193,6 +8509,9 @@ def ensure_schema():
             db.session.commit()
 
     if "document_page_translations" not in inspector.get_table_names():
+        db.create_all()
+
+    if "index_jobs" not in existing_tables:
         db.create_all()
 
 
