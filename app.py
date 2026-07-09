@@ -4030,7 +4030,9 @@ def build_document_fallback_results(query, active_terms, seen_keys, top_k=10):
             continue
         seen_keys.add(key)
 
-        results.append(enrich_result_with_translation({
+        results.append(
+            enrich_search_result_with_bilingual_fields(
+                enrich_result_with_translation({
             "block_id": None,
             "document_id": doc.id,
             "filename": doc.original_filename,
@@ -4052,7 +4054,10 @@ def build_document_fallback_results(query, active_terms, seen_keys, top_k=10):
             "ocr_used": doc.is_ocr,
             "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
             "is_document_fallback": True,
-        }))
+                }),
+                doc,
+            )
+        )
 
     results.sort(
         key=lambda item: (
@@ -4129,7 +4134,9 @@ def search_requirements(query, top_k=30, active_terms=None):
             query,
             row.page,
         )
-        results.append(enrich_result_with_translation({
+        results.append(
+            enrich_search_result_with_bilingual_fields(
+                enrich_result_with_translation({
             "block_id": row.id,
             "document_id": doc.id,
             "filename": doc.original_filename,
@@ -4152,7 +4159,10 @@ def search_requirements(query, top_k=30, active_terms=None):
             "ocr_used": doc.is_ocr,
             "is_image": doc.extension.lower() in {"png", "jpg", "jpeg"},
             "is_document_fallback": False,
-        }))
+                }),
+                doc,
+            )
+        )
 
     if len(results) < top_k:
         fallback = build_document_fallback_results(
@@ -4774,6 +4784,67 @@ a:hover { text-decoration:underline; }
 </style>
 """
 
+REQUIREMENT_BILINGUAL_TABLE_MACRO = """
+{% macro requirement_bilingual_table(item) %}
+<div class="table-scroll-wrap" style="margin-top:8px;">
+    <table class="data-table requirement-bilingual-table" style="width:100%; min-width:720px;">
+        <tr>
+            <th style="width:50%;">Dutch (Original)</th>
+            <th style="width:50%;">English (Translation)</th>
+        </tr>
+        <tr>
+            <td class="req-number-cell">
+                {% if item.requirement_id %}
+                <strong>Requirement number: {{ item.requirement_id }}</strong>
+                {% else %}
+                -
+                {% endif %}
+            </td>
+            <td class="req-number-cell">
+                {% if item.requirement_id %}
+                <strong>Requirement number: {{ item.requirement_id }}</strong>
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>
+                {% if item.title_nl %}
+                <strong>Title:</strong> {{ item.title_nl }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+            <td>
+                {% if item.title_en %}
+                {{ item.title_en }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>
+                {% if item.applicable_nl %}
+                Applicable Discriminators Distance security: {{ item.applicable_nl }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+            <td>
+                {% if item.applicable_en %}
+                {{ item.applicable_en }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+</div>
+{% endmacro %}
+"""
+
 HOME_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -4783,6 +4854,7 @@ HOME_TEMPLATE = """
 """ + BASE_CSS + """
 </head>
 <body>
+""" + REQUIREMENT_BILINGUAL_TABLE_MACRO + """
 <div class="container">
     <div class="topbar">
         <div class="topbar-brand">
@@ -4937,62 +5009,7 @@ HOME_TEMPLATE = """
                             · Page: {{ item.page }}
                             {% endif %}
                         </div>
-                        <div class="table-scroll-wrap" style="margin-top:8px;">
-                            <table class="data-table requirement-bilingual-table" style="width:100%; min-width:720px;">
-                                <tr>
-                                    <th style="width:50%;">Dutch (Original)</th>
-                                    <th style="width:50%;">English (Translation)</th>
-                                </tr>
-                                <tr>
-                                    <td class="req-number-cell">
-                                        {% if item.requirement_id %}
-                                        <strong>Requirement number: {{ item.requirement_id }}</strong>
-                                        {% else %}
-                                        -
-                                        {% endif %}
-                                    </td>
-                                    <td class="req-number-cell">
-                                        {% if item.requirement_id %}
-                                        <strong>Requirement number: {{ item.requirement_id }}</strong>
-                                        {% else %}
-                                        -
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td>
-                                        {% if item.title_nl %}
-                                        <strong>Title:</strong> {{ item.title_nl }}
-                                        {% else %}
-                                        -
-                                        {% endif %}
-                                    </td>
-                                    <td>
-                                        {% if item.title_en %}
-                                        {{ item.title_en }}
-                                        {% else %}
-                                        -
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td>
-                                        {% if item.applicable_nl %}
-                                        Applicable Discriminators Distance security: {{ item.applicable_nl }}
-                                        {% else %}
-                                        -
-                                        {% endif %}
-                                    </td>
-                                    <td>
-                                        {% if item.applicable_en %}
-                                        {{ item.applicable_en }}
-                                        {% else %}
-                                        -
-                                        {% endif %}
-                                    </td>
-                                </tr>
-                            </table>
-                        </div>
+                        {{ requirement_bilingual_table(item) }}
                         <div class="meta" style="margin-top:8px;">
                             {% if item.block_id %}
                             <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
@@ -5236,18 +5253,21 @@ HOME_TEMPLATE = """
                     </div>
                     {% endif %}
 
-                    {% if res.definition %}
+                    {% if res.definition and not res.show_bilingual_table %}
                         <div class="meta-secondary">Definition (NL): ({{ res.definition }})</div>
                     {% endif %}
-                    {% if res.summary %}
+                    {% if res.summary and not res.show_bilingual_table %}
                         <div class="meta-secondary">Summary (NL): ({{ res.summary }})</div>
                     {% endif %}
-                    {% if res.section and res.major_section and res.section != res.major_section %}
+                    {% if res.section and res.major_section and res.section != res.major_section and not res.show_bilingual_table %}
                         <div class="meta-secondary">Subsection (NL): ({{ res.section }})</div>
-                    {% elif res.section and not res.major_section %}
+                    {% elif res.section and not res.major_section and not res.show_bilingual_table %}
                         <div class="meta-secondary">Section (NL): ({{ res.section }})</div>
                     {% endif %}
 
+                    {% if res.show_bilingual_table %}
+                    {{ requirement_bilingual_table(res) }}
+                    {% else %}
                     <div class="snippet-columns">
                         <div class="snippet-panel snippet-panel-original">
                             <strong>Table 1 / Dutch (Original)</strong>
@@ -5260,6 +5280,7 @@ HOME_TEMPLATE = """
                         </div>
                         {% endif %}
                     </div>
+                    {% endif %}
 
                     <div class="meta">
                         {% if res.is_document_fallback %}
@@ -6733,6 +6754,35 @@ def _get_requirement_page_translation_text(doc, page_num):
     except Exception as exc:
         print(f"Requirement page translation error for doc {doc.id} page {page_num}: {exc}")
         return ""
+
+
+def enrich_search_result_with_bilingual_fields(result_dict, doc):
+    requirement_id = (result_dict.get("requirement_id") or "").strip()
+    if not requirement_id:
+        requirement_id = normalize_requirement_lookup_id(result_dict.get("filename") or "")
+
+    full_text_nl = (result_dict.get("full_text") or "").strip()
+    page_num = int(result_dict.get("page") or 1)
+    ext = (doc.extension or "").lower() if doc else ""
+
+    if doc and ext in {"pdf", "docx", "txt"}:
+        if not full_text_nl:
+            full_text_nl = (doc.text_preview or "").strip()
+        if not full_text_nl:
+            full_text_nl = get_document_full_text(doc)
+
+    translated_text = _get_requirement_page_translation_text(doc, page_num) if doc else ""
+    fields = _build_requirement_content_fields(requirement_id, full_text_nl, translated_text)
+    result_dict.update(fields)
+    if requirement_id:
+        result_dict["requirement_id"] = requirement_id
+
+    result_dict["show_bilingual_table"] = bool(
+        requirement_id
+        or fields.get("title_nl")
+        or fields.get("applicable_nl")
+    )
+    return result_dict
 
 
 def _build_requirement_content_fields(requirement_id, full_text_nl, full_text_en=""):
