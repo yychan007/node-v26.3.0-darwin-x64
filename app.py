@@ -4714,16 +4714,22 @@ HOME_TEMPLATE = """
                     <strong>Requirement information (indexed text)</strong>
                     {% for item in req_lookup.blocks %}
                     <div class="summary-box" style="margin-top:10px;">
-                        <div class="meta"><strong>{{ item.requirement_id or '-' }}</strong> · {{ item.document_name }}</div>
-                        {% if item.title %}<div><strong>Title:</strong> {{ item.title }}</div>{% endif %}
-                        {% if item.section %}<div><strong>Section:</strong> {{ item.section }}</div>{% endif %}
-                        {% if item.summary %}<div><strong>Summary:</strong> {{ item.summary }}</div>{% endif %}
-                        {% if item.definition %}<div><strong>Definition:</strong> {{ item.definition }}</div>{% endif %}
-                        {% if item.full_text %}
-                        <div style="margin-top:8px; white-space:pre-wrap;">{{ item.full_text }}</div>
-                        {% endif %}
-                        <div class="meta" style="margin-top:8px;">
-                            <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                        <div class="meta">
+                            <strong>{{ item.requirement_id or '-' }}</strong>
+                            · {{ item.document_name }}
+                            · <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                        </div>
+                        <div class="table-scroll-wrap" style="margin-top:8px;">
+                            <table class="data-table" style="width:100%;">
+                                <tr><th style="width:220px;">Field</th><th>Value</th></tr>
+                                <tr><td>Requirement ID</td><td>{{ item.requirement_id or '-' }}</td></tr>
+                                <tr><td>Document</td><td>{{ item.document_name or '-' }}</td></tr>
+                                <tr><td>Title</td><td style="white-space:pre-wrap;">{{ item.title or '-' }}</td></tr>
+                                <tr><td>Section</td><td style="white-space:pre-wrap;">{{ item.section or '-' }}</td></tr>
+                                <tr><td>Summary</td><td style="white-space:pre-wrap;">{{ item.summary or '-' }}</td></tr>
+                                <tr><td>Definition</td><td style="white-space:pre-wrap;">{{ item.definition or '-' }}</td></tr>
+                                <tr><td>Full text</td><td style="white-space:pre-wrap;">{{ item.full_text or '-' }}</td></tr>
+                            </table>
                         </div>
                     </div>
                     {% endfor %}
@@ -4737,6 +4743,20 @@ HOME_TEMPLATE = """
                     <div class="summary-box" style="margin-top:10px;">
                         <div><strong>{{ t.document_name }}</strong></div>
                         <div class="meta">Sheet: {{ t.sheet_name }} · Format: {{ t.table_format }}</div>
+                        <div style="margin-top:8px;">
+                            <strong>Table 1 / Dutch (Original)</strong>
+                            <div class="table-scroll-wrap" style="margin-top:6px;">
+                                <div class="data-table">{{ t.html_table|safe }}</div>
+                            </div>
+                        </div>
+                        {% if t.html_table_en %}
+                        <div style="margin-top:10px;">
+                            <strong>Table 2 / English (Translation)</strong>
+                            <div class="table-scroll-wrap" style="margin-top:6px;">
+                                <div class="data-table">{{ t.html_table_en|safe }}</div>
+                            </div>
+                        </div>
+                        {% endif %}
                         <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open table</a>
                     </div>
                     {% endfor %}
@@ -6440,6 +6460,8 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                     "document_name": doc.original_filename if doc else f"Document {row.document_id}",
                     "sheet_name": row.sheet_name or "-",
                     "table_format": row.table_format or "-",
+                    "html_table": render_table_preview_html(row, "nl"),
+                    "html_table_en": render_table_preview_html(row, "en"),
                 }
             )
             if len(table_rows) >= max_tables:
