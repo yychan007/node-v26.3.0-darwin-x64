@@ -2040,7 +2040,15 @@ def normalize_excel_sheet(raw_df, max_rows=200):
     if sum(1 for value in header_cells if value) < 2:
         return finalize_display_dataframe(sheet, max_rows=max_rows)
 
-    data_end_row = min(len(sheet), header_row_idx + max_rows + 5)
+    header_keys = {
+        re.sub(r"[^a-z0-9]+", "", value.strip().lower())
+        for value in header_cells
+        if value.strip()
+    }
+    is_master_sheet = "speccode" in header_keys and "sourcedocument" in header_keys
+    effective_max_rows = len(sheet) if is_master_sheet else max_rows
+
+    data_end_row = min(len(sheet), header_row_idx + effective_max_rows + 5)
     block = sheet.iloc[header_row_idx:data_end_row]
 
     keep_col_indexes = []
@@ -2060,7 +2068,7 @@ def normalize_excel_sheet(raw_df, max_rows=200):
 
     body = block.iloc[1:].copy()
     body.columns = dedupe_column_names(headers)
-    return finalize_display_dataframe(body, max_rows=max_rows)
+    return finalize_display_dataframe(body, max_rows=effective_max_rows)
 
 def ocr_pdf(path):
     if not TESSERACT_AVAILABLE or pytesseract is None or convert_from_path is None:
@@ -2722,11 +2730,13 @@ def prepare_table_display(full_df, footnotes_override=None):
 
 
 def build_table_html(df):
-    full_df = finalize_display_dataframe(df, max_rows=40)
+    full_max_rows = max(len(df.index) + 5, 40) if df is not None else 40
+    full_df = finalize_display_dataframe(df, max_rows=full_max_rows)
     if full_df.empty:
         return "", pd.DataFrame()
 
-    html_table, _preview_df, _footnotes = prepare_table_display(full_df)
+    preview_df = finalize_display_dataframe(full_df, max_rows=40)
+    html_table, _preview_df, _footnotes = prepare_table_display(preview_df)
     return html_table, full_df
 
 
@@ -6364,57 +6374,68 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not variants:
         return []
 
-    candidates = TablePreview.query.order_by(TablePreview.id.desc()).all()
-
     rows = []
     seen = set()
-    for table in candidates:
-        df = table_preview_to_dataframe(table, "nl")
-        if df is None or df.empty:
-            continue
-        doc = table.document
-        if not (
-            is_tennet_requirements_document(doc)
-            or is_requirement_master_table_dataframe(df)
-        ):
-            continue
-
-        columns = [str(col) for col in df.columns]
-        for row_idx, row in df.iterrows():
-            values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
-            if not any(
-                requirement_id_matches_text(variant, value)
-                for variant in variants
-                for value in values
-            ):
-                continue
-
-            row_position = int(cast(Any, row_idx))
-            row_key = (table.document_id, table.sheet_name or "", row_position)
-            if row_key in seen:
-                continue
-            seen.add(row_key)
-
-            cells = []
-            for col_name, value in zip(columns, values):
-                if not value:
-                    continue
-                cells.append({"column": col_name, "value": value})
-            if not cells:
-                continue
-
-            rows.append(
-                {
-                    "document_id": table.document_id,
-                    "document_name": doc.original_filename if doc else f"Document {table.document_id}",
-                    "sheet_name": table.sheet_name or "-",
-                    "table_format": table.table_format or "-",
-                    "row_number": row_position + 1,
-                    "cells": cells,
-                }
+    tennet_docs = (
+        DocumentRecord.query.filter(
+            db.or_(
+                DocumentRecord.original_filename.ilike("%tennet%requirement%"),
+                DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
             )
-            if len(rows) >= max_rows:
-                return rows
+        )
+        .order_by(DocumentRecord.id.desc())
+        .all()
+    )
+
+    for doc in tennet_docs:
+        if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+            continue
+        try:
+            with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+                _text, _page_offsets, tables = extract_text_from_xlsx(full_path)
+        except Exception as exc:
+            print(f"Requirement master scan error for {doc.original_filename}: {exc}")
+            continue
+
+        for sheet_name, df in tables:
+            if df is None or df.empty or not is_requirement_master_table_dataframe(df):
+                continue
+            columns = [str(col) for col in df.columns]
+            for row_idx, row in df.iterrows():
+                values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
+                if not any(
+                    requirement_id_matches_text(variant, value)
+                    for variant in variants
+                    for value in values
+                ):
+                    continue
+
+                row_position = int(cast(Any, row_idx))
+                row_key = (doc.id, str(sheet_name or ""), row_position)
+                if row_key in seen:
+                    continue
+                seen.add(row_key)
+
+                cells = []
+                for col_name, value in zip(columns, values):
+                    if not value:
+                        continue
+                    cells.append({"column": col_name, "value": value})
+                if not cells:
+                    continue
+
+                rows.append(
+                    {
+                        "document_id": doc.id,
+                        "document_name": doc.original_filename or f"Document {doc.id}",
+                        "sheet_name": str(sheet_name or "-"),
+                        "table_format": doc.extension or "-",
+                        "row_number": row_position + 1,
+                        "cells": cells,
+                    }
+                )
+                if len(rows) >= max_rows:
+                    return rows
     return rows
 
 
