@@ -4777,13 +4777,13 @@ HOME_TEMPLATE = """
 <div class="container">
     <div class="topbar">
         <div class="topbar-brand">
-            <h1>Technical Standards Search Portal</h1>
+            <h1>{% if search_mode == 'general' %}Normal Search{% else %}Requirement Browser{% endif %}</h1>
             <div class="small">Requirement-level search for PDF, TXT, CSV, XLSX, DOCX</div>
         </div>
         <div class="actions">
+            <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
             <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
             <a class="btn btn-gray" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
-            <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
             <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
         </div>
     </div>
@@ -4929,7 +4929,28 @@ HOME_TEMPLATE = """
                             · Page: {{ item.page }}
                             {% endif %}
                         </div>
-                        {% if item.snippet %}
+                        {% if item.requirement_id %}
+                        <div class="meta" style="margin-top:8px;">
+                            <strong>Requirement number:</strong> {{ item.requirement_id }}
+                        </div>
+                        {% endif %}
+                        {% if item.title_nl %}
+                        <div class="meta" style="margin-top:6px;">
+                            <strong>Title:</strong> {{ item.title_nl }}
+                            {% if item.title_en %}
+                            <span> (English version: {{ item.title_en }})</span>
+                            {% endif %}
+                        </div>
+                        {% endif %}
+                        {% if item.applicable_nl %}
+                        <div class="meta" style="margin-top:6px; white-space:pre-wrap;">
+                            <strong>Applicable Discriminators Distance security:</strong>
+                            {{ item.applicable_nl }}
+                            {% if item.applicable_en %}
+                            <span> (English version: {{ item.applicable_en }})</span>
+                            {% endif %}
+                        </div>
+                        {% elif item.snippet %}
                         <div class="snippet" style="margin-top:8px;">{{ item.snippet }}</div>
                         {% endif %}
                         <div class="meta" style="margin-top:8px;">
@@ -6507,6 +6528,91 @@ def sort_requirement_rows_by_query(rows, query_id):
     )
 
 
+def _collapse_requirement_text(text):
+    cleaned = compact_display_text(text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _extract_requirement_title(requirement_id, title, full_text):
+    if (title or "").strip():
+        return (title or "").strip()
+    lines = [ln.strip() for ln in compact_display_text(full_text or "").splitlines() if ln.strip()]
+    req_lower = (requirement_id or "").strip().lower()
+    for line in lines:
+        if req_lower and req_lower in line.lower():
+            continue
+        if len(line) < 4:
+            continue
+        return line
+    return ""
+
+
+def _extract_applicable_discriminators_text(full_text):
+    source = compact_display_text(full_text or "")
+    if not source:
+        return ""
+    markers = [
+        "Applicable Discriminators",
+        "Distance security",
+        "Distantie beveiliging",
+        "De distantiefunctie",
+    ]
+    lower_source = source.lower()
+    for marker in markers:
+        pos = lower_source.find(marker.lower())
+        if pos != -1:
+            excerpt = source[pos:pos + 1200]
+            break
+    else:
+        excerpt = source[:1200]
+    return _collapse_requirement_text(excerpt)
+
+
+def _build_requirement_browser_content_row(block):
+    doc = block.document
+    if not doc:
+        return None
+    ext = (doc.extension or "").lower()
+    page_num = block.page or 1
+
+    full_text_nl = block.full_text or ""
+    title_nl = _extract_requirement_title(block.requirement_id, block.title, full_text_nl)
+    applicable_nl = _extract_applicable_discriminators_text(full_text_nl)
+
+    title_en = ""
+    applicable_en = ""
+    page_translation = DocumentPageTranslation.query.filter_by(
+        document_id=doc.id, page=page_num
+    ).first()
+    if page_translation and (page_translation.translated_text or "").strip():
+        translated_text = page_translation.translated_text or ""
+        title_en = _extract_requirement_title(block.requirement_id, "", translated_text)
+        applicable_en = _extract_applicable_discriminators_text(translated_text)
+
+    if not title_en and title_nl:
+        title_en = (translate_to_english(title_nl) or "").strip()
+    if not applicable_en and applicable_nl:
+        applicable_en = (translate_to_english(applicable_nl) or "").strip()
+
+    return {
+        "block_id": block.id,
+        "document_id": doc.id,
+        "document_name": doc.original_filename or f"Document {doc.id}",
+        "requirement_id": block.requirement_id or "",
+        "title": block.title or "",
+        "section": block.major_section or block.section or "",
+        "page": page_num,
+        "snippet": compact_display_text(block.full_text or "")[:900].rstrip() + ("..." if len(compact_display_text(block.full_text or "")) > 900 else ""),
+        "title_nl": title_nl,
+        "title_en": title_en,
+        "applicable_nl": applicable_nl,
+        "applicable_en": applicable_en,
+        "is_pdf": ext == "pdf",
+        "is_docx": ext == "docx",
+        "is_txt": ext == "txt",
+    }
+
+
 def _append_requirement_rows_from_dataframe(rows, seen, df, doc, sheet_name, variants, max_rows):
     columns = [str(col) for col in df.columns]
     for row_idx, row in df.iterrows():
@@ -6770,25 +6876,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         if doc_key in seen_block_docs:
             continue
         seen_block_docs.add(doc_key)
-        snippet = compact_display_text(block.full_text or "")
-        if len(snippet) > 900:
-            snippet = snippet[:900].rstrip() + "..."
-        ext = (doc.extension or "").lower()
-        block_rows.append(
-            {
-                "block_id": block.id,
-                "document_id": doc.id,
-                "document_name": doc.original_filename or f"Document {doc.id}",
-                "requirement_id": block.requirement_id or "",
-                "title": block.title or "",
-                "section": block.major_section or block.section or "",
-                "page": block.page or 1,
-                "snippet": snippet,
-                "is_pdf": ext == "pdf",
-                "is_docx": ext == "docx",
-                "is_txt": ext == "txt",
-            }
-        )
+        formatted_row = _build_requirement_browser_content_row(block)
+        if formatted_row:
+            block_rows.append(formatted_row)
 
     matched_doc_ids = {row["document_id"] for row in requirement_rows if row.get("document_id")}
     matched_doc_ids.update(row["document_id"] for row in block_rows if row.get("document_id"))
