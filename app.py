@@ -408,6 +408,17 @@ def should_skip_table_translation(doc):
     return is_tennet_requirements_document(doc)
 
 
+def is_requirement_master_table_dataframe(df):
+    if df is None or df.empty:
+        return False
+    normalized_columns = {
+        re.sub(r"[^a-z0-9]+", "", str(col).strip().lower())
+        for col in df.columns
+        if str(col).strip()
+    }
+    return "speccode" in normalized_columns and "sourcedocument" in normalized_columns
+
+
 class RequirementBlock(db.Model):
     __tablename__ = "requirement_blocks"
 
@@ -6272,27 +6283,19 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not variants:
         return []
 
-    tennet_docs = DocumentRecord.query.filter(
-        db.or_(
-            DocumentRecord.original_filename.ilike("%tennet%requirement%"),
-            DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
-        )
-    ).all()
-    tennet_doc_ids = [doc.id for doc in tennet_docs if doc.id]
-    if not tennet_doc_ids:
-        return []
-
-    candidates = (
-        TablePreview.query.filter(TablePreview.document_id.in_(tennet_doc_ids))
-        .order_by(TablePreview.id.desc())
-        .all()
-    )
+    candidates = TablePreview.query.order_by(TablePreview.id.desc()).all()
 
     rows = []
     seen = set()
     for table in candidates:
         df = table_preview_to_dataframe(table, "nl")
         if df is None or df.empty:
+            continue
+        doc = table.document
+        if not (
+            is_tennet_requirements_document(doc)
+            or is_requirement_master_table_dataframe(df)
+        ):
             continue
 
         columns = [str(col) for col in df.columns]
@@ -6319,7 +6322,6 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
             if not cells:
                 continue
 
-            doc = table.document
             rows.append(
                 {
                     "document_id": table.document_id,
@@ -6373,7 +6375,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         )
 
     requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
-    matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
+    matched_doc_ids = set()
 
     filename_filters = [
         DocumentRecord.original_filename.ilike(f"%{variant}%")
@@ -6455,33 +6457,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                 }
             )
 
-    parsed_blocks = []
-    if not row_based_blocks:
-        seen_blocks = set()
-        for block in sorted(
-            matched_blocks,
-            key=lambda b: ((b.page or 0), (b.char_start or 0), -(b.id or 0)),
-        ):
-            if block.id in seen_blocks:
-                continue
-            seen_blocks.add(block.id)
-            doc = block.document
-            parsed_blocks.append(
-                {
-                    "block_id": block.id,
-                    "requirement_id": block.requirement_id or "",
-                    "title": block.title or "",
-                    "section": block.section or "",
-                    "summary": block.summary or "",
-                    "definition": block.definition or "",
-                    "full_text": block.full_text or "",
-                    "document_name": doc.original_filename if doc else f"Document {block.document_id}",
-                }
-            )
-            if len(parsed_blocks) >= max_blocks:
-                break
-
-    block_rows = row_based_blocks if row_based_blocks else parsed_blocks
+    block_rows = row_based_blocks
 
     return {
         "found": bool(block_rows or table_rows or requirement_rows),
