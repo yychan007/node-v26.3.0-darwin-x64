@@ -173,6 +173,8 @@ for path in (DATA_DIR, DOC_FOLDER, DICT_FOLDER, PREVIEW_FOLDER, DATABASE_PATH.pa
 
 REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS = 300
 _requirement_master_scan_cache = {}
+REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS = 8.0
+REQUIREMENT_LOOKUP_MAX_MASTER_DOCS = 1
 
 
 def build_database_uri():
@@ -6445,6 +6447,7 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
             )
         )
         .order_by(DocumentRecord.id.desc())
+        .limit(REQUIREMENT_LOOKUP_MAX_MASTER_DOCS)
         .all()
     )
 
@@ -6457,6 +6460,13 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
             .all()
         )
         for table in preview_tables:
+            if (time.perf_counter() - started) > REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS:
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                return rows, {
+                    "documents_scanned": documents_scanned,
+                    "sheets_scanned": sheets_scanned,
+                    "elapsed_ms": elapsed_ms,
+                }
             doc = table.document
             if not doc:
                 continue
@@ -6474,8 +6484,19 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
                     "elapsed_ms": elapsed_ms,
                 }
 
+    # If preview path already found matches, return immediately.
+    if rows:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        return rows, {
+            "documents_scanned": documents_scanned,
+            "sheets_scanned": sheets_scanned,
+            "elapsed_ms": elapsed_ms,
+        }
+
     # Slow path: deep scan source Excel only when indexed previews miss.
     for doc in tennet_docs:
+        if (time.perf_counter() - started) > REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS:
+            break
         if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
             continue
         documents_scanned += 1
