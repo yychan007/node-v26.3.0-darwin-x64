@@ -6462,11 +6462,38 @@ def requirement_id_matches_text(req_id, text):
     value = (text or "").strip().lower()
     if not req or not value:
         return False
+    if req == value:
+        return True
     if req in value:
         return True
     req_compact = re.sub(r"[^a-z0-9]+", "", req)
     value_compact = re.sub(r"[^a-z0-9]+", "", value)
     return bool(req_compact and req_compact in value_compact)
+
+
+def requirement_row_spec_code(row):
+    for cell in row.get("cells", []):
+        col_key = re.sub(r"[^a-z0-9]+", "", str(cell.get("column", "")).lower())
+        if col_key == "speccode":
+            return normalize_requirement_lookup_id(cell.get("value", ""))
+    return ""
+
+
+def sort_requirement_rows_by_query(rows, query_id):
+    key = normalize_requirement_lookup_id(query_id).lower()
+    key_compact = re.sub(r"[^a-z0-9]+", "", key)
+
+    def priority(row):
+        spec = requirement_row_spec_code(row).lower()
+        spec_compact = re.sub(r"[^a-z0-9]+", "", spec)
+        if spec == key or spec_compact == key_compact:
+            return 0
+        return 1
+
+    return sorted(
+        rows,
+        key=lambda row: (priority(row), row.get("row_number") or 0),
+    )
 
 
 def _append_requirement_rows_from_dataframe(rows, seen, df, doc, sheet_name, variants, max_rows):
@@ -6509,7 +6536,7 @@ def _append_requirement_rows_from_dataframe(rows, seen, df, doc, sheet_name, var
     return False
 
 
-def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_rows=10):
+def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_collect=200):
     """
     Memory-safe scan: stream XLSX rows (read_only) and only materialize matched rows.
     """
@@ -6546,7 +6573,10 @@ def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_rows=10):
             iter_rows_fn = getattr(ws, "iter_rows", None)
             if not callable(iter_rows_fn):
                 continue
-            for body_row in cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True):
+            for excel_row_num, body_row in enumerate(
+                cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True),
+                start=header_row_idx + 1,
+            ):
                 if not body_row:
                     continue
                 cells = [normalize_cell_text(v) for v in body_row]
@@ -6569,11 +6599,11 @@ def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_rows=10):
                     matched.append(
                         {
                             "sheet_name": ws.title,
-                            "row_number": len(matched) + 1,
+                            "row_number": excel_row_num,
                             "cells": row_cells,
                         }
                     )
-                if len(matched) >= max_rows:
+                if len(matched) >= max_collect:
                     return matched, sheets_scanned
     finally:
         try:
@@ -6593,7 +6623,8 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         return [], {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0}
 
     started = time.perf_counter()
-    cache_key = (variants[0].lower(), max_rows)
+    normalized_id = normalize_requirement_lookup_id(req_id)
+    cache_key = (normalized_id.lower(), max_rows)
     cached = _requirement_master_result_cache.get(cache_key)
     now_ts = time.time()
     if cached and (now_ts - cached.get("ts", 0)) <= REQUIREMENT_MASTER_RESULT_CACHE_TTL_SECONDS:
@@ -6637,7 +6668,7 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         try:
             with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
                 matched_rows, sheet_count = _scan_requirement_master_xlsx_rows(
-                    full_path, variants, max_rows=max_rows
+                    full_path, variants, max_collect=max(max_rows * 20, 100)
                 )
                 sheets_scanned += sheet_count
         except Exception as exc:
@@ -6658,10 +6689,8 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
                     "cells": m.get("cells") or [],
                 }
             )
-            if len(rows) >= max_rows:
-                break
-        if len(rows) >= max_rows:
-            break
+
+    rows = sort_requirement_rows_by_query(rows, normalized_id)[:max_rows]
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     stats = {
