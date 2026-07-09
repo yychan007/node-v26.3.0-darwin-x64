@@ -206,6 +206,12 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = APP_SECRET_KEY
 app.config["SQLALCHEMY_DATABASE_URI"] = build_database_uri()
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    # Render/Postgres connections may drop; pre_ping avoids stale pooled conns.
+    "pool_pre_ping": True,
+    # Recycle periodically to reduce SSL EOF / idle disconnect issues.
+    "pool_recycle": 180,
+}
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["REMEMBER_COOKIE_HTTPONLY"] = True
@@ -219,6 +225,42 @@ login_manager = LoginManager(app)
 # Avoid static type issues with Flask-Login's stubs.
 setattr(login_manager, "login_view", "login")
 login_manager.login_message_category = "warning"
+
+
+@app.errorhandler(Exception)
+def _handle_unexpected_exception(exc):
+    try:
+        db.session.rollback()
+    except Exception:
+        pass
+    message = str(exc) or repr(exc)
+    return (
+        render_template_string(
+            """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Server error</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="container">
+    <h2>Internal Server Error</h2>
+    <div class="warning" style="margin-top:12px;">
+      <strong>Error:</strong> {{ message }}
+    </div>
+    <div class="notice" style="margin-top:12px;">
+      Try going back to <a href="{{ url_for('home') }}">Home</a>.
+    </div>
+  </div>
+</body>
+</html>
+""",
+            message=message,
+        ),
+        500,
+    )
 
 
 @app.context_processor
@@ -6439,17 +6481,26 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
     seen = set()
     documents_scanned = 0
     sheets_scanned = 0
-    tennet_docs = (
-        DocumentRecord.query.filter(
-            db.or_(
-                DocumentRecord.original_filename.ilike("%tennet%requirement%"),
-                DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
+    try:
+        tennet_docs = (
+            DocumentRecord.query.filter(
+                db.or_(
+                    DocumentRecord.original_filename.ilike("%tennet%requirement%"),
+                    DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
+                )
             )
+            .order_by(DocumentRecord.id.desc())
+            .limit(REQUIREMENT_LOOKUP_MAX_MASTER_DOCS)
+            .all()
         )
-        .order_by(DocumentRecord.id.desc())
-        .limit(REQUIREMENT_LOOKUP_MAX_MASTER_DOCS)
-        .all()
-    )
+    except Exception as exc:
+        db.session.rollback()
+        print(f"Requirement master DB query failed: {exc}")
+        return [], {
+            "documents_scanned": 0,
+            "sheets_scanned": 0,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
 
     # Fast path: use indexed table previews first.
     tennet_doc_ids = [doc.id for doc in tennet_docs if doc.id]
@@ -6682,6 +6733,7 @@ def home():
         try:
             req_lookup = build_requirement_lookup_result(req_lookup_query)
         except Exception as exc:
+            db.session.rollback()
             print(f"Requirement Browser error for '{req_lookup_query}': {exc}")
             req_lookup = {
                 "found": False,
@@ -6767,6 +6819,7 @@ def home():
             table_count=TablePreview.query.count(),
         )
     except Exception as exc:
+        db.session.rollback()
         print(f"Home render error: {exc}")
         safe_lookup = req_lookup or {
             "found": False,
