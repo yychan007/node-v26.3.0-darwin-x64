@@ -6653,27 +6653,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             if len(table_rows) >= max_tables:
                 break
 
-    row_based_blocks = []
-    if requirement_rows:
-        for row in requirement_rows[:max_blocks]:
-            cell_map = {str(c.get("column", "")).strip(): (c.get("value", "") or "") for c in row.get("cells", [])}
-            full_text = "\n".join(
-                f"{col}: {val}" for col, val in cell_map.items() if col and str(val).strip()
-            )
-            row_based_blocks.append(
-                {
-                    "block_id": None,
-                    "requirement_id": cell_map.get("specCode") or normalized,
-                    "title": cell_map.get("Dutch Title") or cell_map.get("English Title") or "",
-                    "section": cell_map.get("sourceDocument") or row.get("sheet_name") or "",
-                    "summary": cell_map.get("Dutch description") or cell_map.get("English Description") or "",
-                    "definition": cell_map.get("referredStandardDescription") or "",
-                    "full_text": full_text or (cell_map.get("amStatement") or ""),
-                    "document_name": row.get("document_name") or "Requirement table",
-                }
-            )
-
-    block_rows = row_based_blocks
+    # Keep UI consistent with the screenshot: show the full row as "Requirement information (from Excel rows)"
+    # and avoid rendering an extra "indexed text" field-by-field list.
+    block_rows = []
 
     return {
         "found": bool(block_rows or table_rows or requirement_rows),
