@@ -51,6 +51,7 @@ from typing import Any, cast
 import pdfplumber
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 
@@ -69,6 +70,8 @@ from flask_login import (  # pyright: ignore[reportMissingImports]
     LoginManager, login_user, logout_user, login_required,
     current_user, UserMixin
 )
+from sqlalchemy.exc import OperationalError, PendingRollbackError  # pyright: ignore[reportMissingImports]
+from werkzeug.exceptions import HTTPException
 
 from PIL import Image
 
@@ -176,6 +179,9 @@ _requirement_master_scan_cache = {}
 REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS = 8.0
 REQUIREMENT_LOOKUP_MAX_MASTER_DOCS = 1
 
+REQUIREMENT_MASTER_RESULT_CACHE_TTL_SECONDS = 300
+_requirement_master_result_cache = {}
+
 
 def build_database_uri():
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -226,11 +232,44 @@ login_manager = LoginManager(app)
 setattr(login_manager, "login_view", "login")
 login_manager.login_message_category = "warning"
 
+def _db_recover_and_retry(fn, *, retries=1, label="db_op"):
+    """
+    Best-effort recovery for transient Postgres/SSL disconnects on Render.
+    Rolls back the session, disposes the engine, then retries.
+    """
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except (OperationalError, PendingRollbackError) as exc:
+            last_exc = exc
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+            try:
+                db.engine.dispose()
+            except Exception:
+                pass
+            if attempt >= retries:
+                raise
+            time.sleep(0.15)
+        except Exception as exc:
+            # Other exceptions should not be retried here.
+            raise
+    raise RuntimeError(f"{label} failed")  # pragma: no cover
+
 
 @app.errorhandler(Exception)
 def _handle_unexpected_exception(exc):
+    if isinstance(exc, HTTPException):
+        return exc
     try:
         db.session.rollback()
+    except Exception:
+        pass
+    try:
+        db.engine.dispose()
     except Exception:
         pass
     message = str(exc) or repr(exc)
@@ -3584,7 +3623,8 @@ def import_dictionary_excel(file_path, original_filename):
             storage.save_document(existing.stored_filename, file_path, DICT_FOLDER)
         else:
             stored_filename = f"{uuid.uuid4().hex}.xlsx"
-            source = DictionarySource(
+            source_cls = cast(Any, DictionarySource)
+            source = source_cls(
                 name=display_name,
                 original_filename=original_filename,
                 stored_filename=stored_filename,
@@ -3597,8 +3637,9 @@ def import_dictionary_excel(file_path, original_filename):
             storage.save_document(stored_filename, file_path, DICT_FOLDER)
 
         for entry in entries:
+            entry_cls = cast(Any, DictionaryEntry)
             db.session.add(
-                DictionaryEntry(
+                entry_cls(
                     source_id=source.id,
                     term=entry["term"],
                     content=entry["content"],
@@ -6468,6 +6509,81 @@ def _append_requirement_rows_from_dataframe(rows, seen, df, doc, sheet_name, var
     return False
 
 
+def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_rows=10):
+    """
+    Memory-safe scan: stream XLSX rows (read_only) and only materialize matched rows.
+    """
+    wb = load_workbook(filename=xlsx_path, read_only=True, data_only=True)
+    matched = []
+    sheets_scanned = 0
+
+    try:
+        for ws in cast(Any, wb.worksheets):
+            # Find header row within first 60 rows (row with most non-empty cells)
+            best_row = None
+            best_count = 0
+            for r_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=60, values_only=True), start=1):
+                values = [normalize_cell_text(v) for v in (row or [])]
+                count = sum(1 for v in values if v)
+                if count > best_count:
+                    best_count = count
+                    best_row = (r_idx, values)
+            if not best_row or best_count < 2:
+                continue
+
+            header_row_idx, header_values = best_row
+            header_keys = [
+                re.sub(r"[^a-z0-9]+", "", (h or "").strip().lower())
+                for h in header_values
+            ]
+            if "speccode" not in header_keys or "sourcedocument" not in header_keys:
+                continue
+
+            sheets_scanned += 1
+            spec_idx = header_keys.index("speccode")
+
+            # Stream the body rows
+            iter_rows_fn = getattr(ws, "iter_rows", None)
+            if not callable(iter_rows_fn):
+                continue
+            for body_row in cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True):
+                if not body_row:
+                    continue
+                cells = [normalize_cell_text(v) for v in body_row]
+                if spec_idx >= len(cells):
+                    continue
+                spec_val = cells[spec_idx]
+                if not spec_val:
+                    continue
+                if not any(requirement_id_matches_text(v, spec_val) for v in variants):
+                    continue
+
+                row_cells = []
+                for col_name, value in zip(header_values, cells):
+                    col = normalize_cell_text(col_name)
+                    if not col:
+                        continue
+                    if value:
+                        row_cells.append({"column": col, "value": value})
+                if row_cells:
+                    matched.append(
+                        {
+                            "sheet_name": ws.title,
+                            "row_number": len(matched) + 1,
+                            "cells": row_cells,
+                        }
+                    )
+                if len(matched) >= max_rows:
+                    return matched, sheets_scanned
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return matched, sheets_scanned
+
+
 def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not req_id:
         return [], {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0}
@@ -6477,24 +6593,33 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         return [], {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0}
 
     started = time.perf_counter()
+    cache_key = (variants[0].lower(), max_rows)
+    cached = _requirement_master_result_cache.get(cache_key)
+    now_ts = time.time()
+    if cached and (now_ts - cached.get("ts", 0)) <= REQUIREMENT_MASTER_RESULT_CACHE_TTL_SECONDS:
+        return cached.get("rows", []), cached.get("stats", {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0})
+
     rows = []
     seen = set()
     documents_scanned = 0
     sheets_scanned = 0
     try:
-        tennet_docs = (
-            DocumentRecord.query.filter(
-                db.or_(
-                    DocumentRecord.original_filename.ilike("%tennet%requirement%"),
-                    DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
+        tennet_docs = _db_recover_and_retry(
+            lambda: (
+                DocumentRecord.query.filter(
+                    db.or_(
+                        DocumentRecord.original_filename.ilike("%tennet%requirement%"),
+                        DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
+                    )
                 )
-            )
-            .order_by(DocumentRecord.id.desc())
-            .limit(REQUIREMENT_LOOKUP_MAX_MASTER_DOCS)
-            .all()
+                .order_by(DocumentRecord.id.desc())
+                .limit(REQUIREMENT_LOOKUP_MAX_MASTER_DOCS)
+                .all()
+            ),
+            retries=1,
+            label="tennet_docs",
         )
     except Exception as exc:
-        db.session.rollback()
         print(f"Requirement master DB query failed: {exc}")
         return [], {
             "documents_scanned": 0,
@@ -6502,49 +6627,7 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
         }
 
-    # Fast path: use indexed table previews first.
-    tennet_doc_ids = [doc.id for doc in tennet_docs if doc.id]
-    if tennet_doc_ids:
-        preview_tables = (
-            TablePreview.query.filter(TablePreview.document_id.in_(tennet_doc_ids))
-            .order_by(TablePreview.id.desc())
-            .all()
-        )
-        for table in preview_tables:
-            if (time.perf_counter() - started) > REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS:
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                return rows, {
-                    "documents_scanned": documents_scanned,
-                    "sheets_scanned": sheets_scanned,
-                    "elapsed_ms": elapsed_ms,
-                }
-            doc = table.document
-            if not doc:
-                continue
-            df = table_preview_to_dataframe(table, "nl")
-            if df is None or df.empty or not is_requirement_master_table_dataframe(df):
-                continue
-            sheets_scanned += 1
-            if _append_requirement_rows_from_dataframe(
-                rows, seen, df, doc, table.sheet_name, variants, max_rows
-            ):
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                return rows, {
-                    "documents_scanned": documents_scanned,
-                    "sheets_scanned": sheets_scanned,
-                    "elapsed_ms": elapsed_ms,
-                }
-
-    # If preview path already found matches, return immediately.
-    if rows:
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        return rows, {
-            "documents_scanned": documents_scanned,
-            "sheets_scanned": sheets_scanned,
-            "elapsed_ms": elapsed_ms,
-        }
-
-    # Slow path: deep scan source Excel only when indexed previews miss.
+    # Memory-safe path: stream scan source XLSX (avoid pandas/full table preview).
     for doc in tennet_docs:
         if (time.perf_counter() - started) > REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS:
             break
@@ -6552,38 +6635,42 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
             continue
         documents_scanned += 1
         try:
-            cache_key = f"{doc.id}:{doc.stored_filename}"
-            cached = _requirement_master_scan_cache.get(cache_key)
-            now_ts = time.time()
-            if cached and (now_ts - cached.get("ts", 0)) <= REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS:
-                tables = cached.get("tables", [])
-            else:
-                with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
-                    _text, _page_offsets, tables = extract_text_from_xlsx(full_path)
-                _requirement_master_scan_cache[cache_key] = {"ts": now_ts, "tables": tables}
+            with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+                matched_rows, sheet_count = _scan_requirement_master_xlsx_rows(
+                    full_path, variants, max_rows=max_rows
+                )
+                sheets_scanned += sheet_count
         except Exception as exc:
             print(f"Requirement master scan error for {doc.original_filename}: {exc}")
             continue
-
-        for sheet_name, df in tables:
-            if df is None or df.empty or not is_requirement_master_table_dataframe(df):
+        for m in matched_rows:
+            row_key = (doc.id, m.get("sheet_name") or "", m.get("row_number") or 0)
+            if row_key in seen:
                 continue
-            sheets_scanned += 1
-            if _append_requirement_rows_from_dataframe(
-                rows, seen, df, doc, sheet_name, variants, max_rows
-            ):
-                elapsed_ms = int((time.perf_counter() - started) * 1000)
-                return rows, {
-                    "documents_scanned": documents_scanned,
-                    "sheets_scanned": sheets_scanned,
-                    "elapsed_ms": elapsed_ms,
+            seen.add(row_key)
+            rows.append(
+                {
+                    "document_id": doc.id,
+                    "document_name": doc.original_filename or f"Document {doc.id}",
+                    "sheet_name": m.get("sheet_name") or "-",
+                    "table_format": doc.extension or "-",
+                    "row_number": m.get("row_number") or 0,
+                    "cells": m.get("cells") or [],
                 }
+            )
+            if len(rows) >= max_rows:
+                break
+        if len(rows) >= max_rows:
+            break
+
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    return rows, {
+    stats = {
         "documents_scanned": documents_scanned,
         "sheets_scanned": sheets_scanned,
         "elapsed_ms": elapsed_ms,
     }
+    _requirement_master_result_cache[cache_key] = {"ts": now_ts, "rows": rows, "stats": stats}
+    return rows, stats
 
 
 def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
@@ -6797,7 +6884,8 @@ def home():
                 end_idx = start_idx + RESULTS_PER_PAGE
                 results = all_results[start_idx:end_idx]
 
-        return render_template_string(
+        return _db_recover_and_retry(
+            lambda: render_template_string(
             HOME_TEMPLATE,
             query=query,
             results=results,
@@ -6817,6 +6905,9 @@ def home():
             doc_count=DocumentRecord.query.count(),
             block_count=RequirementBlock.query.count(),
             table_count=TablePreview.query.count(),
+            ),
+            retries=1,
+            label="home_render",
         )
     except Exception as exc:
         db.session.rollback()
