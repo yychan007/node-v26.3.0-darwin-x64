@@ -171,6 +171,9 @@ DATABASE_PATH = Path(
 for path in (DATA_DIR, DOC_FOLDER, DICT_FOLDER, PREVIEW_FOLDER, DATABASE_PATH.parent):
     path.mkdir(parents=True, exist_ok=True)
 
+REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS = 300
+_requirement_master_scan_cache = {}
+
 
 def build_database_uri():
     database_url = os.environ.get("DATABASE_URL", "").strip()
@@ -4775,6 +4778,11 @@ HOME_TEMPLATE = """
         </div>
 
         {% if req_lookup_query %}
+            {% if req_lookup and req_lookup.error_message %}
+                <div class="warning" style="margin-top:12px;">
+                    Requirement Browser error: <strong>{{ req_lookup.error_message }}</strong>
+                </div>
+            {% endif %}
             {% if req_lookup and req_lookup.found %}
                 <div class="meta" style="margin-top:10px;">
                     Requirement: <strong>{{ req_lookup.normalized_id or req_lookup_query }}</strong>
@@ -6376,6 +6384,46 @@ def requirement_id_matches_text(req_id, text):
     return bool(req_compact and req_compact in value_compact)
 
 
+def _append_requirement_rows_from_dataframe(rows, seen, df, doc, sheet_name, variants, max_rows):
+    columns = [str(col) for col in df.columns]
+    for row_idx, row in df.iterrows():
+        values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
+        if not any(
+            requirement_id_matches_text(variant, value)
+            for variant in variants
+            for value in values
+        ):
+            continue
+
+        row_position = int(cast(Any, row_idx))
+        row_key = (doc.id, str(sheet_name or ""), row_position)
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+
+        cells = []
+        for col_name, value in zip(columns, values):
+            if not value:
+                continue
+            cells.append({"column": col_name, "value": value})
+        if not cells:
+            continue
+
+        rows.append(
+            {
+                "document_id": doc.id,
+                "document_name": doc.original_filename or f"Document {doc.id}",
+                "sheet_name": str(sheet_name or "-"),
+                "table_format": doc.extension or "-",
+                "row_number": row_position + 1,
+                "cells": cells,
+            }
+        )
+        if len(rows) >= max_rows:
+            return True
+    return False
+
+
 def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not req_id:
         return [], {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0}
@@ -6400,13 +6448,47 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         .all()
     )
 
+    # Fast path: use indexed table previews first.
+    tennet_doc_ids = [doc.id for doc in tennet_docs if doc.id]
+    if tennet_doc_ids:
+        preview_tables = (
+            TablePreview.query.filter(TablePreview.document_id.in_(tennet_doc_ids))
+            .order_by(TablePreview.id.desc())
+            .all()
+        )
+        for table in preview_tables:
+            doc = table.document
+            if not doc:
+                continue
+            df = table_preview_to_dataframe(table, "nl")
+            if df is None or df.empty or not is_requirement_master_table_dataframe(df):
+                continue
+            sheets_scanned += 1
+            if _append_requirement_rows_from_dataframe(
+                rows, seen, df, doc, table.sheet_name, variants, max_rows
+            ):
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                return rows, {
+                    "documents_scanned": documents_scanned,
+                    "sheets_scanned": sheets_scanned,
+                    "elapsed_ms": elapsed_ms,
+                }
+
+    # Slow path: deep scan source Excel only when indexed previews miss.
     for doc in tennet_docs:
         if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
             continue
         documents_scanned += 1
         try:
-            with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
-                _text, _page_offsets, tables = extract_text_from_xlsx(full_path)
+            cache_key = f"{doc.id}:{doc.stored_filename}"
+            cached = _requirement_master_scan_cache.get(cache_key)
+            now_ts = time.time()
+            if cached and (now_ts - cached.get("ts", 0)) <= REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS:
+                tables = cached.get("tables", [])
+            else:
+                with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+                    _text, _page_offsets, tables = extract_text_from_xlsx(full_path)
+                _requirement_master_scan_cache[cache_key] = {"ts": now_ts, "tables": tables}
         except Exception as exc:
             print(f"Requirement master scan error for {doc.original_filename}: {exc}")
             continue
@@ -6415,47 +6497,15 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
             if df is None or df.empty or not is_requirement_master_table_dataframe(df):
                 continue
             sheets_scanned += 1
-            columns = [str(col) for col in df.columns]
-            for row_idx, row in df.iterrows():
-                values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
-                if not any(
-                    requirement_id_matches_text(variant, value)
-                    for variant in variants
-                    for value in values
-                ):
-                    continue
-
-                row_position = int(cast(Any, row_idx))
-                row_key = (doc.id, str(sheet_name or ""), row_position)
-                if row_key in seen:
-                    continue
-                seen.add(row_key)
-
-                cells = []
-                for col_name, value in zip(columns, values):
-                    if not value:
-                        continue
-                    cells.append({"column": col_name, "value": value})
-                if not cells:
-                    continue
-
-                rows.append(
-                    {
-                        "document_id": doc.id,
-                        "document_name": doc.original_filename or f"Document {doc.id}",
-                        "sheet_name": str(sheet_name or "-"),
-                        "table_format": doc.extension or "-",
-                        "row_number": row_position + 1,
-                        "cells": cells,
-                    }
-                )
-                if len(rows) >= max_rows:
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return rows, {
-                        "documents_scanned": documents_scanned,
-                        "sheets_scanned": sheets_scanned,
-                        "elapsed_ms": elapsed_ms,
-                    }
+            if _append_requirement_rows_from_dataframe(
+                rows, seen, df, doc, sheet_name, variants, max_rows
+            ):
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                return rows, {
+                    "documents_scanned": documents_scanned,
+                    "sheets_scanned": sheets_scanned,
+                    "elapsed_ms": elapsed_ms,
+                }
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     return rows, {
         "documents_scanned": documents_scanned,
@@ -6624,7 +6674,27 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
 def home():
     query = request.args.get("q", "").strip()
     req_lookup_query = request.args.get("req_lookup", "").strip()
-    req_lookup = build_requirement_lookup_result(req_lookup_query) if req_lookup_query else None
+    req_lookup = None
+    if req_lookup_query:
+        try:
+            req_lookup = build_requirement_lookup_result(req_lookup_query)
+        except Exception as exc:
+            print(f"Requirement Browser error for '{req_lookup_query}': {exc}")
+            req_lookup = {
+                "found": False,
+                "normalized_id": req_lookup_query,
+                "requirement_rows": [],
+                "blocks": [],
+                "tables": [],
+                "block_count": 0,
+                "requirement_row_count": 0,
+                "table_count": 0,
+                "document_count": 0,
+                "scan_elapsed_ms": 0,
+                "scan_documents": 0,
+                "scan_sheets": 0,
+                "error_message": str(exc),
+            }
     current_page = max(1, request.args.get("page", 1, type=int) or 1)
     total_pages = 1
     total_results = 0
