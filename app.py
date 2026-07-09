@@ -398,10 +398,14 @@ def is_requirement_master_document(doc):
     return normalize_document_type(getattr(doc, "document_type", None)) == DOCUMENT_TYPE_REQUIREMENT_MASTER
 
 
-def should_skip_table_translation(doc):
+def is_tennet_requirements_document(doc):
     filename = (getattr(doc, "original_filename", "") or "").lower()
     compact = re.sub(r"[^a-z0-9]+", "", filename)
     return "tennetrequirements" in compact
+
+
+def should_skip_table_translation(doc):
+    return is_tennet_requirements_document(doc)
 
 
 class RequirementBlock(db.Model):
@@ -6268,19 +6272,18 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not variants:
         return []
 
-    sql_matchers = []
-    for variant in variants:
-        sql_matchers.extend(
-            [
-                TablePreview.csv_text.ilike(f"%{variant}%"),
-                TablePreview.csv_text_en.ilike(f"%{variant}%"),
-                TablePreview.html_table.ilike(f"%{variant}%"),
-                TablePreview.html_table_en.ilike(f"%{variant}%"),
-            ]
+    tennet_docs = DocumentRecord.query.filter(
+        db.or_(
+            DocumentRecord.original_filename.ilike("%tennet%requirement%"),
+            DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
         )
+    ).all()
+    tennet_doc_ids = [doc.id for doc in tennet_docs if doc.id]
+    if not tennet_doc_ids:
+        return []
 
     candidates = (
-        TablePreview.query.filter(db.or_(*sql_matchers))
+        TablePreview.query.filter(TablePreview.document_id.in_(tennet_doc_ids))
         .order_by(TablePreview.id.desc())
         .all()
     )
@@ -6453,31 +6456,32 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             )
 
     parsed_blocks = []
-    seen_blocks = set()
-    for block in sorted(
-        matched_blocks,
-        key=lambda b: ((b.page or 0), (b.char_start or 0), -(b.id or 0)),
-    ):
-        if block.id in seen_blocks:
-            continue
-        seen_blocks.add(block.id)
-        doc = block.document
-        parsed_blocks.append(
-            {
-                "block_id": block.id,
-                "requirement_id": block.requirement_id or "",
-                "title": block.title or "",
-                "section": block.section or "",
-                "summary": block.summary or "",
-                "definition": block.definition or "",
-                "full_text": block.full_text or "",
-                "document_name": doc.original_filename if doc else f"Document {block.document_id}",
-            }
-        )
-        if len(parsed_blocks) >= max_blocks:
-            break
+    if not row_based_blocks:
+        seen_blocks = set()
+        for block in sorted(
+            matched_blocks,
+            key=lambda b: ((b.page or 0), (b.char_start or 0), -(b.id or 0)),
+        ):
+            if block.id in seen_blocks:
+                continue
+            seen_blocks.add(block.id)
+            doc = block.document
+            parsed_blocks.append(
+                {
+                    "block_id": block.id,
+                    "requirement_id": block.requirement_id or "",
+                    "title": block.title or "",
+                    "section": block.section or "",
+                    "summary": block.summary or "",
+                    "definition": block.definition or "",
+                    "full_text": block.full_text or "",
+                    "document_name": doc.original_filename if doc else f"Document {block.document_id}",
+                }
+            )
+            if len(parsed_blocks) >= max_blocks:
+                break
 
-    block_rows = (row_based_blocks + parsed_blocks)[:max_blocks]
+    block_rows = row_based_blocks if row_based_blocks else parsed_blocks
 
     return {
         "found": bool(block_rows or table_rows or requirement_rows),
@@ -6485,7 +6489,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         "requirement_rows": requirement_rows,
         "blocks": block_rows,
         "tables": table_rows,
-        "block_count": len(matched_blocks),
+        "block_count": len(block_rows),
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
