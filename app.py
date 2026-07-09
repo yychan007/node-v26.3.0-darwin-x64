@@ -4782,6 +4782,9 @@ HOME_TEMPLATE = """
                     · Records: <strong>{{ req_lookup.block_count }}</strong>
                     · Related documents: <strong>{{ req_lookup.document_count }}</strong>
                     · Tables: <strong>{{ req_lookup.table_count }}</strong>
+                    · Scan: <strong>{{ req_lookup.scan_elapsed_ms }} ms</strong>
+                    · Files: <strong>{{ req_lookup.scan_documents }}</strong>
+                    · Sheets: <strong>{{ req_lookup.scan_sheets }}</strong>
                 </div>
 
                 {% if req_lookup.requirement_rows %}
@@ -4873,6 +4876,13 @@ HOME_TEMPLATE = """
                 <div class="warning" style="margin-top:12px;">
                     No matching requirement data found for <strong>{{ req_lookup_query }}</strong>.
                 </div>
+                {% if req_lookup %}
+                <div class="meta" style="margin-top:8px;">
+                    Scan: <strong>{{ req_lookup.scan_elapsed_ms }} ms</strong>
+                    · Files: <strong>{{ req_lookup.scan_documents }}</strong>
+                    · Sheets: <strong>{{ req_lookup.scan_sheets }}</strong>
+                </div>
+                {% endif %}
             {% endif %}
         {% endif %}
     </div>
@@ -6368,14 +6378,17 @@ def requirement_id_matches_text(req_id, text):
 
 def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not req_id:
-        return []
+        return [], {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0}
 
     variants = requirement_lookup_variants(req_id)
     if not variants:
-        return []
+        return [], {"documents_scanned": 0, "sheets_scanned": 0, "elapsed_ms": 0}
 
+    started = time.perf_counter()
     rows = []
     seen = set()
+    documents_scanned = 0
+    sheets_scanned = 0
     tennet_docs = (
         DocumentRecord.query.filter(
             db.or_(
@@ -6390,6 +6403,7 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
     for doc in tennet_docs:
         if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
             continue
+        documents_scanned += 1
         try:
             with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
                 _text, _page_offsets, tables = extract_text_from_xlsx(full_path)
@@ -6400,6 +6414,7 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         for sheet_name, df in tables:
             if df is None or df.empty or not is_requirement_master_table_dataframe(df):
                 continue
+            sheets_scanned += 1
             columns = [str(col) for col in df.columns]
             for row_idx, row in df.iterrows():
                 values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
@@ -6435,8 +6450,18 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
                     }
                 )
                 if len(rows) >= max_rows:
-                    return rows
-    return rows
+                    elapsed_ms = int((time.perf_counter() - started) * 1000)
+                    return rows, {
+                        "documents_scanned": documents_scanned,
+                        "sheets_scanned": sheets_scanned,
+                        "elapsed_ms": elapsed_ms,
+                    }
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return rows, {
+        "documents_scanned": documents_scanned,
+        "sheets_scanned": sheets_scanned,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
@@ -6451,9 +6476,12 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             "block_count": 0,
             "table_count": 0,
             "document_count": 0,
+            "scan_elapsed_ms": 0,
+            "scan_documents": 0,
+            "scan_sheets": 0,
         }
 
-    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
+    requirement_rows, row_scan_stats = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
     variants = requirement_lookup_variants(normalized)
     key = normalized.lower()
 
@@ -6586,6 +6614,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
+        "scan_elapsed_ms": row_scan_stats.get("elapsed_ms", 0),
+        "scan_documents": row_scan_stats.get("documents_scanned", 0),
+        "scan_sheets": row_scan_stats.get("sheets_scanned", 0),
     }
 
 
