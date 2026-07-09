@@ -4801,6 +4801,7 @@ HOME_TEMPLATE = """
         (e.g. <strong>AC</strong>, <strong>declaration of performance</strong>).
     </div>
 
+    {% if search_mode != 'requirement' %}
     <form method="GET" action="/" id="search-form">
         <input type="text" name="q" value="{{ query }}" placeholder="Search requirement ID, Dutch/English keyword, section, definition">
         <button type="submit">Search</button>
@@ -4851,7 +4852,9 @@ HOME_TEMPLATE = """
         </div>
         {% endif %}
     </form>
+    {% endif %}
 
+    {% if search_mode != 'general' %}
     <div class="search-meta-panel" style="margin-top:16px;">
         <div class="panel-title">Requirement Browser</div>
         <form method="GET" action="/" id="requirement-browser-form">
@@ -4912,27 +4915,33 @@ HOME_TEMPLATE = """
 
                 {% if req_lookup.blocks %}
                 <div class="result-item" style="margin-top:12px;">
-                    <strong>Requirement information (indexed text)</strong>
+                    <strong>Related document content</strong>
                     {% for item in req_lookup.blocks %}
                     <div class="summary-box" style="margin-top:10px;">
                         <div class="meta">
-                            <strong>{{ item.requirement_id or '-' }}</strong>
-                            · {{ item.document_name }}
-                            {% if item.block_id %}
-                            · <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                            <strong>{{ item.document_name }}</strong>
+                            · Requirement: {{ item.requirement_id or '-' }}
+                            {% if item.section %}
+                            · Section: {{ item.section }}
+                            {% endif %}
+                            {% if item.page %}
+                            · Page: {{ item.page }}
                             {% endif %}
                         </div>
-                        <div class="table-scroll-wrap" style="margin-top:8px;">
-                            <table class="data-table" style="width:100%;">
-                                <tr><th style="width:220px;">Field</th><th>Value</th></tr>
-                                <tr><td>Requirement ID</td><td>{{ item.requirement_id or '-' }}</td></tr>
-                                <tr><td>Document</td><td>{{ item.document_name or '-' }}</td></tr>
-                                <tr><td>Title</td><td style="white-space:pre-wrap;">{{ item.title or '-' }}</td></tr>
-                                <tr><td>Section</td><td style="white-space:pre-wrap;">{{ item.section or '-' }}</td></tr>
-                                <tr><td>Summary</td><td style="white-space:pre-wrap;">{{ item.summary or '-' }}</td></tr>
-                                <tr><td>Definition</td><td style="white-space:pre-wrap;">{{ item.definition or '-' }}</td></tr>
-                                <tr><td>Full text</td><td style="white-space:pre-wrap;">{{ item.full_text or '-' }}</td></tr>
-                            </table>
+                        {% if item.snippet %}
+                        <div class="snippet" style="margin-top:8px;">{{ item.snippet }}</div>
+                        {% endif %}
+                        <div class="meta" style="margin-top:8px;">
+                            {% if item.block_id %}
+                            <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                            {% endif %}
+                            {% if item.is_pdf %}
+                            · <a href="{{ url_for('pdf_viewer', document_id=item.document_id, page=item.page or 1) }}" target="_blank">Open PDF</a>
+                            {% elif item.is_docx %}
+                            · <a href="{{ url_for('docx_viewer', document_id=item.document_id, page=item.page or 1) }}" target="_blank">Open DOCX</a>
+                            {% elif item.is_txt %}
+                            · <a href="{{ url_for('document_view', document_id=item.document_id, page=item.page or 1) }}" target="_blank">Open TXT</a>
+                            {% endif %}
                         </div>
                     </div>
                     {% endfor %}
@@ -4979,6 +4988,7 @@ HOME_TEMPLATE = """
             {% endif %}
         {% endif %}
     </div>
+    {% endif %}
 
     <script>
     function selectAllTerms(checked) {
@@ -5002,7 +5012,7 @@ HOME_TEMPLATE = """
         </div>
     {% endif %}
 
-    {% if query %}
+    {% if search_mode == 'general' and query %}
         {% if document_matches and current_page == 1 and 'drawings' in result_types %}
         <div class="search-meta-panel">
             <div class="panel-title">related drawings</div>
@@ -6724,14 +6734,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     key = normalized.lower()
 
     exact_blocks = (
-        RequirementBlock.query.join(DocumentRecord)
+        RequirementBlock.query
         .filter(db.func.lower(RequirementBlock.requirement_id) == key)
-        .filter(
-            db.or_(
-                DocumentRecord.original_filename.ilike("%tennet%requirement%"),
-                DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
-            )
-        )
+        .order_by(RequirementBlock.id.desc())
         .all()
     )
 
@@ -6746,19 +6751,46 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         matched_blocks = exact_blocks
     else:
         matched_blocks = (
-            RequirementBlock.query.join(DocumentRecord)
+            RequirementBlock.query
             .filter(db.or_(*variant_filters))
-            .filter(
-                db.or_(
-                    DocumentRecord.original_filename.ilike("%tennet%requirement%"),
-                    DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
-                )
-            )
             .order_by(RequirementBlock.id.desc())
             .all()
         )
 
+    block_rows = []
+    seen_block_docs = set()
+    for block in matched_blocks:
+        if len(block_rows) >= max_blocks:
+            break
+        doc = block.document
+        if not doc:
+            continue
+        doc_key = (doc.id, block.requirement_id or "", block.page or 1)
+        if doc_key in seen_block_docs:
+            continue
+        seen_block_docs.add(doc_key)
+        snippet = compact_display_text(block.full_text or "")
+        if len(snippet) > 900:
+            snippet = snippet[:900].rstrip() + "..."
+        ext = (doc.extension or "").lower()
+        block_rows.append(
+            {
+                "block_id": block.id,
+                "document_id": doc.id,
+                "document_name": doc.original_filename or f"Document {doc.id}",
+                "requirement_id": block.requirement_id or "",
+                "title": block.title or "",
+                "section": block.major_section or block.section or "",
+                "page": block.page or 1,
+                "snippet": snippet,
+                "is_pdf": ext == "pdf",
+                "is_docx": ext == "docx",
+                "is_txt": ext == "txt",
+            }
+        )
+
     matched_doc_ids = {row["document_id"] for row in requirement_rows if row.get("document_id")}
+    matched_doc_ids.update(row["document_id"] for row in block_rows if row.get("document_id"))
 
     filename_filters = [
         DocumentRecord.original_filename.ilike(f"%{variant}%")
@@ -6777,6 +6809,41 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     stored_name_docs = DocumentRecord.query.filter(db.or_(*stored_name_filters)).all()
     matched_doc_ids.update(d.id for d in filename_docs)
     matched_doc_ids.update(d.id for d in stored_name_docs)
+
+    content_rows = list(block_rows)
+    seen_content_doc_ids = {row.get("document_id") for row in content_rows}
+    related_docs = {}
+    for doc in filename_docs + stored_name_docs:
+        if doc and doc.id:
+            related_docs[doc.id] = doc
+    for doc_id, doc in related_docs.items():
+        if doc_id in seen_content_doc_ids:
+            continue
+        ext = (doc.extension or "").lower()
+        if ext not in {"pdf", "docx", "txt"}:
+            continue
+        text = compact_display_text((doc.text_preview or "").strip())
+        if not text:
+            text = compact_display_text(get_document_full_text(doc))
+        if len(text) > 900:
+            text = text[:900].rstrip() + "..."
+        content_rows.append(
+            {
+                "block_id": None,
+                "document_id": doc.id,
+                "document_name": doc.original_filename or f"Document {doc.id}",
+                "requirement_id": normalized,
+                "title": "",
+                "section": "",
+                "page": 1,
+                "snippet": text,
+                "is_pdf": ext == "pdf",
+                "is_docx": ext == "docx",
+                "is_txt": ext == "txt",
+            }
+        )
+        if len(content_rows) >= max_blocks:
+            break
 
     if not matched_doc_ids:
         table_doc_filters = []
@@ -6820,17 +6887,13 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             if len(table_rows) >= max_tables:
                 break
 
-    # Keep UI consistent with the screenshot: show the full row as "Requirement information (from Excel rows)"
-    # and avoid rendering an extra "indexed text" field-by-field list.
-    block_rows = []
-
     return {
-        "found": bool(block_rows or table_rows or requirement_rows),
+        "found": bool(content_rows or table_rows or requirement_rows),
         "normalized_id": normalized,
         "requirement_rows": requirement_rows,
-        "blocks": block_rows,
+        "blocks": content_rows,
         "tables": table_rows,
-        "block_count": len(block_rows),
+        "block_count": len(content_rows),
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
@@ -6842,8 +6905,10 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
 
 @app.route("/")
 def home():
-    query = request.args.get("q", "").strip()
+    raw_query = request.args.get("q", "").strip()
     req_lookup_query = request.args.get("req_lookup", "").strip()
+    search_mode = "requirement" if req_lookup_query else "general"
+    query = raw_query if search_mode == "general" else ""
     req_lookup = None
     if req_lookup_query:
         try:
@@ -6917,6 +6982,7 @@ def home():
             lambda: render_template_string(
             HOME_TEMPLATE,
             query=query,
+            search_mode=search_mode,
             results=results,
             document_matches=document_matches,
             table_results=table_results,
@@ -6960,6 +7026,7 @@ def home():
         return render_template_string(
             HOME_TEMPLATE,
             query=query,
+            search_mode=search_mode,
             results=[],
             document_matches=[],
             table_results=[],
