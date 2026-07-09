@@ -398,6 +398,12 @@ def is_requirement_master_document(doc):
     return normalize_document_type(getattr(doc, "document_type", None)) == DOCUMENT_TYPE_REQUIREMENT_MASTER
 
 
+def should_skip_table_translation(doc):
+    filename = (getattr(doc, "original_filename", "") or "").lower()
+    compact = re.sub(r"[^a-z0-9]+", "", filename)
+    return "tennetrequirements" in compact
+
+
 class RequirementBlock(db.Model):
     __tablename__ = "requirement_blocks"
 
@@ -514,7 +520,7 @@ def load_user(user_id):
 # Helpers
 # =========================================================
 def is_admin():
-    return current_user.is_authenticated and current_user.is_admin
+    return True
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -2711,6 +2717,8 @@ def translate_preview_df_to_html(preview_df, target_lang="en"):
 
 
 def save_table_previews(doc_id, tables):
+    doc = db.session.get(DocumentRecord, doc_id)
+    skip_translation = should_skip_table_translation(doc)
     for sheet_name, df in tables:
         if df is None:
             continue
@@ -2719,7 +2727,7 @@ def save_table_previews(doc_id, tables):
             continue
         html_table_en = ""
         csv_text_en = ""
-        if translation.translation_enabled():
+        if translation.translation_enabled() and not skip_translation:
             html_table_en, csv_text_en = translate_preview_df(full_df, "en")
         csv_buf = io.StringIO()
         full_df.to_csv(csv_buf, index=False)
@@ -2759,7 +2767,9 @@ def table_preview_needs_translation(tables):
     return False
 
 
-def refresh_table_translations_from_cache(tables):
+def refresh_table_translations_from_cache(tables, skip_translation=False):
+    if skip_translation:
+        return False
     updated = False
     for row in tables:
         needs_en = not (row.html_table_en or "").strip()
@@ -3980,7 +3990,7 @@ def search_table_results(query, top_k=20, active_terms=None):
     results = []
     for row in TablePreview.query.all():
         doc = row.document
-        if not doc or is_requirement_master_document(doc):
+        if not doc:
             continue
 
         searchable_parts = [
@@ -4025,7 +4035,7 @@ def search_table_results(query, top_k=20, active_terms=None):
                 "preview_title": row.preview_title or doc.original_filename,
                 "table_format": row.table_format or "xlsx",
                 "html_table": render_table_preview_html(row, "nl"),
-                "html_table_en": render_table_preview_html(row, "en"),
+                "html_table_en": "" if should_skip_table_translation(doc) else render_table_preview_html(row, "en"),
                 "relevance": round(score, 2),
             }
         )
@@ -4044,8 +4054,6 @@ def search_documents(query, top_k=10, active_terms=None):
     scored = []
 
     for doc in DocumentRecord.query.all():
-        if is_requirement_master_document(doc):
-            continue
         score = score_document_text(doc, query, active_terms, exact_terms)
         filename = (doc.original_filename or "").lower()
         stored = (doc.stored_filename or "").lower()
@@ -4579,18 +4587,9 @@ HOME_TEMPLATE = """
             <div class="small">Requirement-level search for PDF, TXT, CSV, XLSX, DOCX</div>
         </div>
         <div class="actions">
-            {% if current_user.is_authenticated %}
-                {% if current_user.is_admin %}
-                    <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
-                    <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
-                    <a class="btn btn-green" href="{{ url_for('admin_users') }}">Users</a>
-                {% endif %}
-                <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
-                <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
-            {% else %}
-                <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
-                <a class="btn btn-gray" href="{{ url_for('login') }}">Login</a>
-            {% endif %}
+            <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
+            <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
+            <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
         </div>
     </div>
 
@@ -5171,19 +5170,6 @@ UPLOAD_PANEL = """
         </div>
         {% endif %}
         <form method="POST" action="{{ url_for('upload_files') }}" enctype="multipart/form-data" id="upload-form"{% if storage_status.persistent and not storage_status.ok %} onsubmit="alert('Fix Supabase storage configuration before uploading.'); return false;"{% else %} onsubmit="return handleUploadSubmit(this);"{% endif %}>
-            <div style="margin-bottom:12px;">
-                <label for="document_type" style="display:block; margin-bottom:6px;"><strong>Document category</strong></label>
-                <select name="document_type" id="document_type" style="min-width:320px; padding:8px;">
-                    {% for option in document_type_options %}
-                    <option value="{{ option.id }}">{{ option.label }}</option>
-                    {% endfor %}
-                </select>
-                <div class="small" style="margin-top:6px;">
-                    Use <strong>Requirement master table (總表)</strong> for Tennet Requirements Excel files.
-                    These rows appear in the Requirement Browser on the home page.
-                    Individual AM-Req spreadsheets should use <strong>Standard document</strong>.
-                </div>
-            </div>
             <input type="file" name="files" multiple required>
             <div style="margin-top:12px;">
                 <button type="submit" id="upload-submit-btn" class="btn btn-green">Upload and index</button>
@@ -5257,8 +5243,7 @@ DOCS_TEMPLATE = """
                 </th>
                 <th>ID</th>
                 <th>Filename</th>
-                <th>Category</th>
-                <th>Format</th>
+                <th>Type</th>
                 <th>Size</th>
                 <th>OCR</th>
                 <th>Status</th>
@@ -5274,7 +5259,6 @@ DOCS_TEMPLATE = """
                 </td>
                 <td>{{ d.id }}</td>
                 <td>{{ d.original_filename }}</td>
-                <td>{{ document_type_label(d.document_type) }}</td>
                 <td>{{ d.extension }}</td>
                 <td>{{ d.size_bytes }}</td>
                 <td>{{ 'Yes' if d.is_ocr else 'No' }}</td>
@@ -6012,9 +5996,7 @@ TABLE_TEMPLATE = """
     <h2>Table preview - {{ doc.original_filename }}</h2>
     <div style="margin:12px 0; display:flex; gap:8px; flex-wrap:wrap;">
         <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
-        {% if current_user.is_authenticated and current_user.is_admin %}
         <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
-        {% endif %}
         {% if tables %}
         <a class="btn btn-purple" href="{{ url_for('export_table_xlsx', document_id=doc.id) }}">Export Excel</a>
         {% endif %}
@@ -6046,11 +6028,7 @@ TABLE_TEMPLATE = """
         {% else %}
         <div class="notice" style="margin-top:12px;">
             The table was not indexed yet, or the source file was lost after a server restart.
-            {% if current_user.is_authenticated and current_user.is_admin %}
             Go to <a href="{{ url_for('admin_documents') }}">Documents</a> and click <strong>Reindex</strong> for this file.
-            {% else %}
-            Ask an admin to reindex this document.
-            {% endif %}
         </div>
         {% endif %}
     {% endif %}
@@ -6079,9 +6057,7 @@ DICTIONARY_TEMPLATE = """
         </div>
         <div class="actions">
             <a class="btn btn-gray" href="{{ url_for('home') }}">Back to search</a>
-            {% if current_user.is_authenticated and current_user.is_admin %}
             <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
-            {% endif %}
         </div>
     </div>
 
@@ -6304,9 +6280,7 @@ def build_requirement_rows_from_tables(req_id, max_rows=10):
         )
 
     candidates = (
-        TablePreview.query.join(DocumentRecord)
-        .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
-        .filter(db.or_(*sql_matchers))
+        TablePreview.query.filter(db.or_(*sql_matchers))
         .order_by(TablePreview.id.desc())
         .all()
     )
@@ -6375,12 +6349,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     variants = requirement_lookup_variants(normalized)
     key = normalized.lower()
 
-    exact_blocks = (
-        RequirementBlock.query.join(DocumentRecord)
-        .filter(db.func.lower(RequirementBlock.requirement_id) == key)
-        .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
-        .all()
-    )
+    exact_blocks = RequirementBlock.query.filter(
+        db.func.lower(RequirementBlock.requirement_id) == key
+    ).all()
 
     variant_filters = [
         RequirementBlock.requirement_id.ilike(f"%{variant}%")
@@ -6393,9 +6364,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         matched_blocks = exact_blocks
     else:
         matched_blocks = (
-            RequirementBlock.query.join(DocumentRecord)
-            .filter(db.or_(*variant_filters))
-            .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
+            RequirementBlock.query.filter(db.or_(*variant_filters))
             .order_by(RequirementBlock.id.desc())
             .all()
         )
@@ -6409,10 +6378,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     ]
     if not filename_filters:
         filename_filters = [DocumentRecord.original_filename.ilike(f"%{normalized}%")]
-    filename_docs = DocumentRecord.query.filter(
-        db.or_(*filename_filters),
-        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
-    ).all()
+    filename_docs = DocumentRecord.query.filter(db.or_(*filename_filters)).all()
 
     stored_name_filters = [
         DocumentRecord.stored_filename.ilike(f"%{variant}%")
@@ -6420,10 +6386,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     ]
     if not stored_name_filters:
         stored_name_filters = [DocumentRecord.stored_filename.ilike(f"%{normalized}%")]
-    stored_name_docs = DocumentRecord.query.filter(
-        db.or_(*stored_name_filters),
-        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
-    ).all()
+    stored_name_docs = DocumentRecord.query.filter(db.or_(*stored_name_filters)).all()
     matched_doc_ids.update(d.id for d in filename_docs)
     matched_doc_ids.update(d.id for d in stored_name_docs)
 
@@ -6439,12 +6402,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                 ]
             )
         if table_doc_filters:
-            related_table_docs = (
-                TablePreview.query.join(DocumentRecord)
-                .filter(DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER)
-                .filter(db.or_(*table_doc_filters))
-                .all()
-            )
+            related_table_docs = TablePreview.query.filter(db.or_(*table_doc_filters)).all()
             matched_doc_ids.update(row.document_id for row in related_table_docs if row.document_id)
 
     table_rows = []
@@ -6468,13 +6426,33 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                     "sheet_name": row.sheet_name or "-",
                     "table_format": row.table_format or "-",
                     "html_table": render_table_preview_html(row, "nl"),
-                    "html_table_en": render_table_preview_html(row, "en"),
+                    "html_table_en": "" if should_skip_table_translation(doc) else render_table_preview_html(row, "en"),
                 }
             )
             if len(table_rows) >= max_tables:
                 break
 
-    block_rows = []
+    row_based_blocks = []
+    if requirement_rows:
+        for row in requirement_rows[:max_blocks]:
+            cell_map = {str(c.get("column", "")).strip(): (c.get("value", "") or "") for c in row.get("cells", [])}
+            full_text = "\n".join(
+                f"{col}: {val}" for col, val in cell_map.items() if col and str(val).strip()
+            )
+            row_based_blocks.append(
+                {
+                    "block_id": None,
+                    "requirement_id": cell_map.get("specCode") or normalized,
+                    "title": cell_map.get("Dutch Title") or cell_map.get("English Title") or "",
+                    "section": cell_map.get("sourceDocument") or row.get("sheet_name") or "",
+                    "summary": cell_map.get("Dutch description") or cell_map.get("English Description") or "",
+                    "definition": cell_map.get("referredStandardDescription") or "",
+                    "full_text": full_text or (cell_map.get("amStatement") or ""),
+                    "document_name": row.get("document_name") or "Requirement table",
+                }
+            )
+
+    parsed_blocks = []
     seen_blocks = set()
     for block in sorted(
         matched_blocks,
@@ -6484,7 +6462,7 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             continue
         seen_blocks.add(block.id)
         doc = block.document
-        block_rows.append(
+        parsed_blocks.append(
             {
                 "block_id": block.id,
                 "requirement_id": block.requirement_id or "",
@@ -6496,27 +6474,10 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                 "document_name": doc.original_filename if doc else f"Document {block.document_id}",
             }
         )
-        if len(block_rows) >= max_blocks:
+        if len(parsed_blocks) >= max_blocks:
             break
 
-    if not block_rows and requirement_rows:
-        for row in requirement_rows[:max_blocks]:
-            cell_map = {str(c.get("column", "")).strip(): (c.get("value", "") or "") for c in row.get("cells", [])}
-            full_text = "\n".join(
-                f"{col}: {val}" for col, val in cell_map.items() if col and str(val).strip()
-            )
-            block_rows.append(
-                {
-                    "block_id": None,
-                    "requirement_id": cell_map.get("specCode") or normalized,
-                    "title": cell_map.get("Dutch Title") or cell_map.get("English Title") or "",
-                    "section": cell_map.get("sourceDocument") or row.get("sheet_name") or "",
-                    "summary": cell_map.get("Dutch description") or cell_map.get("English Description") or "",
-                    "definition": cell_map.get("referredStandardDescription") or "",
-                    "full_text": full_text or (cell_map.get("amStatement") or ""),
-                    "document_name": row.get("document_name") or "Requirement master table",
-                }
-            )
+    block_rows = (row_based_blocks + parsed_blocks)[:max_blocks]
 
     return {
         "found": bool(block_rows or table_rows or requirement_rows),
@@ -6657,11 +6618,7 @@ def dictionary_lookup():
 
 
 @app.route("/admin/dictionaries", methods=["GET", "POST"])
-@login_required
 def admin_dictionaries():
-    if not is_admin():
-        abort(403)
-
     if request.method == "POST":
         upload = request.files.get("dictionary_file")
         if not upload or not upload.filename:
@@ -6729,11 +6686,7 @@ def admin_dictionaries():
 
 
 @app.route("/admin/dictionaries/delete/<int:source_id>")
-@login_required
 def delete_dictionary_source(source_id):
-    if not is_admin():
-        abort(403)
-
     source = db.session.get(DictionarySource, source_id)
     if not source:
         flash("Definition file not found.", "error")
@@ -6763,7 +6716,6 @@ def healthz():
 
 
 @app.route("/ai-translate", methods=["GET", "POST"])
-@login_required
 def ai_translate_tool():
     source_text = ""
     translated_text = ""
@@ -6783,7 +6735,6 @@ def ai_translate_tool():
 
 
 @app.route("/api/translate", methods=["POST"])
-@login_required
 def api_translate_text():
     payload = request.get_json(silent=True) or {}
     source_text = (payload.get("text") or "").strip()
@@ -6870,7 +6821,6 @@ def api_translate_all(document_id):
 
 
 @app.route("/document/<int:document_id>/export-translation-pdf")
-@login_required
 def export_translation_pdf(document_id):
     doc = db.session.get(DocumentRecord, document_id)
     if not doc or doc.extension.lower() not in TRANSLATABLE_EXTENSIONS:
@@ -6928,7 +6878,6 @@ def login():
 
 
 @app.route("/logout")
-@login_required
 def logout():
     logout_user()
     flash("Logged out.")
@@ -6936,32 +6885,8 @@ def logout():
 
 
 @app.route("/admin/users", methods=["GET", "POST"])
-@login_required
 def admin_users():
-    if not is_admin():
-        abort(403)
-
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        role = request.form.get("role", USER_ROLE)
-
-        if not username or not password:
-            flash("Username and password are required.")
-        elif User.query.filter_by(username=username).first():
-            flash("Username already exists.")
-        else:
-            user_cls = cast(Any, User)
-            new_user = user_cls(username=username, role=role)
-            new_user.set_password(password)
-            db.session.add(new_user)
-            db.session.commit()
-            flash(f"User '{username}' created.")
-
-        return redirect(url_for("admin_users"))
-
-    users = User.query.order_by(User.id).all()
-    return render_template_string(USERS_TEMPLATE, users=users)
+    return redirect(url_for("home"))
 
 def build_admin_documents_page_context():
     docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
@@ -6989,8 +6914,6 @@ def build_admin_documents_page_context():
         "storage_backend": storage.storage_backend_name(),
         "storage_persistent": storage.object_storage_enabled(),
         "storage_status": storage.get_storage_status(),
-        "document_type_options": DOCUMENT_TYPE_OPTIONS,
-        "document_type_label": document_type_label,
     }
 
 
@@ -7010,11 +6933,7 @@ def flash_upload_results(results):
 
 
 @app.route("/upload", methods=["GET", "POST"])
-@login_required
 def upload_files():
-    if not is_admin():
-        abort(403)
-
     if request.method == "GET":
         return redirect(url_for("admin_documents"))
 
@@ -7047,7 +6966,6 @@ def _handle_upload_post():
     skipped_count = 0
     restored_count = 0
     results = []
-    selected_document_type = normalize_document_type(request.form.get("document_type"))
 
     for file in files:
         if not file or file.filename == "":
@@ -7061,15 +6979,6 @@ def _handle_upload_post():
             results.append(("error", "Invalid filename."))
             continue
         ext = file_ext(original_filename)
-
-        if selected_document_type in DOCUMENT_TYPE_SPREADSHEET_ONLY and ext not in {"csv", "xlsx"}:
-            results.append(
-                (
-                    "error",
-                    f"Category '{document_type_label(selected_document_type)}' only supports CSV/XLSX: {original_filename}",
-                )
-            )
-            continue
 
         temp_fd, temp_path = tempfile.mkstemp(suffix=f".{ext}")
         os.close(temp_fd)
@@ -7124,8 +7033,7 @@ def _handle_upload_post():
                 extension=ext,
                 file_hash=file_hash,
                 size_bytes=size_bytes,
-                uploaded_by=current_user.id,
-                document_type=selected_document_type,
+                uploaded_by=current_user.id if current_user.is_authenticated else None,
             )
             db.session.add(doc)
             try:
@@ -7169,19 +7077,11 @@ def _handle_upload_post():
     return redirect_admin_documents("admin-feedback")
 
 @app.route("/admin/documents")
-@login_required
 def admin_documents():
-    if not is_admin():
-        abort(403)
-
     return render_template_string(DOCS_TEMPLATE, **build_admin_documents_page_context())
 
 @app.route("/reindex/<int:document_id>")
-@login_required
 def reindex_document(document_id):
-    if not is_admin():
-        abort(403)
-
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
         flash("Document not found.", "error")
@@ -7203,11 +7103,7 @@ def reindex_document(document_id):
 
 
 @app.route("/reindex-multiple", methods=["POST"])
-@login_required
 def bulk_reindex_documents():
-    if not is_admin():
-        abort(403)
-
     raw_ids = request.form.getlist("document_ids")
     if not raw_ids:
         flash("No documents selected.", "warning")
@@ -7250,11 +7146,7 @@ def bulk_reindex_documents():
 
 
 @app.route("/delete/<int:document_id>")
-@login_required
 def delete_document(document_id):
-    if not is_admin():
-        abort(403)
-
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
         flash("Document not found.", "error")
@@ -7301,6 +7193,7 @@ def table_preview(document_id):
     tables = TablePreview.query.filter_by(document_id=document_id).all()
     error_msg = ""
     file_available = storage.document_exists(doc.stored_filename, DOC_FOLDER)
+    skip_translation = should_skip_table_translation(doc)
 
     if (
         file_available
@@ -7318,7 +7211,7 @@ def table_preview(document_id):
             error_msg = f"Could not build table preview: {exc}"
 
     if tables and table_preview_needs_translation(tables):
-        refresh_table_translations_from_cache(tables)
+        refresh_table_translations_from_cache(tables, skip_translation=skip_translation)
         tables = TablePreview.query.filter_by(document_id=document_id).all()
 
     if not tables and not file_available:
@@ -7332,7 +7225,7 @@ def table_preview(document_id):
 
     table_views = []
     for table_row in tables:
-        html_en = render_table_preview_html(table_row, "en")
+        html_en = "" if skip_translation else render_table_preview_html(table_row, "en")
         table_views.append(
             {
                 "preview_title": table_row.preview_title,
@@ -7349,11 +7242,7 @@ def table_preview(document_id):
 
 
 @app.route("/table/<int:document_id>/refresh")
-@login_required
 def refresh_table_preview(document_id):
-    if not is_admin():
-        abort(403)
-
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
         flash("Document not found.")
@@ -7715,11 +7604,7 @@ def export_table_xlsx(document_id):
 
 
 @app.route("/delete-multiple", methods=["POST"])
-@login_required
 def bulk_delete_documents():
-    if not is_admin():
-        abort(403)
-
     raw_ids = request.form.getlist("document_ids")
     if not raw_ids:
         flash("No documents selected.", "warning")
