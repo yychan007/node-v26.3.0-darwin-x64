@@ -4717,7 +4717,9 @@ HOME_TEMPLATE = """
                         <div class="meta">
                             <strong>{{ item.requirement_id or '-' }}</strong>
                             · {{ item.document_name }}
+                            {% if item.block_id %}
                             · <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                            {% endif %}
                         </div>
                         <div class="table-scroll-wrap" style="margin-top:8px;">
                             <table class="data-table" style="width:100%;">
@@ -6373,9 +6375,12 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     variants = requirement_lookup_variants(normalized)
     key = normalized.lower()
 
-    exact_blocks = RequirementBlock.query.filter(
-        db.func.lower(RequirementBlock.requirement_id) == key
-    ).all()
+    exact_blocks = (
+        RequirementBlock.query.join(DocumentRecord)
+        .filter(db.func.lower(RequirementBlock.requirement_id) == key)
+        .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
+        .all()
+    )
 
     variant_filters = [
         RequirementBlock.requirement_id.ilike(f"%{variant}%")
@@ -6388,7 +6393,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         matched_blocks = exact_blocks
     else:
         matched_blocks = (
-            RequirementBlock.query.filter(db.or_(*variant_filters))
+            RequirementBlock.query.join(DocumentRecord)
+            .filter(db.or_(*variant_filters))
+            .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
             .order_by(RequirementBlock.id.desc())
             .all()
         )
@@ -6491,6 +6498,25 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         )
         if len(block_rows) >= max_blocks:
             break
+
+    if not block_rows and requirement_rows:
+        for row in requirement_rows[:max_blocks]:
+            cell_map = {str(c.get("column", "")).strip(): (c.get("value", "") or "") for c in row.get("cells", [])}
+            full_text = "\n".join(
+                f"{col}: {val}" for col, val in cell_map.items() if col and str(val).strip()
+            )
+            block_rows.append(
+                {
+                    "block_id": None,
+                    "requirement_id": cell_map.get("specCode") or normalized,
+                    "title": cell_map.get("Dutch Title") or cell_map.get("English Title") or "",
+                    "section": cell_map.get("sourceDocument") or row.get("sheet_name") or "",
+                    "summary": cell_map.get("Dutch description") or cell_map.get("English Description") or "",
+                    "definition": cell_map.get("referredStandardDescription") or "",
+                    "full_text": full_text or (cell_map.get("amStatement") or ""),
+                    "document_name": row.get("document_name") or "Requirement master table",
+                }
+            )
 
     return {
         "found": bool(block_rows or table_rows or requirement_rows),
