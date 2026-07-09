@@ -4782,6 +4782,7 @@ HOME_TEMPLATE = """
         </div>
         <div class="actions">
             <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
+            <a class="btn btn-gray" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
             <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
             <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
         </div>
@@ -4857,7 +4858,7 @@ HOME_TEMPLATE = """
     {% if search_mode != 'general' %}
     <div class="search-meta-panel" style="margin-top:16px;">
         <div class="panel-title">Requirement Browser</div>
-        <form method="GET" action="/" id="requirement-browser-form">
+        <form method="GET" action="{{ requirement_form_action }}" id="requirement-browser-form">
             <input type="text" name="req_lookup" value="{{ req_lookup_query }}" placeholder="Find one requirement, e.g. AM-Req-0286.06">
             <button type="submit">Browse</button>
         </form>
@@ -6905,32 +6906,10 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
 
 @app.route("/")
 def home():
-    raw_query = request.args.get("q", "").strip()
-    req_lookup_query = request.args.get("req_lookup", "").strip()
-    search_mode = "requirement" if req_lookup_query else "general"
-    query = raw_query if search_mode == "general" else ""
+    query = request.args.get("q", "").strip()
+    search_mode = "general"
+    req_lookup_query = ""
     req_lookup = None
-    if req_lookup_query:
-        try:
-            req_lookup = build_requirement_lookup_result(req_lookup_query)
-        except Exception as exc:
-            db.session.rollback()
-            print(f"Requirement Browser error for '{req_lookup_query}': {exc}")
-            req_lookup = {
-                "found": False,
-                "normalized_id": req_lookup_query,
-                "requirement_rows": [],
-                "blocks": [],
-                "tables": [],
-                "block_count": 0,
-                "requirement_row_count": 0,
-                "table_count": 0,
-                "document_count": 0,
-                "scan_elapsed_ms": 0,
-                "scan_documents": 0,
-                "scan_sheets": 0,
-                "error_message": str(exc),
-            }
     try:
         current_page = max(1, request.args.get("page", 1, type=int) or 1)
         total_pages = 1
@@ -6983,6 +6962,7 @@ def home():
             HOME_TEMPLATE,
             query=query,
             search_mode=search_mode,
+            requirement_form_action=url_for("requirement_browser"),
             results=results,
             document_matches=document_matches,
             table_results=table_results,
@@ -7027,6 +7007,7 @@ def home():
             HOME_TEMPLATE,
             query=query,
             search_mode=search_mode,
+            requirement_form_action=url_for("requirement_browser"),
             results=[],
             document_matches=[],
             table_results=[],
@@ -7045,6 +7026,70 @@ def home():
             block_count=RequirementBlock.query.count(),
             table_count=TablePreview.query.count(),
         )
+
+
+@app.route("/requirement-browser")
+def requirement_browser():
+    req_lookup_query = request.args.get("req_lookup", "").strip()
+    req_lookup = None
+    if req_lookup_query:
+        try:
+            req_lookup = build_requirement_lookup_result(req_lookup_query)
+        except Exception as exc:
+            db.session.rollback()
+            print(f"Requirement Browser error for '{req_lookup_query}': {exc}")
+            req_lookup = {
+                "found": False,
+                "normalized_id": req_lookup_query,
+                "requirement_rows": [],
+                "blocks": [],
+                "tables": [],
+                "block_count": 0,
+                "requirement_row_count": 0,
+                "table_count": 0,
+                "document_count": 0,
+                "scan_elapsed_ms": 0,
+                "scan_documents": 0,
+                "scan_sheets": 0,
+                "error_message": str(exc),
+            }
+    safe_lookup = req_lookup or {
+        "found": False,
+        "normalized_id": req_lookup_query,
+        "requirement_rows": [],
+        "blocks": [],
+        "tables": [],
+        "block_count": 0,
+        "requirement_row_count": 0,
+        "table_count": 0,
+        "document_count": 0,
+        "scan_elapsed_ms": 0,
+        "scan_documents": 0,
+        "scan_sheets": 0,
+    }
+    return render_template_string(
+        HOME_TEMPLATE,
+        query="",
+        search_mode="requirement",
+        requirement_form_action=url_for("requirement_browser"),
+        results=[],
+        document_matches=[],
+        table_results=[],
+        all_expanded_terms=[],
+        selected_terms=[],
+        exact_terms=[],
+        result_types=["drawings", "text", "tables"],
+        summary={"top_categories": [], "top_requirement_ids": []},
+        current_page=1,
+        total_pages=1,
+        total_results=0,
+        results_per_page=RESULTS_PER_PAGE,
+        req_lookup_query=req_lookup_query,
+        req_lookup=safe_lookup,
+        doc_count=DocumentRecord.query.count(),
+        block_count=RequirementBlock.query.count(),
+        table_count=TablePreview.query.count(),
+    )
 
 
 def build_dictionary_result_rows(entries):
