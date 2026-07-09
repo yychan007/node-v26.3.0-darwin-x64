@@ -4623,6 +4623,15 @@ button { background:#0069d9; }
   border-radius:6px;
   background:#fff;
 }
+.requirement-bilingual-table td {
+  vertical-align: top;
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+.requirement-bilingual-table .req-number-cell {
+  font-weight: 700;
+  background: #f8fafc;
+}
 .table-scroll-wrap .data-table {
   display: inline-block;
   width: auto;
@@ -4921,7 +4930,6 @@ HOME_TEMPLATE = """
                     <div class="summary-box" style="margin-top:10px;">
                         <div class="meta">
                             <strong>{{ item.document_name }}</strong>
-                            · Requirement: {{ item.requirement_id or '-' }}
                             {% if item.section %}
                             · Section: {{ item.section }}
                             {% endif %}
@@ -4929,30 +4937,62 @@ HOME_TEMPLATE = """
                             · Page: {{ item.page }}
                             {% endif %}
                         </div>
-                        {% if item.requirement_id %}
-                        <div class="meta" style="margin-top:8px;">
-                            <strong>Requirement number:</strong> {{ item.requirement_id }}
+                        <div class="table-scroll-wrap" style="margin-top:8px;">
+                            <table class="data-table requirement-bilingual-table" style="width:100%; min-width:720px;">
+                                <tr>
+                                    <th style="width:50%;">Dutch (Original)</th>
+                                    <th style="width:50%;">English (Translation)</th>
+                                </tr>
+                                <tr>
+                                    <td class="req-number-cell">
+                                        {% if item.requirement_id %}
+                                        <strong>Requirement number: {{ item.requirement_id }}</strong>
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                    <td class="req-number-cell">
+                                        {% if item.requirement_id %}
+                                        <strong>Requirement number: {{ item.requirement_id }}</strong>
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td>
+                                        {% if item.title_nl %}
+                                        <strong>Title:</strong> {{ item.title_nl }}
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if item.title_en %}
+                                        {{ item.title_en }}
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td>
+                                        {% if item.applicable_nl %}
+                                        Applicable Discriminators Distance security: {{ item.applicable_nl }}
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {% if item.applicable_en %}
+                                        {{ item.applicable_en }}
+                                        {% else %}
+                                        -
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                            </table>
                         </div>
-                        {% endif %}
-                        {% if item.title_nl %}
-                        <div class="meta" style="margin-top:6px;">
-                            <strong>Title:</strong> {{ item.title_nl }}
-                            {% if item.title_en %}
-                            <span> (English version: {{ item.title_en }})</span>
-                            {% endif %}
-                        </div>
-                        {% endif %}
-                        {% if item.applicable_nl %}
-                        <div class="meta" style="margin-top:6px; white-space:pre-wrap;">
-                            <strong>Applicable Discriminators Distance security:</strong>
-                            {{ item.applicable_nl }}
-                            {% if item.applicable_en %}
-                            <span> (English version: {{ item.applicable_en }})</span>
-                            {% endif %}
-                        </div>
-                        {% elif item.snippet %}
-                        <div class="snippet" style="margin-top:8px;">{{ item.snippet }}</div>
-                        {% endif %}
                         <div class="meta" style="margin-top:8px;">
                             {% if item.block_id %}
                             <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
@@ -6533,39 +6573,189 @@ def _collapse_requirement_text(text):
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _extract_requirement_title(requirement_id, title, full_text):
-    if (title or "").strip():
-        return (title or "").strip()
-    lines = [ln.strip() for ln in compact_display_text(full_text or "").splitlines() if ln.strip()]
-    req_lower = (requirement_id or "").strip().lower()
-    for line in lines:
-        if req_lower and req_lower in line.lower():
-            continue
-        if len(line) < 4:
-            continue
-        return line
-    return ""
+def _clean_requirement_field_line(line):
+    return re.sub(r"\s+", " ", (line or "").strip())
 
 
-def _extract_applicable_discriminators_text(full_text):
-    source = compact_display_text(full_text or "")
-    if not source:
-        return ""
-    markers = [
-        "Applicable Discriminators",
-        "Distance security",
-        "Distantie beveiliging",
-        "De distantiefunctie",
+def _is_requirement_metadata_line(line):
+    low = (line or "").strip().lower()
+    skip_prefixes = (
+        "applicable",
+        "verification",
+        "figure",
+        "explanation",
+        "phase",
+        "method",
+        "remark",
+        "test",
+        "berekening",
+        "calculation",
+        "publication date",
+        "generated from",
+        "beveiliging intelligent",
+        "security intelligent",
+        "category:",
+    )
+    return any(low.startswith(prefix) for prefix in skip_prefixes)
+
+
+def sort_requirement_content_rows(rows, query_id):
+    key = normalize_requirement_lookup_id(query_id).lower()
+    key_compact = re.sub(r"[^a-z0-9]+", "", key)
+
+    def priority(row):
+        spec = (row.get("requirement_id") or "").lower()
+        spec_compact = re.sub(r"[^a-z0-9]+", "", spec)
+        if spec == key or spec_compact == key_compact:
+            return 0
+        return 1
+
+    return sorted(
+        rows,
+        key=lambda row: (priority(row), row.get("page") or 0),
+    )
+
+
+def _looks_like_requirement_category(line):
+    low = (line or "").lower()
+    return bool(
+        re.search(r"\b(systeem|system|aspect|betrouwbaarheid|reliability)\b", low)
+    ) and "," in (line or "")
+
+
+def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
+    text = compact_display_text(full_text or "")
+    if not text:
+        return "", ""
+
+    lines = [
+        _clean_requirement_field_line(ln)
+        for ln in text.splitlines()
+        if _clean_requirement_field_line(ln)
     ]
-    lower_source = source.lower()
-    for marker in markers:
-        pos = lower_source.find(marker.lower())
-        if pos != -1:
-            excerpt = source[pos:pos + 1200]
+    title = ""
+    applicable = ""
+
+    for line in lines:
+        title_match = re.match(r"(?i)^Title:\s*(.+)$", line)
+        if title_match:
+            title = title_match.group(1).strip()
             break
-    else:
-        excerpt = source[:1200]
-    return _collapse_requirement_text(excerpt)
+
+    stop_pattern = re.compile(
+        r"(?i)^(figure|explanation|verification|phase|method|remark|test|berekening|calculation|am-req-)\b"
+    )
+    disc_idx = -1
+    for i, line in enumerate(lines):
+        if re.search(
+            r"(?i)applicable\s+discriminators|distance\s+security|distantie\s+beveiliging",
+            line,
+        ):
+            disc_idx = i
+            break
+
+    if disc_idx >= 0:
+        body_parts = []
+        for line in lines[disc_idx + 1 :]:
+            if stop_pattern.search(line):
+                break
+            if _is_requirement_metadata_line(line):
+                continue
+            if re.search(r"(?i)^(distance security|distantie beveiliging)$", line):
+                continue
+            body_parts.append(line)
+        applicable = _collapse_requirement_text(" ".join(body_parts))
+
+    if lang == "nl" and not applicable:
+        body_match = re.search(
+            r"(De\s+distantiefunctie\s*\(ANSI:21\).+?)"
+            r"(?=(?:\s*(?:Figure|Explanation|Verification|Phase|Method|Remark|Test|Berekening)\b|AM-Req-|\Z))",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if body_match:
+            applicable = _collapse_requirement_text(body_match.group(1))
+    elif lang == "en" and not applicable:
+        body_match = re.search(
+            r"(The\s+distance\s+function\s*\(ANSI:21\).+?)"
+            r"(?=(?:\s*(?:Figure|Explanation|Verification|Phase|Method|Remark|Test|Calculation)\b|AM-Req-|\Z))",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if body_match:
+            applicable = _collapse_requirement_text(body_match.group(1))
+
+    req_lower = (requirement_id or "").strip().lower()
+    if not title and req_lower:
+        req_idx = next((i for i, line in enumerate(lines) if req_lower in line.lower()), -1)
+        if req_idx >= 0:
+            for cand in lines[req_idx + 1 : req_idx + 6]:
+                if _is_requirement_metadata_line(cand):
+                    continue
+                if req_lower in cand.lower():
+                    continue
+                low = cand.lower()
+                if re.search(r"(?i)\b(zone|functie|function|instelling|component|beveiliging\s*-\s*)", cand):
+                    title = cand
+                    break
+            if not title:
+                for cand in lines[req_idx + 1 : req_idx + 4]:
+                    if _is_requirement_metadata_line(cand) or req_lower in cand.lower():
+                        continue
+                    if _looks_like_requirement_category(cand):
+                        continue
+                    if len(cand) > 12:
+                        title = cand
+                        break
+
+    if lang == "en" and not title:
+        for cand in lines:
+            if re.search(r"(?i)(distancing function|distance function|forward zone)", cand):
+                title = cand
+                break
+
+    return title, applicable
+
+
+def _get_requirement_page_translation_text(doc, page_num):
+    page_translation = DocumentPageTranslation.query.filter_by(
+        document_id=doc.id, page=page_num
+    ).first()
+    if page_translation and (page_translation.translated_text or "").strip():
+        return page_translation.translated_text or ""
+
+    if (doc.extension or "").lower() != "pdf":
+        return ""
+
+    try:
+        payload = get_or_translate_page(doc, page_num, target_lang="en")
+        return (payload or {}).get("translation") or ""
+    except Exception as exc:
+        print(f"Requirement page translation error for doc {doc.id} page {page_num}: {exc}")
+        return ""
+
+
+def _build_requirement_content_fields(requirement_id, full_text_nl, full_text_en=""):
+    title_nl, applicable_nl = _parse_structured_requirement_fields(
+        requirement_id, full_text_nl, lang="nl"
+    )
+    title_en, applicable_en = ("", "")
+    if (full_text_en or "").strip():
+        title_en, applicable_en = _parse_structured_requirement_fields(
+            requirement_id, full_text_en, lang="en"
+        )
+
+    if not title_en and title_nl:
+        title_en = (translate_to_english(title_nl) or "").strip()
+    if not applicable_en and applicable_nl:
+        applicable_en = (translate_to_english(applicable_nl) or "").strip()
+
+    return {
+        "title_nl": title_nl,
+        "title_en": title_en,
+        "applicable_nl": applicable_nl,
+        "applicable_en": applicable_en,
+    }
 
 
 def _build_requirement_browser_content_row(block):
@@ -6576,23 +6766,10 @@ def _build_requirement_browser_content_row(block):
     page_num = block.page or 1
 
     full_text_nl = block.full_text or ""
-    title_nl = _extract_requirement_title(block.requirement_id, block.title, full_text_nl)
-    applicable_nl = _extract_applicable_discriminators_text(full_text_nl)
-
-    title_en = ""
-    applicable_en = ""
-    page_translation = DocumentPageTranslation.query.filter_by(
-        document_id=doc.id, page=page_num
-    ).first()
-    if page_translation and (page_translation.translated_text or "").strip():
-        translated_text = page_translation.translated_text or ""
-        title_en = _extract_requirement_title(block.requirement_id, "", translated_text)
-        applicable_en = _extract_applicable_discriminators_text(translated_text)
-
-    if not title_en and title_nl:
-        title_en = (translate_to_english(title_nl) or "").strip()
-    if not applicable_en and applicable_nl:
-        applicable_en = (translate_to_english(applicable_nl) or "").strip()
+    translated_text = _get_requirement_page_translation_text(doc, page_num)
+    fields = _build_requirement_content_fields(
+        block.requirement_id, full_text_nl, translated_text
+    )
 
     return {
         "block_id": block.id,
@@ -6602,11 +6779,40 @@ def _build_requirement_browser_content_row(block):
         "title": block.title or "",
         "section": block.major_section or block.section or "",
         "page": page_num,
-        "snippet": compact_display_text(block.full_text or "")[:900].rstrip() + ("..." if len(compact_display_text(block.full_text or "")) > 900 else ""),
-        "title_nl": title_nl,
-        "title_en": title_en,
-        "applicable_nl": applicable_nl,
-        "applicable_en": applicable_en,
+        "snippet": compact_display_text(block.full_text or "")[:900].rstrip()
+        + ("..." if len(compact_display_text(block.full_text or "")) > 900 else ""),
+        **fields,
+        "is_pdf": ext == "pdf",
+        "is_docx": ext == "docx",
+        "is_txt": ext == "txt",
+    }
+
+
+def _build_requirement_browser_content_from_document(doc, requirement_id):
+    ext = (doc.extension or "").lower()
+    if ext not in {"pdf", "docx", "txt"}:
+        return None
+
+    full_text_nl = compact_display_text((doc.text_preview or "").strip())
+    if not full_text_nl:
+        full_text_nl = compact_display_text(get_document_full_text(doc))
+    if not full_text_nl:
+        return None
+
+    fields = _build_requirement_content_fields(requirement_id, full_text_nl)
+    if not any(fields.values()):
+        return None
+
+    return {
+        "block_id": None,
+        "document_id": doc.id,
+        "document_name": doc.original_filename or f"Document {doc.id}",
+        "requirement_id": requirement_id or "",
+        "title": "",
+        "section": "",
+        "page": 1,
+        "snippet": "",
+        **fields,
         "is_pdf": ext == "pdf",
         "is_docx": ext == "docx",
         "is_txt": ext == "txt",
@@ -6902,39 +7108,28 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     matched_doc_ids.update(d.id for d in stored_name_docs)
 
     content_rows = list(block_rows)
-    seen_content_doc_ids = {row.get("document_id") for row in content_rows}
+    seen_content_keys = {
+        (row.get("document_id"), row.get("requirement_id") or "")
+        for row in content_rows
+    }
     related_docs = {}
     for doc in filename_docs + stored_name_docs:
         if doc and doc.id:
             related_docs[doc.id] = doc
     for doc_id, doc in related_docs.items():
-        if doc_id in seen_content_doc_ids:
+        doc_req_id = normalize_requirement_lookup_id(doc.original_filename or "") or normalized
+        content_key = (doc_id, doc_req_id)
+        if content_key in seen_content_keys:
             continue
-        ext = (doc.extension or "").lower()
-        if ext not in {"pdf", "docx", "txt"}:
+        formatted_row = _build_requirement_browser_content_from_document(doc, doc_req_id)
+        if not formatted_row:
             continue
-        text = compact_display_text((doc.text_preview or "").strip())
-        if not text:
-            text = compact_display_text(get_document_full_text(doc))
-        if len(text) > 900:
-            text = text[:900].rstrip() + "..."
-        content_rows.append(
-            {
-                "block_id": None,
-                "document_id": doc.id,
-                "document_name": doc.original_filename or f"Document {doc.id}",
-                "requirement_id": normalized,
-                "title": "",
-                "section": "",
-                "page": 1,
-                "snippet": text,
-                "is_pdf": ext == "pdf",
-                "is_docx": ext == "docx",
-                "is_txt": ext == "txt",
-            }
-        )
+        seen_content_keys.add(content_key)
+        content_rows.append(formatted_row)
         if len(content_rows) >= max_blocks:
             break
+
+    content_rows = sort_requirement_content_rows(content_rows, normalized)[:max_blocks]
 
     if not matched_doc_ids:
         table_doc_filters = []
