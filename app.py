@@ -6698,73 +6698,113 @@ def home():
                 "scan_sheets": 0,
                 "error_message": str(exc),
             }
-    current_page = max(1, request.args.get("page", 1, type=int) or 1)
-    total_pages = 1
-    total_results = 0
-    results = []
-    all_expanded_terms = []
-    selected_terms = []
-    exact_terms = []
-    summary = {"top_categories": [], "top_requirement_ids": []}
-    document_matches = []
-    table_results = []
-    result_types = ["drawings", "text", "tables"]
+    try:
+        current_page = max(1, request.args.get("page", 1, type=int) or 1)
+        total_pages = 1
+        total_results = 0
+        results = []
+        all_expanded_terms = []
+        selected_terms = []
+        exact_terms = []
+        summary = {"top_categories": [], "top_requirement_ids": []}
+        document_matches = []
+        table_results = []
+        result_types = ["drawings", "text", "tables"]
 
-    if query:
-        all_expanded_terms = get_all_expanded_terms(query)
-        exact_terms = default_exact_search_terms(query)
-        if request.args.getlist("term"):
-            selected_terms = resolve_active_search_terms(query, request.args.getlist("term"))
-        else:
-            selected_terms = exact_terms
+        if query:
+            all_expanded_terms = get_all_expanded_terms(query)
+            exact_terms = default_exact_search_terms(query)
+            if request.args.getlist("term"):
+                selected_terms = resolve_active_search_terms(query, request.args.getlist("term"))
+            else:
+                selected_terms = exact_terms
 
-        requested_result_types = [
-            t for t in request.args.getlist("result_type") if t in {"drawings", "text", "tables"}
-        ]
-        if requested_result_types:
-            result_types = requested_result_types
+            requested_result_types = [
+                t for t in request.args.getlist("result_type") if t in {"drawings", "text", "tables"}
+            ]
+            if requested_result_types:
+                result_types = requested_result_types
 
-        if "drawings" in result_types:
-            document_matches = search_documents(query, active_terms=selected_terms)
-        if "tables" in result_types:
-            table_results = search_table_results(query, active_terms=selected_terms)
-        if "text" in result_types:
-            all_results, _ = search_requirements(query, active_terms=selected_terms)
-            if table_results:
-                table_doc_ids = {t["document_id"] for t in table_results}
-                all_results = [
-                    r for r in all_results
-                    if r.get("document_id") not in table_doc_ids
-                ]
-            summary = grouped_search_summary(all_results)
-            total_results = len(all_results)
-            total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
-            current_page = min(current_page, total_pages)
-            start_idx = (current_page - 1) * RESULTS_PER_PAGE
-            end_idx = start_idx + RESULTS_PER_PAGE
-            results = all_results[start_idx:end_idx]
+            if "drawings" in result_types:
+                document_matches = search_documents(query, active_terms=selected_terms)
+            if "tables" in result_types:
+                table_results = search_table_results(query, active_terms=selected_terms)
+            if "text" in result_types:
+                all_results, _ = search_requirements(query, active_terms=selected_terms)
+                if table_results:
+                    table_doc_ids = {t["document_id"] for t in table_results}
+                    all_results = [
+                        r for r in all_results
+                        if r.get("document_id") not in table_doc_ids
+                    ]
+                summary = grouped_search_summary(all_results)
+                total_results = len(all_results)
+                total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
+                current_page = min(current_page, total_pages)
+                start_idx = (current_page - 1) * RESULTS_PER_PAGE
+                end_idx = start_idx + RESULTS_PER_PAGE
+                results = all_results[start_idx:end_idx]
 
-    return render_template_string(
-        HOME_TEMPLATE,
-        query=query,
-        results=results,
-        document_matches=document_matches,
-        table_results=table_results,
-        all_expanded_terms=all_expanded_terms,
-        selected_terms=selected_terms,
-        exact_terms=exact_terms,
-        result_types=result_types,
-        summary=summary,
-        current_page=current_page,
-        total_pages=total_pages,
-        total_results=total_results,
-        results_per_page=RESULTS_PER_PAGE,
-        req_lookup_query=req_lookup_query,
-        req_lookup=req_lookup,
-        doc_count=DocumentRecord.query.count(),
-        block_count=RequirementBlock.query.count(),
-        table_count=TablePreview.query.count(),
-    )
+        return render_template_string(
+            HOME_TEMPLATE,
+            query=query,
+            results=results,
+            document_matches=document_matches,
+            table_results=table_results,
+            all_expanded_terms=all_expanded_terms,
+            selected_terms=selected_terms,
+            exact_terms=exact_terms,
+            result_types=result_types,
+            summary=summary,
+            current_page=current_page,
+            total_pages=total_pages,
+            total_results=total_results,
+            results_per_page=RESULTS_PER_PAGE,
+            req_lookup_query=req_lookup_query,
+            req_lookup=req_lookup,
+            doc_count=DocumentRecord.query.count(),
+            block_count=RequirementBlock.query.count(),
+            table_count=TablePreview.query.count(),
+        )
+    except Exception as exc:
+        print(f"Home render error: {exc}")
+        safe_lookup = req_lookup or {
+            "found": False,
+            "normalized_id": req_lookup_query,
+            "requirement_rows": [],
+            "blocks": [],
+            "tables": [],
+            "block_count": 0,
+            "requirement_row_count": 0,
+            "table_count": 0,
+            "document_count": 0,
+            "scan_elapsed_ms": 0,
+            "scan_documents": 0,
+            "scan_sheets": 0,
+            "error_message": str(exc),
+        }
+        safe_lookup["error_message"] = safe_lookup.get("error_message") or str(exc)
+        return render_template_string(
+            HOME_TEMPLATE,
+            query=query,
+            results=[],
+            document_matches=[],
+            table_results=[],
+            all_expanded_terms=[],
+            selected_terms=[],
+            exact_terms=[],
+            result_types=["drawings", "text", "tables"],
+            summary={"top_categories": [], "top_requirement_ids": []},
+            current_page=1,
+            total_pages=1,
+            total_results=0,
+            results_per_page=RESULTS_PER_PAGE,
+            req_lookup_query=req_lookup_query,
+            req_lookup=safe_lookup,
+            doc_count=DocumentRecord.query.count(),
+            block_count=RequirementBlock.query.count(),
+            table_count=TablePreview.query.count(),
+        )
 
 
 def build_dictionary_result_rows(entries):
