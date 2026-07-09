@@ -2283,6 +2283,8 @@ def requirement_block_keep_score(block):
     score = len(block.full_text or "")
     doc = block.document
     if doc:
+        if is_tennet_requirements_document(doc):
+            score += 10_000_000
         filename_req = requirement_id_from_filename(doc.original_filename)
         block_req = normalize_requirement_id_key(block.requirement_id)
         if filename_req and normalize_requirement_id_key(filename_req) == block_req:
@@ -2320,6 +2322,85 @@ def dedupe_requirement_blocks_by_id():
 
 
 def build_spreadsheet_requirement_blocks(doc_record, text, tables):
+    if is_tennet_requirements_document(doc_record):
+        blocks = []
+        seen_req_ids = set()
+        for sheet_name, df in (tables or []):
+            if df is None or df.empty or not is_requirement_master_table_dataframe(df):
+                continue
+
+            columns = [str(col) for col in df.columns]
+            normalized_map = {
+                re.sub(r"[^a-z0-9]+", "", col.strip().lower()): col
+                for col in columns
+                if col.strip()
+            }
+
+            spec_col = normalized_map.get("speccode")
+            source_col = normalized_map.get("sourcedocument")
+            title_nl_col = normalized_map.get("dutchtitle")
+            title_en_col = normalized_map.get("englishtitle")
+            desc_nl_col = normalized_map.get("dutchdescription")
+            desc_en_col = normalized_map.get("englishdescription")
+            standard_desc_col = normalized_map.get("referredstandarddescription")
+            statement_col = normalized_map.get("amstatement")
+            domain_col = normalized_map.get("vakgebied")
+            phase_col = normalized_map.get("fase")
+
+            if not spec_col:
+                continue
+
+            for row_idx, row in df.iterrows():
+                req_id = cell_to_dictionary_text(row.get(spec_col))
+                req_id = normalize_requirement_lookup_id(req_id)
+                if not is_trackable_am_req_id(req_id):
+                    continue
+
+                req_key = normalize_requirement_id_key(req_id)
+                if req_key in seen_req_ids:
+                    continue
+                seen_req_ids.add(req_key)
+
+                source_document = cell_to_dictionary_text(row.get(source_col)) if source_col else ""
+                title_nl = cell_to_dictionary_text(row.get(title_nl_col)) if title_nl_col else ""
+                title_en = cell_to_dictionary_text(row.get(title_en_col)) if title_en_col else ""
+                desc_nl = cell_to_dictionary_text(row.get(desc_nl_col)) if desc_nl_col else ""
+                desc_en = cell_to_dictionary_text(row.get(desc_en_col)) if desc_en_col else ""
+                standard_desc = cell_to_dictionary_text(row.get(standard_desc_col)) if standard_desc_col else ""
+                am_statement = cell_to_dictionary_text(row.get(statement_col)) if statement_col else ""
+                domain = cell_to_dictionary_text(row.get(domain_col)) if domain_col else ""
+                phase = cell_to_dictionary_text(row.get(phase_col)) if phase_col else ""
+
+                full_text_parts = []
+                for col_name in columns:
+                    value = cell_to_dictionary_text(row.get(col_name))
+                    if value:
+                        full_text_parts.append(f"{col_name}: {value}")
+                full_text = "\n".join(full_text_parts)
+
+                summary_parts = [part for part in [desc_nl, desc_en, am_statement] if part]
+                section_parts = [part for part in [source_document, domain, phase] if part]
+                title = title_nl or title_en or req_id
+
+                row_number = int(cast(Any, row_idx)) + 1
+                blocks.append(
+                    {
+                        "requirement_id": req_id,
+                        "title": title,
+                        "section": " · ".join(section_parts),
+                        "major_section": str(sheet_name or ""),
+                        "page": 1,
+                        "char_start": row_number,
+                        "category": "Requirement master",
+                        "definition": standard_desc,
+                        "summary": " | ".join(summary_parts),
+                        "full_text": full_text,
+                        "token_blob": " ".join(preprocess(full_text)),
+                    }
+                )
+        if blocks:
+            return blocks
+
     req_id = requirement_id_from_filename(doc_record.original_filename)
     if not req_id:
         return []
@@ -6351,12 +6432,21 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             "document_count": 0,
         }
 
+    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
     variants = requirement_lookup_variants(normalized)
     key = normalized.lower()
 
-    exact_blocks = RequirementBlock.query.filter(
-        db.func.lower(RequirementBlock.requirement_id) == key
-    ).all()
+    exact_blocks = (
+        RequirementBlock.query.join(DocumentRecord)
+        .filter(db.func.lower(RequirementBlock.requirement_id) == key)
+        .filter(
+            db.or_(
+                DocumentRecord.original_filename.ilike("%tennet%requirement%"),
+                DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
+            )
+        )
+        .all()
+    )
 
     variant_filters = [
         RequirementBlock.requirement_id.ilike(f"%{variant}%")
@@ -6369,13 +6459,19 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
         matched_blocks = exact_blocks
     else:
         matched_blocks = (
-            RequirementBlock.query.filter(db.or_(*variant_filters))
+            RequirementBlock.query.join(DocumentRecord)
+            .filter(db.or_(*variant_filters))
+            .filter(
+                db.or_(
+                    DocumentRecord.original_filename.ilike("%tennet%requirement%"),
+                    DocumentRecord.stored_filename.ilike("%tennet%requirement%"),
+                )
+            )
             .order_by(RequirementBlock.id.desc())
             .all()
         )
 
-    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
-    matched_doc_ids = set()
+    matched_doc_ids = {row["document_id"] for row in requirement_rows if row.get("document_id")}
 
     filename_filters = [
         DocumentRecord.original_filename.ilike(f"%{variant}%")
