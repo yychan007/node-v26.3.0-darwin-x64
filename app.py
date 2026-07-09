@@ -43,9 +43,6 @@ import zipfile
 import tempfile
 import mimetypes
 import xml.etree.ElementTree as ET
-import threading
-import traceback
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from collections import defaultdict, Counter
 from pathlib import Path
@@ -160,8 +157,6 @@ MAX_INDEX_FILE_MB = env_int("MAX_INDEX_FILE_MB", 40 if IS_PRODUCTION else 0)
 TEXT_PREVIEW_LIMIT = env_int("TEXT_PREVIEW_LIMIT", 150000)
 TRANSLATE_MAX_CELLS = env_int("TRANSLATE_MAX_CELLS", 500)
 STORAGE_QUOTA_MB = env_int("STORAGE_QUOTA_MB", 1024)
-
-INDEX_JOB_WORKERS = env_int("INDEX_JOB_WORKERS", 1)
 
 
 DEFAULT_DATA_DIR = BASE_DIR / "data"
@@ -342,9 +337,6 @@ DOCUMENT_TYPE_OPTIONS = [
 ]
 DOCUMENT_TYPE_IDS = {option["id"] for option in DOCUMENT_TYPE_OPTIONS}
 DOCUMENT_TYPE_SPREADSHEET_ONLY = {DOCUMENT_TYPE_REQUIREMENT_MASTER}
-REQUIREMENT_MASTER_MAX_ROWS = 35000
-DEFAULT_EXCEL_MAX_ROWS = 200
-DEFAULT_TABLE_DISPLAY_ROWS = 40
 
 # =========================================================
 # Database models
@@ -406,132 +398,6 @@ def is_requirement_master_document(doc):
     return normalize_document_type(getattr(doc, "document_type", None)) == DOCUMENT_TYPE_REQUIREMENT_MASTER
 
 
-def is_requirement_master_source(doc):
-    if not doc:
-        return False
-    if is_requirement_master_document(doc):
-        return True
-    if (doc.extension or "").lower() not in {"csv", "xlsx"}:
-        return False
-    name = (doc.original_filename or "").lower().replace("_", " ")
-    return "tennet" in name and "requirement" in name
-
-
-def get_requirement_master_documents():
-    candidates = DocumentRecord.query.filter(
-        DocumentRecord.extension.in_(("csv", "xlsx"))
-    ).all()
-    return [doc for doc in candidates if is_requirement_master_source(doc)]
-
-
-def prepare_requirement_master_storage_df(df, max_rows=REQUIREMENT_MASTER_MAX_ROWS):
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    cleaned = df.copy()
-    cleaned.columns = dedupe_column_names(cleaned.columns)
-    for idx in range(cleaned.shape[1]):
-        cleaned.iloc[:, idx] = cleaned.iloc[:, idx].map(normalize_cell_text)
-
-    if not cleaned.empty:
-        row_keep = cleaned.apply(
-            lambda row: any(normalize_cell_text(value) for value in row), axis=1
-        )
-        cleaned = cleaned.loc[row_keep]
-
-    if cleaned.empty:
-        return cleaned
-    return cleaned.head(max_rows).reset_index(drop=True)
-
-
-def requirement_master_english_columns(columns):
-    spec_cols = []
-    english_cols = []
-    neutral_cols = []
-    for col in columns:
-        lowered = str(col).lower().strip()
-        norm = re.sub(r"[^a-z0-9]", "", lowered)
-        if norm in {"speccode", "requirementid", "reqid"}:
-            spec_cols.append(col)
-        elif "english" in lowered:
-            english_cols.append(col)
-        elif "dutch" in lowered:
-            continue
-        elif any(
-            token in norm
-            for token in (
-                "sourcedocument",
-                "vakgebied",
-                "conceptual",
-                "objectname",
-                "fase",
-                "verificatie",
-                "referredstandard",
-                "amstatement",
-            )
-        ):
-            neutral_cols.append(col)
-    ordered = spec_cols + english_cols + neutral_cols
-    return ordered if ordered else list(columns)
-
-
-def build_requirement_master_english_table(df, max_rows=200):
-    if df is None or df.empty:
-        return "", ""
-
-    columns = requirement_master_english_columns(list(df.columns))
-    available = [col for col in columns if col in df.columns]
-    if not available:
-        return "", ""
-
-    subset = df.loc[:, available].head(max_rows).copy()
-    if subset.empty:
-        return "", ""
-
-    html_table, _, _ = prepare_table_display(subset)
-    csv_buf = io.StringIO()
-    subset.to_csv(csv_buf, index=False)
-    return html_table, csv_buf.getvalue()
-
-
-def table_row_is_requirement_master(table_row, doc=None):
-    if doc is None:
-        doc = getattr(table_row, "document", None)
-    if doc is None and getattr(table_row, "document_id", None):
-        doc = db.session.get(DocumentRecord, table_row.document_id)
-    return is_requirement_master_source(doc) if doc else False
-
-
-def load_requirement_master_dataframe(doc, sheet_name=""):
-    if not doc or not storage.document_exists(doc.stored_filename, DOC_FOLDER):
-        return None, ""
-
-    try:
-        ext = (doc.extension or "").lower()
-        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as path:
-            if ext == "csv":
-                _text, _offsets, tables = extract_text_from_csv(path)
-                for name, df in tables or []:
-                    prepared = prepare_requirement_master_storage_df(df)
-                    if not prepared.empty:
-                        return prepared, str(name or "CSV")
-                return None, ""
-
-            workbook = pd.ExcelFile(path)
-            target_sheets = [sheet_name] if sheet_name else list(workbook.sheet_names)
-            for name in target_sheets:
-                if name not in workbook.sheet_names:
-                    continue
-                raw_df = pd.read_excel(workbook, sheet_name=name, header=None, dtype=object)
-                df = normalize_excel_sheet(raw_df, max_rows=REQUIREMENT_MASTER_MAX_ROWS)
-                prepared = prepare_requirement_master_storage_df(df)
-                if not prepared.empty:
-                    return prepared, str(name)
-    except Exception as exc:
-        print(f"Requirement master load error for {getattr(doc, 'original_filename', 'unknown')}: {exc}")
-    return None, ""
-
-
 class RequirementBlock(db.Model):
     __tablename__ = "requirement_blocks"
 
@@ -570,23 +436,6 @@ class TablePreview(db.Model):
     csv_text_en = db.Column(db.Text, default="")
     csv_text_es = db.Column(db.Text, default="")
     preview_title = db.Column(db.String(255), default="")
-
-
-class IndexJob(db.Model):
-    __tablename__ = "index_jobs"
-
-    id = db.Column(db.Integer, primary_key=True)
-    job_type = db.Column(db.String(50), default="bulk_reindex")
-    status = db.Column(db.String(20), default="queued", index=True)  # queued|running|completed|failed
-    document_ids_json = db.Column(db.Text, default="[]")
-    created_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    started_at = db.Column(db.DateTime, nullable=True)
-    finished_at = db.Column(db.DateTime, nullable=True)
-    progress_current = db.Column(db.Integer, default=0)
-    progress_total = db.Column(db.Integer, default=0)
-    message = db.Column(db.Text, default="")
-    error = db.Column(db.Text, default="")
 
 
 class TranslationCache(db.Model):
@@ -669,189 +518,6 @@ def is_admin():
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-INDEX_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, INDEX_JOB_WORKERS))
-_INDEX_JOB_LOCK = threading.Lock()
-
-
-def _now_utc():
-    return datetime.utcnow()
-
-
-def _safe_json_loads(text, default):
-    try:
-        return json.loads(text or "")
-    except Exception:
-        return default
-
-
-def index_job_status_label(status):
-    return {
-        "queued": "Queued",
-        "running": "Running",
-        "completed": "Completed",
-        "failed": "Failed",
-    }.get(status or "", status or "-")
-
-
-def job_to_dict(job):
-    return {
-        "id": job.id,
-        "job_type": job.job_type,
-        "status": job.status,
-        "status_label": index_job_status_label(job.status),
-        "created_at": (job.created_at.isoformat() if job.created_at else ""),
-        "started_at": (job.started_at.isoformat() if job.started_at else ""),
-        "finished_at": (job.finished_at.isoformat() if job.finished_at else ""),
-        "progress_current": int(job.progress_current or 0),
-        "progress_total": int(job.progress_total or 0),
-        "message": job.message or "",
-        "error": job.error or "",
-        "document_ids": _safe_json_loads(job.document_ids_json, []),
-    }
-
-
-def _set_job(job_id, **fields):
-    job = db.session.get(IndexJob, job_id)
-    if not job:
-        return
-    for key, value in fields.items():
-        setattr(job, key, value)
-    db.session.commit()
-
-
-def run_bulk_reindex_job(job_id):
-    with app.app_context():
-        job = db.session.get(IndexJob, job_id)
-        if not job:
-            return
-
-        doc_ids = []
-        for raw_id in _safe_json_loads(job.document_ids_json, []):
-            try:
-                doc_ids.append(int(raw_id))
-            except Exception:
-                continue
-
-        total = len(doc_ids)
-        _set_job(
-            job_id,
-            status="running",
-            started_at=_now_utc(),
-            progress_current=0,
-            progress_total=total,
-            message=f"Starting reindex for {total} document(s)…",
-            error="",
-        )
-
-        reindexed_count = 0
-        missing_count = 0
-        error_count = 0
-        error_names = []
-
-        for idx, document_id in enumerate(doc_ids, start=1):
-            try:
-                doc = db.session.get(DocumentRecord, document_id)
-                if not doc:
-                    missing_count += 1
-                    _set_job(
-                        job_id,
-                        progress_current=idx,
-                        message=f"Missing document id={document_id} ({idx}/{total})",
-                    )
-                    continue
-
-                _set_job(
-                    job_id,
-                    progress_current=idx - 1,
-                    message=f"Reindexing: {doc.original_filename} ({idx}/{total})",
-                )
-                index_document_record(doc)
-                reindexed_count += 1
-                _set_job(
-                    job_id,
-                    progress_current=idx,
-                    message=f"Reindexed: {doc.original_filename} ({idx}/{total})",
-                )
-            except Exception as exc:
-                db.session.rollback()
-                error_count += 1
-                try:
-                    doc = db.session.get(DocumentRecord, document_id)
-                    if doc:
-                        error_names.append(doc.original_filename)
-                except Exception:
-                    pass
-                _set_job(
-                    job_id,
-                    progress_current=idx,
-                    message=f"Error reindexing document id={document_id} ({idx}/{total})",
-                    error=str(exc),
-                )
-
-        summary = (
-            f"Bulk reindex completed. Reindexed: {reindexed_count}, "
-            f"Missing: {missing_count}, Errors: {error_count}."
-        )
-        if error_names:
-            preview = ", ".join(error_names[:5])
-            if len(error_names) > 5:
-                preview += f" (+{len(error_names) - 5} more)"
-            summary += f" Failed: {preview}."
-
-        _set_job(
-            job_id,
-            status="completed" if error_count == 0 else "failed",
-            finished_at=_now_utc(),
-            progress_current=total,
-            progress_total=total,
-            message=summary,
-        )
-
-
-def enqueue_bulk_reindex_job(document_ids, created_by=None):
-    raw_ids = []
-    for raw in document_ids or []:
-        try:
-            raw_ids.append(int(raw))
-        except Exception:
-            continue
-    if not raw_ids:
-        raise ValueError("No valid documents selected.")
-
-    job_cls = cast(Any, IndexJob)
-    job = job_cls(
-        job_type="bulk_reindex",
-        status="queued",
-        document_ids_json=json.dumps(raw_ids),
-        created_by=created_by,
-        created_at=_now_utc(),
-        progress_current=0,
-        progress_total=len(raw_ids),
-        message=f"Queued reindex for {len(raw_ids)} document(s).",
-        error="",
-    )
-    db.session.add(job)
-    db.session.commit()
-
-    def _submit():
-        try:
-            run_bulk_reindex_job(job.id)
-        except Exception as exc:
-            with app.app_context():
-                db.session.rollback()
-                _set_job(
-                    job.id,
-                    status="failed",
-                    finished_at=_now_utc(),
-                    error=str(exc),
-                    message="Job crashed unexpectedly.",
-                )
-
-    with _INDEX_JOB_LOCK:
-        INDEX_JOB_EXECUTOR.submit(_submit)
-    return job
 
 def sha256_of_file(path, chunk_size=1024 * 1024):
     h = hashlib.sha256()
@@ -2302,13 +1968,13 @@ def clean_dataframe_for_display(df, max_rows=50):
     return cleaned.head(max_rows).reset_index(drop=True)
 
 
-def extract_text_from_xlsx(path, max_sheet_rows=DEFAULT_EXCEL_MAX_ROWS):
+def extract_text_from_xlsx(path):
     workbook = pd.ExcelFile(path)
     all_parts = []
     tables = []
     for sheet_name in workbook.sheet_names:
         raw_df = pd.read_excel(workbook, sheet_name=sheet_name, header=None, dtype=object)
-        df = normalize_excel_sheet(raw_df, max_rows=max_sheet_rows)
+        df = normalize_excel_sheet(raw_df)
         if df.empty:
             continue
         tables.append((sheet_name, df))
@@ -2399,7 +2065,7 @@ def ocr_pdf(path):
 
     return full_text, page_offsets
 
-def extract_text_by_extension(path, excel_max_rows=DEFAULT_EXCEL_MAX_ROWS):
+def extract_text_by_extension(path):
     ext = file_ext(path)
 
     if ext == "pdf":
@@ -2436,7 +2102,7 @@ def extract_text_by_extension(path, excel_max_rows=DEFAULT_EXCEL_MAX_ROWS):
         return text, page_offsets, tables, False
 
     if ext == "xlsx":
-        text, page_offsets, tables = extract_text_from_xlsx(path, max_sheet_rows=excel_max_rows)
+        text, page_offsets, tables = extract_text_from_xlsx(path)
         return text, page_offsets, tables, False
 
     if ext in {"png", "jpg", "jpeg"}:
@@ -2953,8 +2619,8 @@ def prepare_table_display(full_df, footnotes_override=None):
     return html_table, preview_df, footnotes
 
 
-def build_table_html(df, max_rows=DEFAULT_TABLE_DISPLAY_ROWS):
-    full_df = finalize_display_dataframe(df, max_rows=max_rows)
+def build_table_html(df):
+    full_df = finalize_display_dataframe(df, max_rows=40)
     if full_df.empty:
         return "", pd.DataFrame()
 
@@ -2971,31 +2637,9 @@ def dataframe_from_table_csv(csv_text):
         return None
 
 
-def render_table_preview_html(table_row, lang="nl", doc=None):
-    if doc is None:
-        doc = getattr(table_row, "document", None)
-    if doc is None and getattr(table_row, "document_id", None):
-        doc = db.session.get(DocumentRecord, table_row.document_id)
-
+def render_table_preview_html(table_row, lang="nl"):
     csv_text = (table_row.csv_text or "").strip()
     csv_text_en = (table_row.csv_text_en or "").strip()
-    if lang == "en" and table_row_is_requirement_master(table_row, doc=doc):
-        if csv_text_en:
-            df_en = dataframe_from_table_csv(csv_text_en)
-            if df_en is not None and not df_en.empty:
-                html_table, _, _ = prepare_table_display(
-                    finalize_display_dataframe(df_en, max_rows=200)
-                )
-                if html_table:
-                    return html_table
-        if csv_text:
-            df = dataframe_from_table_csv(csv_text)
-            if df is not None and not df.empty:
-                html_table, _ = build_requirement_master_english_table(df, max_rows=200)
-                if html_table:
-                    return html_table
-        return table_row.html_table_en or table_row.html_table or ""
-
     if lang == "en" and csv_text_en:
         df_en = dataframe_from_table_csv(csv_text_en)
         if df_en is not None and not df_en.empty:
@@ -3066,26 +2710,16 @@ def translate_preview_df_to_html(preview_df, target_lang="en"):
     return html_table
 
 
-def save_table_previews(doc_id, tables, max_display_rows=DEFAULT_TABLE_DISPLAY_ROWS, skip_translation=False):
+def save_table_previews(doc_id, tables):
     for sheet_name, df in tables:
         if df is None:
             continue
-        is_master_storage = skip_translation or max_display_rows >= REQUIREMENT_MASTER_MAX_ROWS
-        if is_master_storage:
-            full_df = prepare_requirement_master_storage_df(df, max_rows=max_display_rows)
-            if full_df.empty:
-                continue
-            preview_df = full_df.head(200)
-            html_table, _, _ = prepare_table_display(preview_df)
-        else:
-            html_table, full_df = build_table_html(df, max_rows=max_display_rows)
-            if full_df.empty:
-                continue
+        html_table, full_df = build_table_html(df)
+        if full_df.empty:
+            continue
         html_table_en = ""
         csv_text_en = ""
-        if is_master_storage:
-            html_table_en, csv_text_en = build_requirement_master_english_table(full_df, max_rows=200)
-        elif translation.translation_enabled():
+        if translation.translation_enabled():
             html_table_en, csv_text_en = translate_preview_df(full_df, "en")
         csv_buf = io.StringIO()
         full_df.to_csv(csv_buf, index=False)
@@ -3116,26 +2750,18 @@ def table_preview_needs_regenerate(tables):
     return False
 
 
-def table_preview_needs_translation(tables, doc=None):
+def table_preview_needs_translation(tables):
     if not translation.translation_enabled():
         return False
-    if doc and is_requirement_master_source(doc):
-        return False
     for row in tables:
-        if table_row_is_requirement_master(row, doc=doc):
-            continue
         if not (row.html_table_en or "").strip():
             return True
     return False
 
 
-def refresh_table_translations_from_cache(tables, doc=None):
+def refresh_table_translations_from_cache(tables):
     updated = False
-    if doc and is_requirement_master_source(doc):
-        return False
     for row in tables:
-        if table_row_is_requirement_master(row, doc=doc):
-            continue
         needs_en = not (row.html_table_en or "").strip()
         if (
             not needs_en
@@ -3176,10 +2802,8 @@ def regenerate_table_previews(doc_record):
         doc_record.stored_filename, DOC_FOLDER
     ) as full_path:
         ensure_indexable_file(full_path)
-        master_doc = is_requirement_master_source(doc_record)
-        excel_max_rows = REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_EXCEL_MAX_ROWS
         if ext == "xlsx":
-            _, _, tables = extract_text_from_xlsx(full_path, max_sheet_rows=excel_max_rows)
+            _, _, tables = extract_text_from_xlsx(full_path)
         else:
             _, _, tables = extract_text_from_csv(full_path)
 
@@ -3187,12 +2811,7 @@ def regenerate_table_previews(doc_record):
         return []
 
     TablePreview.query.filter_by(document_id=doc_record.id).delete()
-    save_table_previews(
-        doc_record.id,
-        tables,
-        max_display_rows=REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_TABLE_DISPLAY_ROWS,
-        skip_translation=master_doc,
-    )
+    save_table_previews(doc_record.id, tables)
     db.session.commit()
     return TablePreview.query.filter_by(document_id=doc_record.id).all()
 
@@ -3220,11 +2839,7 @@ def _index_document_record_impl(doc_record):
         doc_record.stored_filename, DOC_FOLDER
     ) as full_path:
         ensure_indexable_file(full_path)
-        master_doc = is_requirement_master_source(doc_record)
-        excel_max_rows = REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_EXCEL_MAX_ROWS
-        text, page_offsets, tables, used_ocr = extract_text_by_extension(
-            full_path, excel_max_rows=excel_max_rows
-        )
+        text, page_offsets, tables, used_ocr = extract_text_by_extension(full_path)
 
     doc_record.is_ocr = used_ocr
     doc_record.text_preview = text[:TEXT_PREVIEW_LIMIT]
@@ -3288,12 +2903,7 @@ def _index_document_record_impl(doc_record):
             db.session.commit()
             pending = 0
 
-    save_table_previews(
-        doc_record.id,
-        tables,
-        max_display_rows=REQUIREMENT_MASTER_MAX_ROWS if master_doc else DEFAULT_TABLE_DISPLAY_ROWS,
-        skip_translation=master_doc,
-    )
+    save_table_previews(doc_record.id, tables)
     db.session.commit()
     dedupe_requirement_blocks_by_id()
 
@@ -3750,118 +3360,44 @@ def parse_dictionary_sheet(df, entry_kind=None):
     return entries, kind
 
 
-def import_dictionary_sheet(file_path, sheet_name, original_filename, forced_entry_kind=None):
-    raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
-    if raw_df.empty:
-        return [], forced_entry_kind or "reference"
-
-    matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
-    header_row = find_dictionary_header_row(
-        raw_df, sheet_name=sheet_name, original_filename=original_filename
-    )
-
-    if forced_entry_kind == "cabinet":
-        entries, entry_kind = parse_cabinet_matrix(
-            matrix, sheet_name=sheet_name, original_filename=original_filename
-        )
-        if not entries and matrix:
-            entries, entry_kind = parse_cabinet_matrix(
-                raw_df.values.tolist(),
-                sheet_name=sheet_name,
-                original_filename=original_filename,
-            )
-        return entries, entry_kind
-
-    if forced_entry_kind in {"abbreviation", "reference"}:
-        if header_row is None:
-            return [], forced_entry_kind
-        df = build_dictionary_dataframe_from_raw(raw_df, header_row)
-        return parse_dictionary_sheet(df, entry_kind=forced_entry_kind)
-
-    cabinet_sheet = sheet_is_cabinet_data(raw_df, sheet_name, original_filename)
-    if cabinet_sheet:
-        entries, entry_kind = parse_cabinet_matrix(
-            matrix, sheet_name=sheet_name, original_filename=original_filename
-        )
-        if not entries and matrix:
-            entries, entry_kind = parse_cabinet_matrix(
-                raw_df.values.tolist(),
-                sheet_name=sheet_name,
-                original_filename=original_filename,
-            )
-        return entries, entry_kind
-
-    if header_row is None:
-        entries, entry_kind = parse_cabinet_matrix(
-            matrix or raw_df.values.tolist(),
-            sheet_name=sheet_name,
-            original_filename=original_filename,
-        )
-        return entries, entry_kind
-
-    df = build_dictionary_dataframe_from_raw(raw_df, header_row)
-    forced_kind = "abbreviation" if sheet_is_glossary_data(raw_df, sheet_name) else None
-    return parse_dictionary_sheet(df, entry_kind=forced_kind)
-
-
-def persist_dictionary_entries(source, entries, entry_kind):
-    DictionaryEntry.query.filter_by(source_id=source.id).delete()
-    dict_entry_cls = cast(Any, DictionaryEntry)
-    for entry in entries:
-        db.session.add(
-            dict_entry_cls(
-                source_id=source.id,
-                term=entry["term"],
-                content=entry["content"],
-                content_nl=entry.get("content_nl", ""),
-                content_en=entry.get("content_en", ""),
-                search_keys=entry.get("search_keys", ""),
-                entry_kind=entry["entry_kind"],
-                row_number=entry["row_number"],
-            )
-        )
-    source.entry_kind = entry_kind
-    source.entry_count = len(entries)
-
-
-def reimport_dictionary_source(source, entry_kind):
-    if entry_kind not in VALID_DICTIONARY_ENTRY_KINDS:
-        raise ValueError("Invalid definition type.")
-    if not storage.document_exists(source.stored_filename, DICT_FOLDER):
-        raise FileNotFoundError("Stored definition file not found.")
-
-    sheet_name = source.sheet_name or ""
-    with storage.open_document_local_path(source.stored_filename, DICT_FOLDER) as path:
-        if not sheet_name:
-            workbook = pd.ExcelFile(path)
-            sheet_name = workbook.sheet_names[0] if workbook.sheet_names else ""
-        entries, parsed_kind = import_dictionary_sheet(
-            path,
-            sheet_name,
-            source.original_filename,
-            forced_entry_kind=entry_kind,
-        )
-
-    if not entries:
-        raise ValueError(
-            f"No rows found when parsing as {dictionary_entry_kind_label(entry_kind)}. "
-            "Check that the sheet columns match the selected type."
-        )
-
-    persist_dictionary_entries(source, entries, parsed_kind)
-    db.session.commit()
-    return len(entries)
-
-
 def import_dictionary_excel(file_path, original_filename):
     workbook = pd.ExcelFile(file_path)
     imported_sources = []
     skipped_sheets = []
 
     for sheet_name in workbook.sheet_names:
-        entries, entry_kind = import_dictionary_sheet(
-            file_path, sheet_name, original_filename
+        raw_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None, dtype=object)
+        if raw_df.empty:
+            skipped_sheets.append(sheet_name)
+            continue
+
+        matrix = load_dictionary_sheet_matrix(file_path, sheet_name)
+        header_row = find_dictionary_header_row(
+            raw_df, sheet_name=sheet_name, original_filename=original_filename
         )
+        cabinet_sheet = sheet_is_cabinet_data(
+            raw_df, sheet_name, original_filename
+        )
+        if cabinet_sheet:
+            entries, entry_kind = parse_cabinet_matrix(
+                matrix, sheet_name=sheet_name, original_filename=original_filename
+            )
+            if not entries and matrix:
+                entries, entry_kind = parse_cabinet_matrix(
+                    raw_df.values.tolist(),
+                    sheet_name=sheet_name,
+                    original_filename=original_filename,
+                )
+        elif header_row is None:
+            entries, entry_kind = parse_cabinet_matrix(
+                matrix or raw_df.values.tolist(),
+                sheet_name=sheet_name,
+                original_filename=original_filename,
+            )
+        else:
+            df = build_dictionary_dataframe_from_raw(raw_df, header_row)
+            forced_kind = "abbreviation" if sheet_is_glossary_data(raw_df, sheet_name) else None
+            entries, entry_kind = parse_dictionary_sheet(df, entry_kind=forced_kind)
         if not entries:
             skipped_sheets.append(sheet_name)
             continue
@@ -3885,8 +3421,7 @@ def import_dictionary_excel(file_path, original_filename):
             storage.save_document(existing.stored_filename, file_path, DICT_FOLDER)
         else:
             stored_filename = f"{uuid.uuid4().hex}.xlsx"
-            dict_source_cls = cast(Any, DictionarySource)
-            source = dict_source_cls(
+            source = DictionarySource(
                 name=display_name,
                 original_filename=original_filename,
                 stored_filename=stored_filename,
@@ -3898,7 +3433,21 @@ def import_dictionary_excel(file_path, original_filename):
             db.session.flush()
             storage.save_document(stored_filename, file_path, DICT_FOLDER)
 
-        persist_dictionary_entries(source, entries, entry_kind)
+        for entry in entries:
+            db.session.add(
+                DictionaryEntry(
+                    source_id=source.id,
+                    term=entry["term"],
+                    content=entry["content"],
+                    content_nl=entry.get("content_nl", ""),
+                    content_en=entry.get("content_en", ""),
+                    search_keys=entry.get("search_keys", ""),
+                    entry_kind=entry["entry_kind"],
+                    row_number=entry["row_number"],
+                )
+            )
+
+        source.entry_count = len(entries)
         imported_sources.append(
             {
                 "source": source,
@@ -3917,15 +3466,6 @@ def dictionary_entry_kind_label(entry_kind):
         "cabinet": "Cabinets",
         "reference": "Project Documents",
     }.get(entry_kind, "Definition")
-
-
-VALID_DICTIONARY_ENTRY_KINDS = {"abbreviation", "reference", "cabinet"}
-
-DICTIONARY_ENTRY_KIND_OPTIONS = [
-    {"kind": "abbreviation", "label": "Glossary"},
-    {"kind": "cabinet", "label": "Cabinets"},
-    {"kind": "reference", "label": "Project Documents"},
-]
 
 
 DICTIONARY_TYPE_OPTIONS = [
@@ -5134,17 +4674,10 @@ HOME_TEMPLATE = """
                 <div class="meta" style="margin-top:10px;">
                     Requirement: <strong>{{ req_lookup.normalized_id or req_lookup_query }}</strong>
                     · Requirement rows: <strong>{{ req_lookup.requirement_row_count }}</strong>
-                    · Related Excel files: <strong>{{ req_lookup.document_count }}</strong>
+                    · Records: <strong>{{ req_lookup.block_count }}</strong>
+                    · Related documents: <strong>{{ req_lookup.document_count }}</strong>
                     · Tables: <strong>{{ req_lookup.table_count }}</strong>
                 </div>
-
-                {% if req_lookup.requirement_row_count == 0 and req_lookup.master_source_count > 0 %}
-                <div class="warning" style="margin-top:10px;">
-                    No rows matched in the requirement master table for this ID.
-                    Open <strong>Documents &amp; upload</strong>, set Tennet Requirements to
-                    <strong>Requirement master table (總表)</strong>, then click <strong>Reindex</strong>.
-                </div>
-                {% endif %}
 
                 {% if req_lookup.requirement_rows %}
                 <div class="result-item" style="margin-top:12px;">
@@ -5152,18 +4685,46 @@ HOME_TEMPLATE = """
                     {% for row in req_lookup.requirement_rows %}
                     <div class="summary-box" style="margin-top:10px;">
                         <div class="meta">
-                            <strong>{{ row.spec_code or ('Row ' ~ row.row_number) }}</strong>
-                            · {{ row.document_name }}
+                            <strong>{{ row.document_name }}</strong>
                             · Sheet: {{ row.sheet_name }}
                             · Row: {{ row.row_number }}
                             · <a href="{{ url_for('table_preview', document_id=row.document_id) }}" target="_blank">Open table</a>
                         </div>
-                        {% for cell in row.cells %}
-                        <div style="margin-top:8px;">
-                            <div class="meta"><strong>{{ cell.column }}</strong></div>
-                            <div style="white-space:pre-wrap; margin-top:4px;">{{ cell.value }}</div>
+                        <div class="table-scroll-wrap" style="margin-top:8px;">
+                            <table class="data-table" style="width:max-content; min-width:100%;">
+                                <tr>
+                                    {% for cell in row.cells %}
+                                    <th>{{ cell.column }}</th>
+                                    {% endfor %}
+                                </tr>
+                                <tr>
+                                    {% for cell in row.cells %}
+                                    <td style="white-space:pre-wrap; min-width:160px;">{{ cell.value }}</td>
+                                    {% endfor %}
+                                </tr>
+                            </table>
                         </div>
-                        {% endfor %}
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if req_lookup.blocks %}
+                <div class="result-item" style="margin-top:12px;">
+                    <strong>Requirement information (indexed text)</strong>
+                    {% for item in req_lookup.blocks %}
+                    <div class="summary-box" style="margin-top:10px;">
+                        <div class="meta"><strong>{{ item.requirement_id or '-' }}</strong> · {{ item.document_name }}</div>
+                        {% if item.title %}<div><strong>Title:</strong> {{ item.title }}</div>{% endif %}
+                        {% if item.section %}<div><strong>Section:</strong> {{ item.section }}</div>{% endif %}
+                        {% if item.summary %}<div><strong>Summary:</strong> {{ item.summary }}</div>{% endif %}
+                        {% if item.definition %}<div><strong>Definition:</strong> {{ item.definition }}</div>{% endif %}
+                        {% if item.full_text %}
+                        <div style="margin-top:8px; white-space:pre-wrap;">{{ item.full_text }}</div>
+                        {% endif %}
+                        <div class="meta" style="margin-top:8px;">
+                            <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Open requirement page</a>
+                        </div>
                     </div>
                     {% endfor %}
                 </div>
@@ -5176,25 +4737,7 @@ HOME_TEMPLATE = """
                     <div class="summary-box" style="margin-top:10px;">
                         <div><strong>{{ t.document_name }}</strong></div>
                         <div class="meta">Sheet: {{ t.sheet_name }} · Format: {{ t.table_format }}</div>
-                        <div class="table-result-columns" style="margin-top:12px;">
-                            <div class="table-result-panel snippet-panel-original">
-                                <strong>Dutch (Original)</strong>
-                                <div class="table-scroll-wrap">
-                                    <div class="data-table">{{ t.html_table|safe }}</div>
-                                </div>
-                            </div>
-                            {% if t.html_table_en %}
-                            <div class="table-result-panel snippet-panel-translation">
-                                <strong>English (Translation)</strong>
-                                <div class="table-scroll-wrap">
-                                    <div class="data-table">{{ t.html_table_en|safe }}</div>
-                                </div>
-                            </div>
-                            {% endif %}
-                        </div>
-                        <div class="meta" style="margin-top:8px;">
-                            <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open full table preview</a>
-                        </div>
+                        <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open table</a>
                     </div>
                     {% endfor %}
                 </div>
@@ -5616,7 +5159,6 @@ UPLOAD_PANEL = """
                 <div class="small" style="margin-top:6px;">
                     Use <strong>Requirement master table (總表)</strong> for Tennet Requirements Excel files.
                     These rows appear in the Requirement Browser on the home page.
-                    The master table is not machine-translated because it already includes English columns.
                     Individual AM-Req spreadsheets should use <strong>Standard document</strong>.
                 </div>
             </div>
@@ -5676,56 +5218,10 @@ DOCS_TEMPLATE = """
         </div>
     </div>
 
-    {% if index_jobs %}
-    <div class="stats-panel" id="index-jobs-panel">
-        <div class="panel-title">Background index jobs</div>
-        <div class="small" style="margin-top:6px;">
-            Jobs run in the background to avoid request timeouts. This page auto-refreshes job status.
-        </div>
-        <table class="data-table" style="width:100%; margin-top:12px;">
-            <tr>
-                <th style="width:80px;">Job ID</th>
-                <th style="width:110px;">Status</th>
-                <th style="width:120px;">Progress</th>
-                <th>Message</th>
-                <th style="width:220px;">Created</th>
-            </tr>
-            {% for j in index_jobs %}
-            {% set job = job_to_dict(j) %}
-            <tr data-job-id="{{ job.id }}" class="index-job-row">
-                <td>#{{ job.id }}</td>
-                <td class="job-status">{{ job.status_label }}</td>
-                <td class="job-progress">{{ job.progress_current }}/{{ job.progress_total }}</td>
-                <td class="job-message" style="white-space:pre-wrap;">{{ job.message }}</td>
-                <td>{{ job.created_at }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
-    {% endif %}
-
     <form method="POST" action="{{ url_for('bulk_delete_documents') }}">
         <div class="panel-title" style="margin-top:8px;">Indexed documents</div>
-        <div class="small" style="margin:6px 0 10px 0; display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-            <span>Showing page <strong>{{ docs_page }}</strong> / {{ docs_total_pages }} ({{ docs_page_size }} per page)</span>
-            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=1, check_files=('1' if check_files else '0')) }}">First</a>
-            {% if docs_page > 1 %}
-            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_page-1, check_files=('1' if check_files else '0')) }}">Prev</a>
-            {% endif %}
-            {% if docs_page < docs_total_pages %}
-            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_page+1, check_files=('1' if check_files else '0')) }}">Next</a>
-            {% endif %}
-            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_total_pages, check_files=('1' if check_files else '0')) }}">Last</a>
-            {% if not check_files %}
-            <a class="btn btn-purple btn-small" href="{{ url_for('admin_documents', page=docs_page, check_files=1) }}">Check file availability</a>
-            <span>(This may be slower)</span>
-            {% else %}
-            <a class="btn btn-gray btn-small" href="{{ url_for('admin_documents', page=docs_page, check_files=0) }}">Stop checking files</a>
-            {% endif %}
-        </div>
         <div style="margin-bottom:12px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
             <button type="submit" formaction="{{ url_for('bulk_reindex_documents') }}" class="btn btn-green" onclick="return confirmBulkReindex();">Reindex Selected</button>
-            <button type="submit" formaction="{{ url_for('bulk_reindex_documents_async') }}" class="btn btn-purple" onclick="return confirmBulkReindexAsync(this.form);">Reindex Selected (background)</button>
             <button type="submit" class="btn btn-orange" onclick="return confirmBulkDelete();">Delete Selected</button>
             <button type="button" class="btn btn-gray" onclick="toggleAll(true)">Select All</button>
             <button type="button" class="btn btn-gray" onclick="toggleAll(false)">Clear All</button>
@@ -5762,9 +5258,7 @@ DOCS_TEMPLATE = """
                 <td>{{ 'Yes' if d.is_ocr else 'No' }}</td>
                 <td>{{ d.status }}</td>
                 <td>
-                    {% if row.file_available is none %}
-                    <span style="color:#6c757d; font-weight:700;">Unknown</span>
-                    {% elif row.file_available %}
+                    {% if row.file_available %}
                     <span style="color:#198754; font-weight:700;">OK</span>
                     {% else %}
                     <span style="color:#dc3545; font-weight:700;">Missing</span>
@@ -5823,20 +5317,6 @@ function confirmBulkReindex() {
     return confirm('Reindex ' + checked.length + ' selected document(s)? This may take a while.');
 }
 
-function confirmBulkReindexAsync(form) {
-    const checked = document.querySelectorAll('.doc-checkbox:checked');
-    if (checked.length === 0) {
-        alert('Please select at least one document to reindex.');
-        return false;
-    }
-    const ok = confirm(
-        'Queue background reindex for ' + checked.length + ' selected document(s)? ' +
-        'You can leave this page and come back later.'
-    );
-    if (!ok) return false;
-    return true;
-}
-
 function handleUploadSubmit(form) {
     const btn = form.querySelector('#upload-submit-btn');
     if (!btn || btn.disabled) {
@@ -5857,36 +5337,6 @@ function handleUploadSubmit(form) {
             target.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         }
     }
-})();
-
-(function () {
-    const jobRows = Array.from(document.querySelectorAll('.index-job-row'));
-    if (!jobRows.length) return;
-
-    async function refreshOne(row) {
-        const jobId = row.getAttribute('data-job-id');
-        if (!jobId) return;
-        try {
-            const res = await fetch('/api/index-job/' + jobId);
-            if (!res.ok) return;
-            const data = await res.json();
-            const statusEl = row.querySelector('.job-status');
-            const progressEl = row.querySelector('.job-progress');
-            const msgEl = row.querySelector('.job-message');
-            if (statusEl) statusEl.textContent = data.status_label || data.status || '-';
-            if (progressEl) progressEl.textContent = (data.progress_current || 0) + '/' + (data.progress_total || 0);
-            if (msgEl) msgEl.textContent = data.message || '';
-        } catch (e) {
-            // ignore polling errors
-        }
-    }
-
-    async function refreshAll() {
-        await Promise.all(jobRows.map(refreshOne));
-    }
-
-    refreshAll();
-    setInterval(refreshAll, 2500);
 })();
 </script>
 </body>
@@ -6710,8 +6160,7 @@ ADMIN_DICTIONARIES_TEMPLATE = """
             <strong>Glossary (3 columns):</strong> Abreviation | Full Name | English Translation<br>
             <strong>Cabinet file:</strong> <code>=__+A001</code> | Dutch function (English auto-translated on upload)<br>
             <strong>Project documents:</strong> Document | Content<br>
-            Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.<br>
-            If the auto-detected <strong>Type</strong> is wrong, change it in the table below and click <strong>Save</strong>.
+            Multi-sheet workbooks are supported. Re-uploading the same filename replaces existing entries for that file.
         </div>
         <form method="POST" enctype="multipart/form-data" onsubmit="return handleDictUploadSubmit(this);">
             <input type="file" name="dictionary_file" accept=".xlsx,.xls" required>
@@ -6739,16 +6188,7 @@ ADMIN_DICTIONARIES_TEMPLATE = """
                 <td>{{ row.name }}</td>
                 <td>{{ row.original_filename }}</td>
                 <td>{{ row.sheet_name or '-' }}</td>
-                <td>
-                    <form method="POST" action="{{ url_for('update_dictionary_source_type', source_id=row.id) }}" style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                        <select name="entry_kind" style="padding:6px; min-width:160px;">
-                            {% for option in dictionary_kind_options %}
-                            <option value="{{ option.kind }}" {% if row.entry_kind == option.kind %}selected{% endif %}>{{ option.label }}</option>
-                            {% endfor %}
-                        </select>
-                        <button type="submit" class="btn btn-gray" style="padding:6px 10px;">Save</button>
-                    </form>
-                </td>
+                <td>{{ row.kind_label }}</td>
                 <td>{{ row.entry_count }}</td>
                 <td>{{ row.uploaded_at }}</td>
                 <td>
@@ -6792,40 +6232,25 @@ def normalize_requirement_lookup_id(raw_query):
     return query
 
 
-def extract_requirement_spec_code(text):
-    match = REQ_ID_REGEX.search(text or "")
-    return match.group(1) if match else ""
-
-
-def is_base_requirement_lookup_id(req_id):
+def requirement_lookup_variants(req_id):
     normalized = normalize_requirement_lookup_id(req_id)
-    match = REQ_ID_REGEX.search(normalized)
-    if not match:
-        return "." not in normalized.rsplit("-", 1)[-1]
-    numeric_part = match.group(1).rsplit("-", 1)[-1]
-    return "." not in numeric_part
+    if not normalized:
+        return []
 
-
-def requirement_spec_matches_lookup(lookup_id, spec_text):
-    lookup = normalize_requirement_lookup_id(lookup_id)
-    spec = extract_requirement_spec_code(spec_text) or (spec_text or "").strip()
-    if not lookup or not spec:
-        return False
-    lookup_key = lookup.lower()
-    spec_key = spec.lower()
-    if spec_key == lookup_key:
-        return True
-    if spec_key.startswith(lookup_key + "."):
-        return True
-    if is_base_requirement_lookup_id(lookup) and spec_key.startswith(lookup_key):
-        suffix = spec_key[len(lookup_key):]
-        return not suffix or suffix.startswith(".")
-    return False
+    variants = [normalized]
+    family_match = re.match(
+        r"^([A-Z]{1,10}-Req-\d+)(?:\.\d+)?$",
+        normalized,
+        re.IGNORECASE,
+    )
+    if family_match:
+        family_id = family_match.group(1)
+        if family_id.lower() != normalized.lower():
+            variants.append(family_id)
+    return variants
 
 
 def requirement_id_matches_text(req_id, text):
-    if requirement_spec_matches_lookup(req_id, text):
-        return True
     req = (req_id or "").strip().lower()
     value = (text or "").strip().lower()
     if not req or not value:
@@ -6837,201 +6262,83 @@ def requirement_id_matches_text(req_id, text):
     return bool(req_compact and req_compact in value_compact)
 
 
-def find_spec_code_column(columns):
-    for col in columns:
-        norm = re.sub(r"[^a-z0-9]", "", str(col).lower())
-        if norm in {"speccode", "requirementid", "reqid"}:
-            return col
-    for col in columns:
-        lowered = str(col).lower()
-        if "spec" in lowered and "code" in lowered:
-            return col
-    return None
-
-
-def row_spec_code_value(df, row_idx, spec_col, columns):
-    if spec_col is not None:
-        value = cell_to_dictionary_text(df.iloc[row_idx].get(spec_col))
-        if value and value.lower() not in {"speccode", "spec code"}:
-            return value
-    for col in columns:
-        value = cell_to_dictionary_text(df.iloc[row_idx].get(col))
-        code = extract_requirement_spec_code(value)
-        if code:
-            return code
-    return ""
-
-
-def build_merged_row_cells(df, row_indices, columns):
-    merged = {}
-    for col in columns:
-        parts = []
-        for row_idx in row_indices:
-            value = cell_to_dictionary_text(df.iloc[row_idx].get(col))
-            if not value:
-                continue
-            if not parts or value != parts[-1]:
-                parts.append(value)
-        if parts:
-            merged[col] = "\n".join(parts)
-    return merged
-
-
-def document_matches_requirement_lookup(doc, lookup_id):
-    if not doc or is_requirement_master_document(doc):
-        return False
-    filename = doc.original_filename or ""
-    stored = doc.stored_filename or ""
-    file_req = requirement_id_from_filename(filename)
-    if file_req and requirement_spec_matches_lookup(lookup_id, file_req):
-        return True
-    if requirement_id_matches_text(lookup_id, filename):
-        return True
-    if requirement_id_matches_text(lookup_id, stored):
-        return True
-    return False
-
-
-def collect_requirement_rows_from_dataframe(
-    df,
-    req_id,
-    *,
-    document_id,
-    document_name,
-    sheet_name,
-    table_format,
-    max_rows,
-    seen,
-    rows,
-):
-    if df is None or df.empty:
-        return
-
-    columns = [str(col) for col in df.columns]
-    spec_col = find_spec_code_column(columns)
-    row_idx = 0
-    while row_idx < len(df):
-        spec_value = row_spec_code_value(df, row_idx, spec_col, columns)
-        if not spec_value or not requirement_spec_matches_lookup(req_id, spec_value):
-            row_idx += 1
-            continue
-
-        group_indices = [row_idx]
-        primary_spec = extract_requirement_spec_code(spec_value) or spec_value
-        primary_key = normalize_requirement_lookup_id(primary_spec).lower()
-        next_idx = row_idx + 1
-        while next_idx < len(df):
-            next_spec = row_spec_code_value(df, next_idx, spec_col, columns)
-            if next_spec:
-                next_code = extract_requirement_spec_code(next_spec) or next_spec
-                next_key = normalize_requirement_lookup_id(next_code).lower()
-                if next_key == primary_key:
-                    group_indices.append(next_idx)
-                    next_idx += 1
-                    continue
-                if requirement_spec_matches_lookup(req_id, next_spec):
-                    break
-                break
-            group_indices.append(next_idx)
-            next_idx += 1
-
-        row_position = int(cast(Any, row_idx))
-        row_key = (document_id, sheet_name or "", row_position)
-        if row_key not in seen:
-            seen.add(row_key)
-            merged_cells = build_merged_row_cells(df, group_indices, columns)
-            cells = [
-                {"column": col_name, "value": value}
-                for col_name, value in merged_cells.items()
-                if value
-            ]
-            if cells:
-                rows.append(
-                    {
-                        "document_id": document_id,
-                        "document_name": document_name,
-                        "sheet_name": sheet_name or "-",
-                        "table_format": table_format or "-",
-                        "row_number": row_position + 1,
-                        "spec_code": extract_requirement_spec_code(spec_value) or spec_value,
-                        "cells": cells,
-                    }
-                )
-
-        row_idx = next_idx if next_idx > row_idx else row_idx + 1
-        if len(rows) >= max_rows:
-            return
-
-
-def build_requirement_rows_from_tables(req_id, max_rows=100, master_documents=None):
+def build_requirement_rows_from_tables(req_id, max_rows=10):
     if not req_id:
         return []
 
-    rows = []
-    seen = set()
-    master_documents = master_documents if master_documents is not None else get_requirement_master_documents()
-    for doc in master_documents:
-        try:
-            df, sheet_name = load_requirement_master_dataframe(doc, sheet_name="")
-            if df is None or df.empty:
-                table = (
-                    TablePreview.query.filter_by(document_id=doc.id)
-                    .order_by(TablePreview.id.desc())
-                    .first()
-                )
-                if table:
-                    df = table_preview_to_dataframe(table, "nl")
-                    sheet_name = table.sheet_name or sheet_name
-            if df is None or df.empty:
-                continue
+    variants = requirement_lookup_variants(req_id)
+    if not variants:
+        return []
 
-            collect_requirement_rows_from_dataframe(
-                df,
-                req_id,
-                document_id=doc.id,
-                document_name=doc.original_filename or f"Document {doc.id}",
-                sheet_name=sheet_name,
-                table_format=doc.extension or "xlsx",
-                max_rows=max_rows,
-                seen=seen,
-                rows=rows,
-            )
-            if len(rows) >= max_rows:
-                break
-        except Exception as exc:
-            print(f"Requirement master search error for {getattr(doc, 'original_filename', 'unknown')}: {exc}")
-            continue
-
-    rows.sort(key=lambda item: (item.get("spec_code") or "", item.get("row_number") or 0))
-    return rows
-
-
-def find_matching_requirement_table_document_ids(lookup_id):
-    if not lookup_id:
-        return set()
-
-    candidate_docs = (
-        DocumentRecord.query.filter(
-            DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
-            DocumentRecord.extension.in_(("csv", "xlsx")),
-            db.or_(
-                DocumentRecord.original_filename.ilike(f"%{lookup_id}%"),
-                DocumentRecord.stored_filename.ilike(f"%{lookup_id}%"),
-            ),
+    sql_matchers = []
+    for variant in variants:
+        sql_matchers.extend(
+            [
+                TablePreview.csv_text.ilike(f"%{variant}%"),
+                TablePreview.csv_text_en.ilike(f"%{variant}%"),
+                TablePreview.html_table.ilike(f"%{variant}%"),
+                TablePreview.html_table_en.ilike(f"%{variant}%"),
+            ]
         )
+
+    candidates = (
+        TablePreview.query.join(DocumentRecord)
+        .filter(DocumentRecord.document_type == DOCUMENT_TYPE_REQUIREMENT_MASTER)
+        .filter(db.or_(*sql_matchers))
+        .order_by(TablePreview.id.desc())
         .all()
     )
-    return {
-        doc.id
-        for doc in candidate_docs
-        if document_matches_requirement_lookup(doc, lookup_id)
-    }
+
+    rows = []
+    seen = set()
+    for table in candidates:
+        df = table_preview_to_dataframe(table, "nl")
+        if df is None or df.empty:
+            continue
+
+        columns = [str(col) for col in df.columns]
+        for row_idx, row in df.iterrows():
+            values = [cell_to_dictionary_text(row.get(col)) for col in df.columns]
+            if not any(
+                requirement_id_matches_text(variant, value)
+                for variant in variants
+                for value in values
+            ):
+                continue
+
+            row_position = int(cast(Any, row_idx))
+            row_key = (table.document_id, table.sheet_name or "", row_position)
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+
+            cells = []
+            for col_name, value in zip(columns, values):
+                if not value:
+                    continue
+                cells.append({"column": col_name, "value": value})
+            if not cells:
+                continue
+
+            doc = table.document
+            rows.append(
+                {
+                    "document_id": table.document_id,
+                    "document_name": doc.original_filename if doc else f"Document {table.document_id}",
+                    "sheet_name": table.sheet_name or "-",
+                    "table_format": table.table_format or "-",
+                    "row_number": row_position + 1,
+                    "cells": cells,
+                }
+            )
+            if len(rows) >= max_rows:
+                return rows
+    return rows
 
 
 def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
     query = (raw_query or "").strip()
     normalized = normalize_requirement_lookup_id(query)
-    master_documents = get_requirement_master_documents()
     if not normalized:
         return {
             "found": False,
@@ -7041,27 +6348,82 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
             "block_count": 0,
             "table_count": 0,
             "document_count": 0,
-            "requirement_rows": [],
-            "requirement_row_count": 0,
-            "master_source_count": len(master_documents),
         }
 
-    base_lookup = is_base_requirement_lookup_id(normalized)
-    row_limit = 100 if base_lookup else 20
-    requirement_rows = build_requirement_rows_from_tables(
-        normalized,
-        max_rows=row_limit,
-        master_documents=master_documents,
-    )
-    matched_doc_ids = find_matching_requirement_table_document_ids(normalized)
+    variants = requirement_lookup_variants(normalized)
+    key = normalized.lower()
 
-    table_limit = max(max_tables, 12 if base_lookup else max_tables)
+    exact_blocks = RequirementBlock.query.filter(
+        db.func.lower(RequirementBlock.requirement_id) == key
+    ).all()
+
+    variant_filters = [
+        RequirementBlock.requirement_id.ilike(f"%{variant}%")
+        for variant in variants
+    ]
+    if not variant_filters:
+        variant_filters = [RequirementBlock.requirement_id.ilike(f"%{normalized}%")]
+
+    if exact_blocks:
+        matched_blocks = exact_blocks
+    else:
+        matched_blocks = (
+            RequirementBlock.query.filter(db.or_(*variant_filters))
+            .order_by(RequirementBlock.id.desc())
+            .all()
+        )
+
+    requirement_rows = build_requirement_rows_from_tables(normalized, max_rows=max_tables)
+    matched_doc_ids = {b.document_id for b in matched_blocks if b.document_id}
+
+    filename_filters = [
+        DocumentRecord.original_filename.ilike(f"%{variant}%")
+        for variant in variants
+    ]
+    if not filename_filters:
+        filename_filters = [DocumentRecord.original_filename.ilike(f"%{normalized}%")]
+    filename_docs = DocumentRecord.query.filter(
+        db.or_(*filename_filters),
+        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
+    ).all()
+
+    stored_name_filters = [
+        DocumentRecord.stored_filename.ilike(f"%{variant}%")
+        for variant in variants
+    ]
+    if not stored_name_filters:
+        stored_name_filters = [DocumentRecord.stored_filename.ilike(f"%{normalized}%")]
+    stored_name_docs = DocumentRecord.query.filter(
+        db.or_(*stored_name_filters),
+        DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER,
+    ).all()
+    matched_doc_ids.update(d.id for d in filename_docs)
+    matched_doc_ids.update(d.id for d in stored_name_docs)
+
+    if not matched_doc_ids:
+        table_doc_filters = []
+        for variant in variants:
+            table_doc_filters.extend(
+                [
+                    TablePreview.csv_text.ilike(f"%{variant}%"),
+                    TablePreview.csv_text_en.ilike(f"%{variant}%"),
+                    TablePreview.html_table.ilike(f"%{variant}%"),
+                    TablePreview.html_table_en.ilike(f"%{variant}%"),
+                ]
+            )
+        if table_doc_filters:
+            related_table_docs = (
+                TablePreview.query.join(DocumentRecord)
+                .filter(DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER)
+                .filter(db.or_(*table_doc_filters))
+                .all()
+            )
+            matched_doc_ids.update(row.document_id for row in related_table_docs if row.document_id)
+
     table_rows = []
     if matched_doc_ids:
         tables = (
             TablePreview.query.filter(TablePreview.document_id.in_(matched_doc_ids))
-            .join(DocumentRecord)
-            .filter(DocumentRecord.document_type != DOCUMENT_TYPE_REQUIREMENT_MASTER)
             .order_by(TablePreview.id.desc())
             .all()
         )
@@ -7078,24 +6440,46 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                     "document_name": doc.original_filename if doc else f"Document {row.document_id}",
                     "sheet_name": row.sheet_name or "-",
                     "table_format": row.table_format or "-",
-                    "html_table": render_table_preview_html(row, "nl"),
-                    "html_table_en": render_table_preview_html(row, "en"),
                 }
             )
-            if len(table_rows) >= table_limit:
+            if len(table_rows) >= max_tables:
                 break
 
+    block_rows = []
+    seen_blocks = set()
+    for block in sorted(
+        matched_blocks,
+        key=lambda b: ((b.page or 0), (b.char_start or 0), -(b.id or 0)),
+    ):
+        if block.id in seen_blocks:
+            continue
+        seen_blocks.add(block.id)
+        doc = block.document
+        block_rows.append(
+            {
+                "block_id": block.id,
+                "requirement_id": block.requirement_id or "",
+                "title": block.title or "",
+                "section": block.section or "",
+                "summary": block.summary or "",
+                "definition": block.definition or "",
+                "full_text": block.full_text or "",
+                "document_name": doc.original_filename if doc else f"Document {block.document_id}",
+            }
+        )
+        if len(block_rows) >= max_blocks:
+            break
+
     return {
-        "found": bool(table_rows or requirement_rows),
+        "found": bool(block_rows or table_rows or requirement_rows),
         "normalized_id": normalized,
         "requirement_rows": requirement_rows,
-        "blocks": [],
+        "blocks": block_rows,
         "tables": table_rows,
-        "block_count": 0,
+        "block_count": len(matched_blocks),
         "requirement_row_count": len(requirement_rows),
         "table_count": len(table_rows),
         "document_count": len(matched_doc_ids),
-        "master_source_count": len(master_documents),
     }
 
 
@@ -7289,52 +6673,11 @@ def admin_dictionaries():
             "sheet_name": source.sheet_name,
             "entry_count": source.entry_count,
             "uploaded_at": source.uploaded_at,
-            "entry_kind": source.entry_kind,
             "kind_label": dictionary_entry_kind_label(source.entry_kind),
         }
         for source in sources
     ]
-    return render_template_string(
-        ADMIN_DICTIONARIES_TEMPLATE,
-        sources=source_rows,
-        dictionary_kind_options=DICTIONARY_ENTRY_KIND_OPTIONS,
-        storage_usage=build_storage_usage_summary(),
-    )
-
-
-@app.route("/admin/dictionaries/<int:source_id>/type", methods=["POST"])
-@login_required
-def update_dictionary_source_type(source_id):
-    if not is_admin():
-        abort(403)
-
-    source = db.session.get(DictionarySource, source_id)
-    if not source:
-        flash("Definition file not found.", "error")
-        return redirect(url_for("admin_dictionaries"))
-
-    entry_kind = (request.form.get("entry_kind") or "").strip().lower()
-    if entry_kind not in VALID_DICTIONARY_ENTRY_KINDS:
-        flash("Invalid definition type selected.", "error")
-        return redirect(url_for("admin_dictionaries"))
-
-    if source.entry_kind == entry_kind:
-        flash(f"Type for {source.name} is already {dictionary_entry_kind_label(entry_kind)}.", "info")
-        return redirect(url_for("admin_dictionaries"))
-
-    try:
-        entry_count = reimport_dictionary_source(source, entry_kind)
-        flash(
-            f"Updated {source.name} to {dictionary_entry_kind_label(entry_kind)} "
-            f"({entry_count} entries re-indexed).",
-            "success",
-        )
-    except Exception as exc:
-        db.session.rollback()
-        print(f"Dictionary type update error for source {source_id}: {exc}")
-        flash(f"Could not change type for {source.name}: {exc}", "error")
-
-    return redirect(url_for("admin_dictionaries"))
+    return render_template_string(ADMIN_DICTIONARIES_TEMPLATE, sources=source_rows, storage_usage=build_storage_usage_summary())
 
 
 @app.route("/admin/dictionaries/delete/<int:source_id>")
@@ -7478,17 +6821,6 @@ def api_translate_all(document_id):
     )
 
 
-@app.route("/api/index-job/<int:job_id>")
-@login_required
-def api_index_job(job_id):
-    if not is_admin():
-        abort(403)
-    job = db.session.get(IndexJob, job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify(job_to_dict(job))
-
-
 @app.route("/document/<int:document_id>/export-translation-pdf")
 @login_required
 def export_translation_pdf(document_id):
@@ -7584,44 +6916,24 @@ def admin_users():
     return render_template_string(USERS_TEMPLATE, users=users)
 
 def build_admin_documents_page_context():
-    # This page can become slow if we list or HEAD-check every stored file.
-    # By default we skip storage checks; users can opt-in via ?check_files=1.
-    check_files = request.args.get("check_files", "0").strip() in {"1", "true", "yes", "on"}
-    page = max(1, request.args.get("page", 1, type=int) or 1)
-    page_size = 200
-    total_docs = DocumentRecord.query.count()
-    total_pages = max(1, math.ceil(total_docs / page_size))
-    page = min(page, total_pages)
-    docs = (
-        DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
-
-    stored_files = None
-    if check_files:
-        stored_files = storage.list_stored_document_filenames(DOC_FOLDER)
-        if stored_files is None:
-            stored_files = {
-                doc.stored_filename
-                for doc in docs
-                if storage.document_exists(doc.stored_filename, DOC_FOLDER)
-            }
+    docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
+    stored_files = storage.list_stored_document_filenames(DOC_FOLDER)
+    if stored_files is None:
+        stored_files = {
+            doc.stored_filename
+            for doc in docs
+            if storage.document_exists(doc.stored_filename, DOC_FOLDER)
+        }
 
     return {
         "doc_rows": [
             {
                 "record": doc,
-                "file_available": (doc.stored_filename in stored_files) if stored_files is not None else None,
+                "file_available": doc.stored_filename in stored_files,
             }
             for doc in docs
         ],
-        "doc_count": total_docs,
-        "docs_page": page,
-        "docs_total_pages": total_pages,
-        "docs_page_size": page_size,
-        "check_files": check_files,
+        "doc_count": len(docs),
         "block_count": RequirementBlock.query.count(),
         "table_count": TablePreview.query.count(),
         "storage_usage": build_storage_usage_summary(),
@@ -7631,8 +6943,6 @@ def build_admin_documents_page_context():
         "storage_status": storage.get_storage_status(),
         "document_type_options": DOCUMENT_TYPE_OPTIONS,
         "document_type_label": document_type_label,
-        "index_jobs": IndexJob.query.order_by(IndexJob.created_at.desc()).limit(10).all(),
-        "job_to_dict": job_to_dict,
     }
 
 
@@ -7891,30 +7201,6 @@ def bulk_reindex_documents():
     return redirect_admin_documents("admin-feedback")
 
 
-@app.route("/reindex-multiple-async", methods=["POST"])
-@login_required
-def bulk_reindex_documents_async():
-    if not is_admin():
-        abort(403)
-
-    raw_ids = request.form.getlist("document_ids")
-    if not raw_ids:
-        flash("No documents selected.", "warning")
-        return redirect_admin_documents("admin-feedback")
-
-    try:
-        job = enqueue_bulk_reindex_job(raw_ids, created_by=current_user.id)
-        flash(
-            f"Queued background reindex job #{job.id} for {len(_safe_json_loads(job.document_ids_json, []))} document(s).",
-            "success",
-        )
-    except Exception as exc:
-        db.session.rollback()
-        flash(f"Could not queue background reindex: {exc}", "error")
-
-    return redirect_admin_documents("index-jobs-panel")
-
-
 @app.route("/delete/<int:document_id>")
 @login_required
 def delete_document(document_id):
@@ -7983,8 +7269,8 @@ def table_preview(document_id):
             print(f"Table preview regeneration error for document {document_id}: {exc}")
             error_msg = f"Could not build table preview: {exc}"
 
-    if tables and table_preview_needs_translation(tables, doc=doc):
-        refresh_table_translations_from_cache(tables, doc=doc)
+    if tables and table_preview_needs_translation(tables):
+        refresh_table_translations_from_cache(tables)
         tables = TablePreview.query.filter_by(document_id=document_id).all()
 
     if not tables and not file_available:
@@ -8430,7 +7716,6 @@ def ensure_schema():
     from sqlalchemy import inspect, text
 
     inspector = inspect(db.engine)
-    existing_tables = set(inspector.get_table_names())
     doc_cols = {col["name"] for col in inspector.get_columns("documents")}
     if "page_offsets_json" not in doc_cols:
         db.session.execute(text("ALTER TABLE documents ADD COLUMN page_offsets_json TEXT"))
@@ -8506,9 +7791,6 @@ def ensure_schema():
             db.session.commit()
 
     if "document_page_translations" not in inspector.get_table_names():
-        db.create_all()
-
-    if "index_jobs" not in existing_tables:
         db.create_all()
 
 
