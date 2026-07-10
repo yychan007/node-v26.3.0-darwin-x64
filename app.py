@@ -4849,16 +4849,9 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
             </td>
         </tr>
         <tr>
-            <td>
+            <td colspan="2">
                 {% if item.related_requirement_id %}
                 <strong>Related requirement number:</strong>
-                <a href="{{ url_for('home', q=item.related_requirement_id) }}">{{ item.related_requirement_id }}</a>
-                {% else %}
-                -
-                {% endif %}
-            </td>
-            <td>
-                {% if item.related_requirement_id %}
                 <a href="{{ url_for('home', q=item.related_requirement_id) }}">{{ item.related_requirement_id }}</a>
                 {% else %}
                 -
@@ -5337,18 +5330,18 @@ HOME_TEMPLATE = """
                     <div class="filename">
                         {% if res.is_pdf %}
                             <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
-                                {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
+                                {{ res.requirement_id or '-' }} - {{ res.title_nl or res.title or res.filename }}{% if res.title_en %} ({{ res.title_en }}){% endif %}
                             </a>
                         {% elif res.is_docx %}
                             <a href="{{ url_for('docx_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
-                                {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
+                                {{ res.requirement_id or '-' }} - {{ res.title_nl or res.title or res.filename }}{% if res.title_en %} ({{ res.title_en }}){% endif %}
                             </a>
                         {% elif res.is_txt %}
                             <a href="{{ url_for('document_view', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
-                                {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
+                                {{ res.requirement_id or '-' }} - {{ res.title_nl or res.title or res.filename }}{% if res.title_en %} ({{ res.title_en }}){% endif %}
                             </a>
                         {% else %}
-                            {{ res.requirement_id or '-' }} - {{ res.title or res.filename }}
+                            {{ res.requirement_id or '-' }} - {{ res.title_nl or res.title or res.filename }}{% if res.title_en %} ({{ res.title_en }}){% endif %}
                         {% endif %}
                     </div>
 
@@ -6821,6 +6814,8 @@ def _extract_related_requirement_id(requirement_id, full_text):
 
 def _looks_like_requirement_statement(line, lang="nl"):
     text = _clean_requirement_field_line(line)
+    # Allow bullet prefixes like "• Het ..." or "- The ..."
+    text = re.sub(r"^[\s\-\u2013\u2014\u2022\u00b7\*\u2023o]+\s*", "", text)
     if len(text) < 18:
         return False
     if _is_requirement_metadata_line(text):
@@ -6851,7 +6846,8 @@ def _extract_requirement_body_from_lines(requirement_id, lines, lang="nl"):
         r"(?i)^(figure|explanation|verification|phase|method|remark|test|berekening|calculation|am-req-)\b"
     )
     body_parts = []
-    for line in lines[start_idx + 1 :]:
+    tail_lines = lines[start_idx + 1 :]
+    for i, line in enumerate(tail_lines):
         if stop_pattern.search(line):
             break
         if _is_requirement_metadata_line(line):
@@ -6862,7 +6858,37 @@ def _extract_requirement_body_from_lines(requirement_id, lines, lang="nl"):
             continue
         if not _looks_like_requirement_statement(line, lang=lang):
             continue
-        body_parts.append(line)
+        # Collect this line + immediate continuations (sometimes wrapped)
+        first_clean = _clean_requirement_field_line(line)
+        first_clean = re.sub(
+            r"^[\s\-\u2013\u2014\u2022\u00b7\*\u2023o]+\s*",
+            "",
+            first_clean,
+        )
+        body_parts.append(first_clean)
+        remaining_budget = 360
+        for cont in tail_lines[i + 1 :]:
+            if stop_pattern.search(cont):
+                break
+            if _is_requirement_metadata_line(cont):
+                break
+            if _is_standalone_requirement_id_line(cont):
+                break
+            if _looks_like_requirement_category(cont):
+                break
+            cont_clean = _clean_requirement_field_line(cont)
+            cont_clean = re.sub(r"^[\s\-\u2013\u2014\u2022\u00b7\*\u2023o]+\s*", "", cont_clean)
+            if not cont_clean:
+                break
+            if len(cont_clean) < 8:
+                break
+            if remaining_budget <= 0:
+                break
+            body_parts.append(cont_clean)
+            remaining_budget -= len(cont_clean) + 1
+            # Stop once we likely hit sentence end.
+            if cont_clean.endswith((".", ")", ";")):
+                break
         break
 
     return _collapse_requirement_text(" ".join(body_parts))
