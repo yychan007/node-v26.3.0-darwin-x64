@@ -3992,7 +3992,15 @@ def is_spreadsheet_document(doc):
     return (doc.extension or "").lower() in {"csv", "xlsx"}
 
 
+def is_requirement_id_search(query):
+    normalized = normalize_requirement_lookup_id(query)
+    return is_trackable_am_req_id(normalized)
+
+
 def build_document_fallback_results(query, active_terms, seen_keys, top_k=10):
+    if is_requirement_id_search(query):
+        return []
+
     exact_terms = default_exact_search_terms(query)
     results = []
     for doc in DocumentRecord.query.all():
@@ -4162,6 +4170,21 @@ def search_requirements(query, top_k=30, active_terms=None):
         ),
         reverse=True,
     )
+
+    if is_requirement_id_search(query):
+        normalized_query_id = normalize_requirement_id_key(
+            normalize_requirement_lookup_id(query)
+        )
+        results = [
+            r
+            for r in results
+            if not r.get("is_document_fallback")
+            and (
+                not r.get("requirement_id")
+                or normalize_requirement_id_key(r["requirement_id"]) == normalized_query_id
+            )
+        ]
+
     return results[:top_k], all_expanded_terms
 
 
@@ -4812,7 +4835,7 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
         <tr>
             <td>
                 {% if item.applicable_nl %}
-                Applicable Discriminators Distance security: {{ item.applicable_nl }}
+                {{ item.applicable_nl }}
                 {% else %}
                 -
                 {% endif %}
@@ -4820,6 +4843,23 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
             <td>
                 {% if item.applicable_en %}
                 {{ item.applicable_en }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>
+                {% if item.related_requirement_id %}
+                <strong>Related requirement number:</strong>
+                <a href="{{ url_for('home', q=item.related_requirement_id) }}">{{ item.related_requirement_id }}</a>
+                {% else %}
+                -
+                {% endif %}
+            </td>
+            <td>
+                {% if item.related_requirement_id %}
+                <a href="{{ url_for('home', q=item.related_requirement_id) }}">{{ item.related_requirement_id }}</a>
                 {% else %}
                 -
                 {% endif %}
@@ -6724,6 +6764,110 @@ def _looks_like_requirement_category(line):
     ) and "," in (line or "")
 
 
+def _is_standalone_requirement_id_line(line):
+    cleaned = _clean_requirement_field_line(line)
+    if not cleaned:
+        return False
+    ids = REQ_ID_REGEX.findall(cleaned)
+    if len(ids) != 1:
+        return False
+    req_id = ids[0]
+    return bool(
+        re.fullmatch(r"(?i)\s*" + re.escape(req_id) + r"\s*\.?\s*", cleaned)
+    )
+
+
+def _extract_related_requirement_id(requirement_id, full_text):
+    primary = normalize_requirement_lookup_id(requirement_id)
+    if not primary:
+        return ""
+
+    primary_key = normalize_requirement_id_key(primary)
+    lines = [
+        _clean_requirement_field_line(ln)
+        for ln in compact_display_text(full_text or "").splitlines()
+        if _clean_requirement_field_line(ln)
+    ]
+    if not lines:
+        return ""
+
+    primary_idx = 0
+    for idx, line in enumerate(lines):
+        line_key = normalize_requirement_id_key(line)
+        if primary_key in line_key or primary_key in normalize_requirement_id_key(
+            " ".join(REQ_ID_REGEX.findall(line))
+        ):
+            primary_idx = idx
+            break
+
+    stop_pattern = re.compile(
+        r"(?i)^(figure|explanation|verification|phase|method|remark|test|berekening|calculation)\b"
+    )
+    for line in lines[primary_idx + 1 :]:
+        if _looks_like_requirement_statement(line, lang="nl") or _looks_like_requirement_statement(
+            line, lang="en"
+        ):
+            break
+        if stop_pattern.search(line):
+            break
+        if not _is_standalone_requirement_id_line(line):
+            continue
+        candidate = normalize_requirement_lookup_id(REQ_ID_REGEX.findall(line)[0])
+        if normalize_requirement_id_key(candidate) != primary_key:
+            return candidate
+
+    return ""
+
+
+def _looks_like_requirement_statement(line, lang="nl"):
+    text = _clean_requirement_field_line(line)
+    if len(text) < 18:
+        return False
+    if _is_requirement_metadata_line(text):
+        return False
+    if _looks_like_requirement_category(text):
+        return False
+    if lang == "en":
+        return bool(
+            re.match(r"(?i)^(the|it|each|all|when|if|a|an|this|these|there)\b", text)
+            or re.search(r"(?i)\b(shall|must|should|is to|are to|needs to)\b", text)
+        )
+    return bool(
+        re.match(r"(?i)^(het|de|een|opdrachtnemer|indien|bij|alle|elke|er|wanneer)\b", text)
+        or re.search(r"(?i)\b(dient te|moet|dient|zijn|worden)\b", text)
+    )
+
+
+def _extract_requirement_body_from_lines(requirement_id, lines, lang="nl"):
+    req_lower = (requirement_id or "").strip().lower()
+    start_idx = 0
+    if req_lower:
+        for idx, line in enumerate(lines):
+            if req_lower in line.lower():
+                start_idx = idx
+                break
+
+    stop_pattern = re.compile(
+        r"(?i)^(figure|explanation|verification|phase|method|remark|test|berekening|calculation|am-req-)\b"
+    )
+    body_parts = []
+    for line in lines[start_idx + 1 :]:
+        if stop_pattern.search(line):
+            break
+        if _is_requirement_metadata_line(line):
+            continue
+        if req_lower and req_lower in line.lower():
+            continue
+        if _looks_like_requirement_category(line):
+            continue
+        if not _looks_like_requirement_statement(line, lang=lang):
+            continue
+        body_parts.append(line)
+        break
+
+    return _collapse_requirement_text(" ".join(body_parts))
+
+
 def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
     text = compact_display_text(full_text or "")
     if not text:
@@ -6815,6 +6959,9 @@ def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
                 title = cand
                 break
 
+    if not applicable:
+        applicable = _extract_requirement_body_from_lines(requirement_id, lines, lang=lang)
+
     return title, applicable
 
 
@@ -6839,7 +6986,7 @@ def _get_requirement_page_translation_text(doc, page_num):
 def enrich_search_result_with_bilingual_fields(result_dict, doc):
     requirement_id = (result_dict.get("requirement_id") or "").strip()
     if not requirement_id:
-        requirement_id = normalize_requirement_lookup_id(result_dict.get("filename") or "")
+        requirement_id = requirement_id_from_filename(result_dict.get("filename") or "")
 
     full_text_nl = (result_dict.get("full_text") or "").strip()
     page_num = int(result_dict.get("page") or 1)
@@ -6852,20 +6999,32 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
             full_text_nl = get_document_full_text(doc)
 
     translated_text = _get_requirement_page_translation_text(doc, page_num) if doc else ""
-    fields = _build_requirement_content_fields(requirement_id, full_text_nl, translated_text)
+    fields = _build_requirement_content_fields(
+        requirement_id,
+        full_text_nl,
+        translated_text,
+        summary_nl=(result_dict.get("summary") or "").strip(),
+        definition_nl=(result_dict.get("definition") or "").strip(),
+    )
     result_dict.update(fields)
     if requirement_id:
         result_dict["requirement_id"] = requirement_id
 
     result_dict["show_bilingual_table"] = bool(
-        requirement_id
+        is_trackable_am_req_id(requirement_id)
         or fields.get("title_nl")
         or fields.get("applicable_nl")
     )
     return result_dict
 
 
-def _build_requirement_content_fields(requirement_id, full_text_nl, full_text_en=""):
+def _build_requirement_content_fields(
+    requirement_id,
+    full_text_nl,
+    full_text_en="",
+    summary_nl="",
+    definition_nl="",
+):
     title_nl, applicable_nl = _parse_structured_requirement_fields(
         requirement_id, full_text_nl, lang="nl"
     )
@@ -6875,16 +7034,34 @@ def _build_requirement_content_fields(requirement_id, full_text_nl, full_text_en
             requirement_id, full_text_en, lang="en"
         )
 
+    if not applicable_nl and summary_nl:
+        applicable_nl = _collapse_requirement_text(summary_nl)
+    if not applicable_nl and definition_nl:
+        applicable_nl = _collapse_requirement_text(definition_nl)
+
     if not title_en and title_nl:
         title_en = (translate_to_english(title_nl) or "").strip()
     if not applicable_en and applicable_nl:
-        applicable_en = (translate_to_english(applicable_nl) or "").strip()
+        if (full_text_en or "").strip():
+            _, parsed_en = _parse_structured_requirement_fields(
+                requirement_id, full_text_en, lang="en"
+            )
+            applicable_en = parsed_en
+        if not applicable_en:
+            applicable_en = (translate_to_english(applicable_nl) or "").strip()
+
+    related_requirement_id = _extract_related_requirement_id(requirement_id, full_text_nl)
+    if not related_requirement_id and (full_text_en or "").strip():
+        related_requirement_id = _extract_related_requirement_id(
+            requirement_id, full_text_en
+        )
 
     return {
         "title_nl": title_nl,
         "title_en": title_en,
         "applicable_nl": applicable_nl,
         "applicable_en": applicable_en,
+        "related_requirement_id": related_requirement_id,
     }
 
 
@@ -6898,7 +7075,11 @@ def _build_requirement_browser_content_row(block):
     full_text_nl = block.full_text or ""
     translated_text = _get_requirement_page_translation_text(doc, page_num)
     fields = _build_requirement_content_fields(
-        block.requirement_id, full_text_nl, translated_text
+        block.requirement_id,
+        full_text_nl,
+        translated_text,
+        summary_nl=(block.summary or "").strip(),
+        definition_nl=(block.definition or "").strip(),
     )
 
     return {
