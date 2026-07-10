@@ -413,6 +413,11 @@ DOCX_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationship
 DOCX_A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 
 REQ_ID_REGEX = re.compile(r'\b([A-Z]{1,10}-Req-\d+(?:\.\d+)?)\b', re.IGNORECASE)
+BARE_REQUIREMENT_NUMBER_RE = re.compile(r'^\d{3,6}(?:\.\d{1,4})?$')
+SHORTHAND_REQUIREMENT_RE = re.compile(
+    r'^(?:am[-\s]*)?req[-\s]*(\d{3,6}(?:\.\d{1,4})?)$',
+    re.IGNORECASE,
+)
 
 DOCUMENT_TYPE_STANDARD = "standard"
 DOCUMENT_TYPE_REQUIREMENT_MASTER = "requirement_master"
@@ -650,6 +655,53 @@ def expand_query_tokens(tokens):
     return list(dict.fromkeys(out))
 
 
+def expand_bare_requirement_query(query):
+    text = (query or "").strip()
+    if not text:
+        return ""
+
+    if is_trackable_am_req_id(text):
+        return normalize_requirement_lookup_id(text)
+
+    if BARE_REQUIREMENT_NUMBER_RE.fullmatch(text):
+        return f"AM-Req-{text}"
+
+    shorthand_match = SHORTHAND_REQUIREMENT_RE.fullmatch(text)
+    if shorthand_match:
+        return f"AM-Req-{shorthand_match.group(1)}"
+
+    return text
+
+
+def resolve_requirement_search_query(query):
+    raw = (query or "").strip()
+    if not raw:
+        return raw, ""
+
+    normalized = expand_bare_requirement_query(raw)
+    if is_trackable_am_req_id(normalized):
+        return normalized, normalized
+    return raw, ""
+
+
+def requirement_search_aliases(query):
+    raw = (query or "").strip()
+    if not raw:
+        return []
+
+    normalized = normalize_requirement_lookup_id(raw)
+    if not is_trackable_am_req_id(normalized):
+        return []
+
+    aliases = [normalized, normalized.lower()]
+    number_match = re.search(r'(\d+(?:\.\d+)?)$', normalized, re.IGNORECASE)
+    if number_match:
+        aliases.append(number_match.group(1))
+    if raw.lower() not in {alias.lower() for alias in aliases}:
+        aliases.append(raw)
+    return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
 def get_all_expanded_terms(query):
     q = (query or "").strip().lower()
     terms = []
@@ -657,15 +709,19 @@ def get_all_expanded_terms(query):
         terms.append(q)
     for token in preprocess(query):
         terms.extend(expand_query_tokens([token]))
+    terms.extend(requirement_search_aliases(query))
     return list(dict.fromkeys(terms))
 
 
 def default_exact_search_terms(query):
     tokens = preprocess(query)
+    aliases = requirement_search_aliases(query)
     if tokens:
-        return tokens
+        return list(dict.fromkeys(tokens + aliases))
     q = (query or "").strip().lower()
-    return [q] if q else []
+    if q:
+        return list(dict.fromkeys([q] + aliases))
+    return aliases
 
 
 def resolve_active_search_terms(query, selected_terms=None):
@@ -3877,6 +3933,10 @@ def lexical_score(block, query, active_terms, exact_terms=None):
     # Existing ID / metadata matches for exact query
     if q and q == req_id:
         score += 30
+    normalized_query_id = normalize_requirement_lookup_id(query)
+    if is_trackable_am_req_id(normalized_query_id):
+        if normalize_requirement_id_key(req_id) == normalize_requirement_id_key(normalized_query_id):
+            score += 250
     if q and q in section:
         score += 10
     if q and q in major_section:
@@ -5060,7 +5120,7 @@ HOME_TEMPLATE = """
         This page is dedicated to requirement ID lookup. Example IDs:
         <strong>AM-Req-1144.04</strong>, <strong>AM-Req-35288</strong>, <strong>AM-Req-36605</strong>.
         {% else %}
-        Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>.
+        Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>, or just <strong>5457</strong> for <strong>AM-Req-5457</strong>.
         For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Definitions</strong></a>
         (e.g. <strong>AC</strong>, <strong>declaration of performance</strong>).
         {% endif %}
@@ -5068,8 +5128,17 @@ HOME_TEMPLATE = """
 
     {% if search_mode != 'requirement' %}
     <form method="GET" action="/" id="search-form">
-        <input type="text" name="q" value="{{ query }}" placeholder="Search requirement ID, Dutch/English keyword, section, definition">
+        <input type="text" name="q" value="{{ query }}" placeholder="Search requirement ID (e.g. 5457 or AM-Req-5457), Dutch/English keyword, section, definition">
         <button type="submit">Search</button>
+
+        {% if resolved_requirement_id and resolved_requirement_id|lower != query|lower %}
+        <div class="search-meta-panel" style="margin-top:12px;">
+            <div class="panel-title">Requirement ID recognized</div>
+            <div class="small">
+                Your search <strong>{{ query }}</strong> was interpreted as requirement <strong>{{ resolved_requirement_id }}</strong>.
+            </div>
+        </div>
+        {% endif %}
 
         {% if query and all_expanded_terms %}
         <div class="search-filter-panel">
@@ -5123,7 +5192,7 @@ HOME_TEMPLATE = """
     <div class="search-meta-panel" style="margin-top:16px;">
         <div class="panel-title">Requirement Browser</div>
         <form method="GET" action="{{ requirement_form_action }}" id="requirement-browser-form">
-            <input type="text" name="req_lookup" value="{{ req_lookup_query }}" placeholder="Find one requirement, e.g. AM-Req-0286.06">
+            <input type="text" name="req_lookup" value="{{ req_lookup_query }}" placeholder="Find one requirement, e.g. 5457 or AM-Req-0286.06">
             <button type="submit">Browse</button>
         </form>
         <div class="small" style="margin-top:8px;">
@@ -5389,7 +5458,7 @@ HOME_TEMPLATE = """
 
         {% if 'text' in result_types %}
         <div class="search-results-text">
-        <h3>Text results for "{{ query }}"</h3>
+        <h3>Text results for "{{ query }}"{% if resolved_requirement_id and resolved_requirement_id|lower != query|lower %} <span class="small">(as <strong>{{ resolved_requirement_id }}</strong>)</span>{% endif %}</h3>
 
         {% if results %}
             {% for res in results %}
@@ -6709,6 +6778,9 @@ def normalize_requirement_lookup_id(raw_query):
     match = REQ_ID_REGEX.search(query)
     if match:
         return match.group(1)
+    expanded = expand_bare_requirement_query(query)
+    if is_trackable_am_req_id(expanded):
+        return expanded
     return query
 
 
@@ -6832,6 +6904,41 @@ def _looks_like_requirement_category(line):
     ):
         return True
     return bool(re.match(r"(?i)^(systeem|system|proces|process)\s*,", cleaned))
+
+
+def _looks_like_requirement_hidden_link_line(line):
+    text = _clean_requirement_field_line(line)
+    if not text:
+        return False
+    if _looks_like_requirement_category(text):
+        return False
+    if _looks_like_requirement_content_line(text, "nl") or _looks_like_requirement_content_line(text, "en"):
+        return False
+    return bool(re.match(r"^.{1,80}\([^)]{2,60}\)$", text))
+
+
+def _split_requirement_category_line(line):
+    text = _clean_requirement_field_line(line)
+    if not text or " | " not in text:
+        return text, ""
+    parts = [part.strip() for part in text.split(" | ") if part.strip()]
+    if not parts:
+        return text, ""
+    first = parts[0]
+    if _looks_like_requirement_category(first):
+        title_hint = " | ".join(parts[1:]) if len(parts) > 1 else ""
+        return first, title_hint
+    return text, ""
+
+
+def _english_requirement_field_looks_suspect(title_en, applicable_en, title_nl=""):
+    if applicable_en and " | " in applicable_en:
+        return True
+    if title_en and _looks_like_requirement_hidden_link_line(title_en):
+        return True
+    if title_nl and title_en and len(title_en) < min(24, max(12, int(len(title_nl) * 0.45))):
+        return True
+    return False
 
 
 def _is_standalone_requirement_id_line(line):
@@ -7052,7 +7159,10 @@ def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
             if _is_requirement_metadata_line(cand):
                 continue
             if _looks_like_requirement_category(cand):
-                applicable = _collapse_requirement_text(cand)
+                category_text, title_hint = _split_requirement_category_line(cand)
+                applicable = _collapse_requirement_text(category_text)
+                if title_hint and not title:
+                    title = _collapse_requirement_text(title_hint)
                 break
             if _looks_like_requirement_content_line(cand, lang):
                 break
@@ -7065,15 +7175,29 @@ def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
                 continue
             if req_lower in cand.lower():
                 continue
+            if _looks_like_requirement_category(cand):
+                _, title_hint = _split_requirement_category_line(cand)
+                if title_hint:
+                    title = _collapse_requirement_text(title_hint)
+                    break
+                continue
+            if _looks_like_requirement_hidden_link_line(cand):
+                continue
             low = cand.lower()
             if re.search(r"(?i)\b(zone|functie|function|instelling|component|beveiliging\s*-\s*)", cand):
                 title = cand
                 break
         if not title:
-            for cand in lines[req_idx + 1 : req_idx + 4]:
+            for cand in lines[req_idx + 1 : req_idx + 6]:
                 if _is_requirement_metadata_line(cand) or req_lower in cand.lower():
                     continue
                 if _looks_like_requirement_category(cand):
+                    _, title_hint = _split_requirement_category_line(cand)
+                    if title_hint:
+                        title = _collapse_requirement_text(title_hint)
+                        break
+                    continue
+                if _looks_like_requirement_hidden_link_line(cand):
                     continue
                 if len(cand) > 12:
                     title = cand
@@ -7181,8 +7305,33 @@ def _build_requirement_content_fields(
     if not applicable_nl and definition_nl and _looks_like_requirement_category(definition_nl):
         applicable_nl = _collapse_requirement_text(definition_nl)
 
-    if not title_en and title_nl:
-        title_en = (translate_to_english(title_nl) or "").strip()
+    parsed_title_en = title_en
+    parsed_applicable_en = applicable_en
+
+    if title_nl:
+        translated_title_en = (translate_to_english(title_nl) or "").strip()
+        if translated_title_en:
+            title_en = translated_title_en
+        elif parsed_title_en:
+            title_en = parsed_title_en
+    elif not title_en and parsed_title_en:
+        title_en = parsed_title_en
+
+    if applicable_nl:
+        translated_applicable_en = (translate_to_english(applicable_nl) or "").strip()
+        if translated_applicable_en:
+            applicable_en = translated_applicable_en
+        elif parsed_applicable_en:
+            applicable_en = parsed_applicable_en
+    elif not applicable_en and parsed_applicable_en:
+        applicable_en = parsed_applicable_en
+
+    if _english_requirement_field_looks_suspect(title_en, applicable_en, title_nl):
+        if title_nl:
+            title_en = (translate_to_english(title_nl) or title_en or "").strip()
+        if applicable_nl:
+            applicable_en = (translate_to_english(applicable_nl) or applicable_en or "").strip()
+
     if not content_en and content_nl:
         if (full_text_en or "").strip():
             lines_en = [
@@ -7195,14 +7344,6 @@ def _build_requirement_content_fields(
             )
         if not content_en:
             content_en = (translate_to_english(content_nl) or "").strip()
-    if not applicable_en and applicable_nl:
-        if (full_text_en or "").strip():
-            _, parsed_en = _parse_structured_requirement_fields(
-                requirement_id, full_text_en, lang="en"
-            )
-            applicable_en = parsed_en
-        if not applicable_en:
-            applicable_en = (translate_to_english(applicable_nl) or "").strip()
 
     related_requirement_id = _extract_related_requirement_id(requirement_id, full_text_nl)
     if not related_requirement_id and (full_text_en or "").strip():
@@ -7658,7 +7799,9 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
 
 @app.route("/")
 def home():
-    query = request.args.get("q", "").strip()
+    query_input = request.args.get("q", "").strip()
+    search_query, resolved_requirement_id = resolve_requirement_search_query(query_input)
+    query = query_input
     search_mode = "general"
     req_lookup_query = ""
     req_lookup = None
@@ -7675,11 +7818,11 @@ def home():
         table_results = []
         result_types = ["drawings", "text", "tables"]
 
-        if query:
-            all_expanded_terms = get_all_expanded_terms(query)
-            exact_terms = default_exact_search_terms(query)
+        if search_query:
+            all_expanded_terms = get_all_expanded_terms(search_query)
+            exact_terms = default_exact_search_terms(search_query)
             if request.args.getlist("term"):
-                selected_terms = resolve_active_search_terms(query, request.args.getlist("term"))
+                selected_terms = resolve_active_search_terms(search_query, request.args.getlist("term"))
             else:
                 selected_terms = exact_terms
 
@@ -7690,11 +7833,11 @@ def home():
                 result_types = requested_result_types
 
             if "drawings" in result_types:
-                document_matches = search_documents(query, active_terms=selected_terms)
+                document_matches = search_documents(search_query, active_terms=selected_terms)
             if "tables" in result_types:
-                table_results = search_table_results(query, active_terms=selected_terms)
+                table_results = search_table_results(search_query, active_terms=selected_terms)
             if "text" in result_types:
-                all_results, _ = search_requirements(query, active_terms=selected_terms)
+                all_results, _ = search_requirements(search_query, active_terms=selected_terms)
                 if table_results:
                     table_doc_ids = {t["document_id"] for t in table_results}
                     all_results = [
@@ -7713,6 +7856,7 @@ def home():
             lambda: render_template_string(
             HOME_TEMPLATE,
             query=query,
+            resolved_requirement_id=resolved_requirement_id,
             search_mode=search_mode,
             requirement_form_action=url_for("requirement_browser"),
             results=results,
@@ -7758,6 +7902,7 @@ def home():
         return render_template_string(
             HOME_TEMPLATE,
             query=query,
+            resolved_requirement_id=resolved_requirement_id,
             search_mode=search_mode,
             requirement_form_action=url_for("requirement_browser"),
             results=[],
