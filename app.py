@@ -4832,10 +4832,10 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
 
 AUTH_NAV_LINKS = """
         {% if current_user.is_authenticated %}
-        <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
         {% if current_user.is_admin %}
         <a class="btn btn-green" href="{{ url_for('admin_users') }}">Users</a>
         {% endif %}
+        <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
         {% else %}
         <a class="btn btn-gray" href="{{ url_for('login') }}">Login</a>
         {% endif %}
@@ -4892,6 +4892,39 @@ ADMIN_DOCUMENTS_NAV_LINKS = """
 ADMIN_DOCUMENTS_NAV_ACTIONS = """
     <div class="actions">
 """ + ADMIN_DOCUMENTS_NAV_LINKS + AUTH_NAV_LINKS + """
+    </div>
+"""
+
+LOGIN_NAV_LINKS = """
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
+        <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+"""
+
+LOGIN_NAV_ACTIONS = """
+    <div class="actions">
+""" + LOGIN_NAV_LINKS + """
+    </div>
+"""
+
+LOGOUT_NAV_LINKS = """
+        {% if current_user.is_authenticated %}
+        <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
+        {% else %}
+        <a class="btn btn-gray" href="{{ url_for('login') }}">Login</a>
+        {% endif %}
+"""
+
+USERS_NAV_LINKS = """
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
+        <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+        <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
+"""
+
+USERS_NAV_ACTIONS = """
+    <div class="actions">
+""" + USERS_NAV_LINKS + LOGOUT_NAV_LINKS + """
     </div>
 """
 
@@ -5454,14 +5487,15 @@ LOGIN_TEMPLATE = """
 """ + BASE_CSS + """
 </head>
 <body>
-<div class="container" style="max-width: 520px;">
+<div class="container">
     <div class="topbar">
         <div class="topbar-brand">
             <h1>Login</h1>
         </div>
-""" + PORTAL_NAV_ACTIONS + """
+""" + LOGIN_NAV_ACTIONS + """
     </div>
 
+    <div style="max-width:520px;">
     {% with messages = get_flashed_messages() %}
       {% if messages %}
         {% for msg in messages %}
@@ -5485,6 +5519,7 @@ LOGIN_TEMPLATE = """
     <div class="notice" style="margin-top:16px;">
         Create the first admin user by setting <code>ADMIN_USERNAME</code> and
         <code>ADMIN_PASSWORD</code> before the first start.
+    </div>
     </div>
 </div>
 </body>
@@ -5726,7 +5761,7 @@ USERS_TEMPLATE = """
         <div class="topbar-brand">
             <h1>User management</h1>
         </div>
-""" + PORTAL_NAV_ACTIONS + """
+""" + USERS_NAV_ACTIONS + """
     </div>
 
     <form method="POST" style="margin-bottom:24px;">
