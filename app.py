@@ -4834,15 +4834,15 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
         </tr>
         <tr>
             <td>
-                {% if item.applicable_nl %}
-                {{ item.applicable_nl }}
+                {% if item.content_nl %}
+                <strong>Content:</strong> {{ item.content_nl }}
                 {% else %}
                 -
                 {% endif %}
             </td>
             <td>
-                {% if item.applicable_en %}
-                {{ item.applicable_en }}
+                {% if item.content_en %}
+                {{ item.content_en }}
                 {% else %}
                 -
                 {% endif %}
@@ -4853,6 +4853,22 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
                 {% if item.related_requirement_id %}
                 <strong>Related requirement number:</strong>
                 <a href="{{ url_for('home', q=item.related_requirement_id) }}">{{ item.related_requirement_id }}</a>
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>
+                {% if item.applicable_nl %}
+                {{ item.applicable_nl }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+            <td>
+                {% if item.applicable_en %}
+                {{ item.applicable_en }}
                 {% else %}
                 -
                 {% endif %}
@@ -6894,6 +6910,15 @@ def _extract_requirement_body_from_lines(requirement_id, lines, lang="nl"):
     return _collapse_requirement_text(" ".join(body_parts))
 
 
+def _looks_like_requirement_content_line(text, lang="nl"):
+    value = _clean_requirement_field_line(text)
+    if not value:
+        return False
+    if lang == "en":
+        return bool(re.match(r"(?i)^(the|a|an|it|this|these)\b", value))
+    return bool(re.match(r"(?i)^(de|een|het)\b", value))
+
+
 def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
     text = compact_display_text(full_text or "")
     if not text:
@@ -6985,9 +7010,6 @@ def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
                 title = cand
                 break
 
-    if not applicable:
-        applicable = _extract_requirement_body_from_lines(requirement_id, lines, lang=lang)
-
     return title, applicable
 
 
@@ -7039,6 +7061,7 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
     result_dict["show_bilingual_table"] = bool(
         is_trackable_am_req_id(requirement_id)
         or fields.get("title_nl")
+        or fields.get("content_nl")
         or fields.get("applicable_nl")
     )
     return result_dict
@@ -7054,19 +7077,49 @@ def _build_requirement_content_fields(
     title_nl, applicable_nl = _parse_structured_requirement_fields(
         requirement_id, full_text_nl, lang="nl"
     )
-    title_en, applicable_en = ("", "")
+    lines_nl = [
+        _clean_requirement_field_line(ln)
+        for ln in compact_display_text(full_text_nl or "").splitlines()
+        if _clean_requirement_field_line(ln)
+    ]
+    content_nl = _extract_requirement_body_from_lines(requirement_id, lines_nl, lang="nl")
+
+    title_en, applicable_en, content_en = ("", "", "")
     if (full_text_en or "").strip():
         title_en, applicable_en = _parse_structured_requirement_fields(
             requirement_id, full_text_en, lang="en"
         )
+        lines_en = [
+            _clean_requirement_field_line(ln)
+            for ln in compact_display_text(full_text_en or "").splitlines()
+            if _clean_requirement_field_line(ln)
+        ]
+        content_en = _extract_requirement_body_from_lines(
+            requirement_id, lines_en, lang="en"
+        )
 
-    if not applicable_nl and summary_nl:
+    if not content_nl and summary_nl and _looks_like_requirement_content_line(summary_nl, "nl"):
+        content_nl = _collapse_requirement_text(summary_nl)
+
+    if not applicable_nl and summary_nl and _looks_like_requirement_category(summary_nl):
         applicable_nl = _collapse_requirement_text(summary_nl)
-    if not applicable_nl and definition_nl:
+    if not applicable_nl and definition_nl and _looks_like_requirement_category(definition_nl):
         applicable_nl = _collapse_requirement_text(definition_nl)
 
     if not title_en and title_nl:
         title_en = (translate_to_english(title_nl) or "").strip()
+    if not content_en and content_nl:
+        if (full_text_en or "").strip():
+            lines_en = [
+                _clean_requirement_field_line(ln)
+                for ln in compact_display_text(full_text_en or "").splitlines()
+                if _clean_requirement_field_line(ln)
+            ]
+            content_en = _extract_requirement_body_from_lines(
+                requirement_id, lines_en, lang="en"
+            )
+        if not content_en:
+            content_en = (translate_to_english(content_nl) or "").strip()
     if not applicable_en and applicable_nl:
         if (full_text_en or "").strip():
             _, parsed_en = _parse_structured_requirement_fields(
@@ -7085,6 +7138,8 @@ def _build_requirement_content_fields(
     return {
         "title_nl": title_nl,
         "title_en": title_en,
+        "content_nl": content_nl,
+        "content_en": content_en,
         "applicable_nl": applicable_nl,
         "applicable_en": applicable_en,
         "related_requirement_id": related_requirement_id,
