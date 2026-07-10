@@ -4878,9 +4878,14 @@ HOME_TEMPLATE = """
     {% endwith %}
 
     <div class="notice">
+        {% if search_mode == 'requirement' %}
+        This page is dedicated to requirement ID lookup. Example IDs:
+        <strong>AM-Req-1144.04</strong>, <strong>AM-Req-35288</strong>, <strong>AM-Req-36605</strong>.
+        {% else %}
         Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>.
         For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Definitions</strong></a>
         (e.g. <strong>AC</strong>, <strong>declaration of performance</strong>).
+        {% endif %}
     </div>
 
     {% if search_mode != 'requirement' %}
