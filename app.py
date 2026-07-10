@@ -4834,6 +4834,22 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
         </tr>
         <tr>
             <td>
+                {% if item.applicable_nl %}
+                <strong>Attributes:</strong> {{ item.applicable_nl }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+            <td>
+                {% if item.applicable_en %}
+                {{ item.applicable_en }}
+                {% else %}
+                -
+                {% endif %}
+            </td>
+        </tr>
+        <tr>
+            <td>
                 {% if item.content_nl %}
                 <strong>Content:</strong> {{ item.content_nl }}
                 {% else %}
@@ -4853,22 +4869,6 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
                 {% if item.related_requirement_id %}
                 <strong>Related requirement number:</strong>
                 <a href="{{ url_for('home', q=item.related_requirement_id) }}">{{ item.related_requirement_id }}</a>
-                {% else %}
-                -
-                {% endif %}
-            </td>
-        </tr>
-        <tr>
-            <td>
-                {% if item.applicable_nl %}
-                {{ item.applicable_nl }}
-                {% else %}
-                -
-                {% endif %}
-            </td>
-            <td>
-                {% if item.applicable_en %}
-                {{ item.applicable_en }}
                 {% else %}
                 -
                 {% endif %}
