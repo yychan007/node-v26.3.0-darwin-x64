@@ -538,10 +538,8 @@ class TablePreview(db.Model):
     table_format = db.Column(db.String(20), default="csv")
     html_table = db.Column(db.Text, default="")
     html_table_en = db.Column(db.Text, default="")
-    html_table_es = db.Column(db.Text, default="")
     csv_text = db.Column(db.Text, default="")
     csv_text_en = db.Column(db.Text, default="")
-    csv_text_es = db.Column(db.Text, default="")
     preview_title = db.Column(db.String(255), default="")
 
 
@@ -568,7 +566,6 @@ class DocumentPageTranslation(db.Model):
     page = db.Column(db.Integer, nullable=False)
     source_text = db.Column(db.Text, default="")
     translated_text = db.Column(db.Text, default="")
-    translated_text_es = db.Column(db.Text, default="")
     provider = db.Column(db.String(32), default="")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -1288,12 +1285,8 @@ def build_layout_translation_payload(doc, page_num, target_lang="en"):
     }
 
 
-def normalize_translation_lang(lang):
-    return "en"
-
-
 def get_or_translate_page(doc, page_num, target_lang="en"):
-    target_lang = normalize_translation_lang(target_lang)
+    target_lang = "en"
     row = DocumentPageTranslation.query.filter_by(
         document_id=doc.id, page=page_num
     ).first()
@@ -1304,9 +1297,7 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
 
     cached_translation = ""
     if row:
-        cached_translation = (
-            row.translated_text_es if target_lang == "es" else row.translated_text
-        ) or ""
+        cached_translation = (row.translated_text or "") or ""
     if cached_translation:
         cached_source = row.source_text if row else ""
         cached_provider = row.provider if row else get_translation_provider()
@@ -1357,10 +1348,7 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
     if translated:
         if row:
             row.source_text = source[:20000]
-            if target_lang == "es":
-                row.translated_text_es = translated
-            else:
-                row.translated_text = translated
+            row.translated_text = translated
             row.provider = provider
         else:
             dpt_cls = cast(Any, DocumentPageTranslation)
@@ -1369,8 +1357,7 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
                     document_id=doc.id,
                     page=page_num,
                     source_text=source[:20000],
-                    translated_text=translated if target_lang == "en" else "",
-                    translated_text_es=translated if target_lang == "es" else "",
+                    translated_text=translated,
                     provider=provider,
                 )
             )
@@ -1480,7 +1467,7 @@ def build_translated_pdf_bytes(doc, target_lang="en"):
     if not translation.translation_enabled():
         raise RuntimeError("Translation is disabled.")
 
-    target_lang = normalize_translation_lang(target_lang)
+    target_lang = "en"
     lang_label = translation.language_label(target_lang)
 
     total_pages = count_document_pages(doc)
@@ -1526,7 +1513,7 @@ def build_translated_pdf_bytes(doc, target_lang="en"):
 def translate_to_language(text, target_lang="en"):
     return translation.translate_text(
         text,
-        target_lang=normalize_translation_lang(target_lang),
+        target_lang="en",
         cache_get=get_cached_translation,
         cache_set=store_cached_translation,
     )
@@ -2931,10 +2918,8 @@ def save_table_previews(doc_id, tables):
             table_format="xlsx" if sheet_name != "CSV" else "csv",
             html_table=html_table,
             html_table_en=html_table_en,
-            html_table_es="",
             csv_text=csv_buf.getvalue(),
             csv_text_en=csv_text_en,
-            csv_text_es="",
             preview_title=f"{sheet_name} preview"
         )
         db.session.add(row)
@@ -7585,18 +7570,17 @@ def healthz():
 def api_translate_text():
     payload = request.get_json(silent=True) or {}
     source_text = (payload.get("text") or "").strip()
-    target_lang = normalize_translation_lang(payload.get("lang", "en"))
     if not source_text:
         return jsonify({"error": "text is required"}), 400
     if not translation.translation_enabled():
         return jsonify({"error": "translation is disabled"}), 503
 
-    translated = translate_to_language(source_text, target_lang)
+    translated = translate_to_english(source_text)
     return jsonify(
         {
             "source": source_text,
             "translation": translated,
-            "lang": target_lang,
+            "lang": "en",
             "provider": get_translation_provider(),
         }
     )
@@ -7611,15 +7595,14 @@ def api_translate_page(document_id):
         return jsonify({"error": "translation is disabled"}), 503
 
     page = request.args.get("page", 1, type=int)
-    target_lang = normalize_translation_lang(request.args.get("lang", "en"))
     try:
-        result = get_or_translate_page(doc, page, target_lang=target_lang)
+        result = get_or_translate_page(doc, page, target_lang="en")
     except Exception as exc:
         print(f"Translate page API error for doc {document_id} page {page}: {exc}")
         return jsonify(
             {
                 "page": page,
-                "lang": target_lang,
+                "lang": "en",
                 "translation": "",
                 "error": f"Translation failed: {exc}",
             }
@@ -7686,8 +7669,7 @@ def export_translation_pdf(document_id):
         return redirect(url_for("pdf_viewer", document_id=document_id, page=1))
 
     try:
-        target_lang = normalize_translation_lang(request.args.get("lang", "en"))
-        pdf_bytes = build_translated_pdf_bytes(doc, target_lang=target_lang)
+        pdf_bytes = build_translated_pdf_bytes(doc, target_lang="en")
     except Exception as exc:
         print(f"Translated PDF export error for document {document_id}: {exc}")
         flash(f"Export failed: {exc}")
@@ -8260,7 +8242,6 @@ def table_preview_to_dataframe(table_row, lang="nl"):
     csv_field = {
         "nl": "csv_text",
         "en": "csv_text_en",
-        "es": "csv_text_es",
     }.get(lang, "csv_text")
     df = csv_text_to_dataframe(getattr(table_row, csv_field, "") or "")
     if df is not None and not df.empty:
@@ -8269,13 +8250,12 @@ def table_preview_to_dataframe(table_row, lang="nl"):
     html_field = {
         "nl": "html_table",
         "en": "html_table_en",
-        "es": "html_table_es",
     }.get(lang, "html_table")
     df = html_table_to_dataframe(getattr(table_row, html_field, "") or "")
     if df is not None and not df.empty:
         return df
 
-    if lang == "nl" or not translation.translation_enabled():
+    if lang != "en" or not translation.translation_enabled():
         return df
 
     nl_df = csv_text_to_dataframe(table_row.csv_text)
@@ -8284,7 +8264,7 @@ def table_preview_to_dataframe(table_row, lang="nl"):
     try:
         return translation.translate_dataframe_values(
             nl_df,
-            target_lang=lang,
+            target_lang="en",
             cache_get=get_cached_translation,
             cache_set=store_cached_translation,
             max_cells=TRANSLATE_MAX_CELLS,
@@ -8518,25 +8498,8 @@ def ensure_schema():
     if "html_table_en" not in table_cols:
         db.session.execute(text("ALTER TABLE table_previews ADD COLUMN html_table_en TEXT"))
         db.session.commit()
-    if "html_table_es" not in table_cols:
-        db.session.execute(text("ALTER TABLE table_previews ADD COLUMN html_table_es TEXT"))
-        db.session.commit()
     if "csv_text_en" not in table_cols:
         db.session.execute(text("ALTER TABLE table_previews ADD COLUMN csv_text_en TEXT"))
-        db.session.commit()
-    if "csv_text_es" not in table_cols:
-        db.session.execute(text("ALTER TABLE table_previews ADD COLUMN csv_text_es TEXT"))
-        db.session.commit()
-
-    page_translation_cols = set()
-    if "document_page_translations" in inspector.get_table_names():
-        page_translation_cols = {
-            col["name"] for col in inspector.get_columns("document_page_translations")
-        }
-    if page_translation_cols and "translated_text_es" not in page_translation_cols:
-        db.session.execute(
-            text("ALTER TABLE document_page_translations ADD COLUMN translated_text_es TEXT")
-        )
         db.session.commit()
 
     cache_cols = set()
