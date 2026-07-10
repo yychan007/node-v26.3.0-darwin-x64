@@ -4845,6 +4845,19 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
 {% endmacro %}
 """
 
+PORTAL_NAV_LINKS = """
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
+        <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+        <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
+"""
+
+PORTAL_NAV_ACTIONS = """
+    <div class="actions">
+""" + PORTAL_NAV_LINKS + """
+    </div>
+"""
+
 HOME_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -4861,12 +4874,7 @@ HOME_TEMPLATE = """
             <h1>{% if search_mode == 'general' %}Normal Search{% else %}Requirement Browser{% endif %}</h1>
             <div class="small">Requirement-level search for PDF, TXT, CSV, XLSX, DOCX</div>
         </div>
-        <div class="actions">
-            <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
-            <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
-            <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
-            <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
-        </div>
+""" + PORTAL_NAV_ACTIONS + """
     </div>
 
     {% with messages = get_flashed_messages() %}
@@ -5352,7 +5360,12 @@ REQUIREMENT_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>{{ block.requirement_id or 'Requirement block' }}</h2>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>{{ block.requirement_id or 'Requirement block' }}</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
+    </div>
 
     <div class="summary-box">
         <div><strong>Title:</strong> {{ block.title or '-' }}</div>
@@ -5381,7 +5394,6 @@ REQUIREMENT_TEMPLATE = """
     <div class="full-block">{{ block.full_text }}</div>
 
     <div style="margin-top:16px;">
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
         {% if block.document.extension == 'pdf' %}
             <a class="btn btn-purple" href="{{ url_for('pdf_viewer', document_id=block.document.id, page=block.page or 1) }}" target="_blank">Open PDF at page {{ block.page or 1 }}</a>
         {% elif block.document.extension == 'docx' %}
@@ -5406,7 +5418,12 @@ LOGIN_TEMPLATE = """
 </head>
 <body>
 <div class="container" style="max-width: 520px;">
-    <h2>Login</h2>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>Login</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
+    </div>
 
     {% with messages = get_flashed_messages() %}
       {% if messages %}
@@ -5426,7 +5443,6 @@ LOGIN_TEMPLATE = """
             <input type="password" name="password" required style="width:100%;">
         </div>
         <button type="submit">Login</button>
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
     </form>
 
     <div class="notice" style="margin-top:16px;">
@@ -5495,10 +5511,11 @@ DOCS_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>Documents &amp; upload</h2>
-
-    <div style="margin-bottom:16px;">
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>Documents &amp; upload</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
     </div>
 
     """ + UPLOAD_PANEL + """
@@ -5668,7 +5685,12 @@ USERS_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>User management</h2>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>User management</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
+    </div>
 
     <form method="POST" style="margin-bottom:24px;">
         <div class="grid">
@@ -5690,7 +5712,6 @@ USERS_TEMPLATE = """
         </div>
         <br>
         <button type="submit">Create user</button>
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
     </form>
 
     <table class="data-table">
@@ -5724,7 +5745,12 @@ REQUIREMENT_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>{{ block.requirement_id or 'Requirement block' }}</h2>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>{{ block.requirement_id or 'Requirement block' }}</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
+    </div>
 
     <div class="summary-box">
         <div><strong>Title:</strong> {{ block.title or '-' }}</div>
@@ -5746,7 +5772,6 @@ REQUIREMENT_TEMPLATE = """
     {% endif %}
 
     <div style="margin-top:16px;">
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
         {% if block.document.extension == 'pdf' %}
             <a class="btn btn-purple" href="{{ url_for('pdf_viewer', document_id=block.document.id, page=block.page or 1) }}" target="_blank">Open PDF at page {{ block.page or 1 }}</a>
         {% elif block.document.extension == 'docx' %}
@@ -6004,6 +6029,14 @@ iframe { width:100%; height:100%; border:none; }
 </style>
 </head>
 <body>
+    <div style="padding:8px 16px; background:#fff; border-bottom:1px solid #ddd;">
+        <div class="topbar" style="margin-bottom:0;">
+            <div class="topbar-brand">
+                <div class="small">Document Viewer</div>
+            </div>
+""" + PORTAL_NAV_ACTIONS + """
+        </div>
+    </div>
     <div class="toolbar">
         <div>
             <strong>{{ filename }}</strong>
@@ -6041,7 +6074,6 @@ iframe { width:100%; height:100%; border:none; }
             <button class="btn btn-purple btn-small" id="export-translation" disabled>Export this page (.txt)</button>
             <a class="btn btn-orange btn-small" href="{{ url_for('export_translation_pdf', document_id=document_id, lang='en') }}">Export full EN PDF</a>
             {% endif %}
-            <a href="{{ url_for('home') }}">Back</a>
         </div>
     </div>
     <div class="viewer-layout">
@@ -6253,43 +6285,6 @@ iframe { width:100%; height:100%; border:none; }
 </html>
 """
 
-AI_TRANSLATE_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>AI Translation Tool</title>
-""" + BASE_CSS + """
-</head>
-<body>
-<div class="container">
-    <h2>AI Translation Tool</h2>
-    <p class="small">
-        Provider: <strong>{{ provider_info.provider }}</strong>
-        | Model: <strong>{{ provider_info.model }}</strong>
-        | Status: <strong>{{ "Ready" if provider_info.configured else "Not configured" }}</strong>
-    </p>
-
-    <form method="post">
-        <label><strong>Source text (Dutch / mixed)</strong></label>
-        <textarea name="source_text" rows="10" style="width:100%; margin-top:8px;">{{ source_text }}</textarea>
-        <div style="margin-top:12px;">
-            <button class="btn btn-green" type="submit">Translate to English</button>
-            <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
-        </div>
-    </form>
-
-    {% if translated_text %}
-    <div class="summary-box" style="margin-top:18px;">
-        <strong>English translation</strong>
-        <div class="full-block" style="margin-top:10px;">{{ translated_text }}</div>
-    </div>
-    {% endif %}
-</div>
-</body>
-</html>
-"""
-
 TABLE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -6300,9 +6295,13 @@ TABLE_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>Table preview - {{ doc.original_filename }}</h2>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>Table preview - {{ doc.original_filename }}</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
+    </div>
     <div style="margin:12px 0; display:flex; gap:8px; flex-wrap:wrap;">
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
         <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
         {% if tables %}
         <a class="btn btn-purple" href="{{ url_for('export_table_xlsx', document_id=doc.id) }}">Export Excel</a>
@@ -6363,7 +6362,7 @@ DICTIONARY_TEMPLATE = """
             <div class="small">Abbreviations and reference text lookup</div>
         </div>
         <div class="actions">
-            <a class="btn btn-gray" href="{{ url_for('home') }}">Back to search</a>
+""" + PORTAL_NAV_LINKS + """
             <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
         </div>
     </div>
@@ -6440,10 +6439,11 @@ ADMIN_DICTIONARIES_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h2>Manage definitions</h2>
-    <div style="margin-bottom:16px;">
-        <a class="btn btn-gray" href="{{ url_for('home') }}">Back</a>
-        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>Manage definitions</h1>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
     </div>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -7578,25 +7578,6 @@ def healthz():
             "database_path": str(DATABASE_PATH),
             "translation": get_translation_status(),
         }
-    )
-
-
-@app.route("/ai-translate", methods=["GET", "POST"])
-def ai_translate_tool():
-    source_text = ""
-    translated_text = ""
-    provider_info = get_translation_status()
-
-    if request.method == "POST":
-        source_text = request.form.get("source_text", "").strip()
-        if source_text:
-            translated_text = translate_to_english(source_text)
-
-    return render_template_string(
-        AI_TRANSLATE_TEMPLATE,
-        source_text=source_text,
-        translated_text=translated_text,
-        provider_info=provider_info,
     )
 
 
