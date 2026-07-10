@@ -2521,6 +2521,57 @@ def parse_requirement_blocks(content, page_offsets):
     content = normalize_requirement_text(content)
     doc_sections = parse_document_sections(content)
     matches = list(REQ_ID_REGEX.finditer(content))
+
+    def _line_at(pos):
+        line_start = content.rfind("\n", 0, pos) + 1
+        line_end = content.find("\n", pos)
+        if line_end == -1:
+            line_end = len(content)
+        return content[line_start:line_end].strip(), line_end
+
+    def _is_primary_requirement_match(match_obj):
+        req_id = (match_obj.group(1) or "").strip()
+        if not req_id:
+            return False
+
+        # Read the first meaningful line after the AM-Req marker.
+        _, line_end = _line_at(match_obj.start())
+        cursor = line_end + 1
+        next_non_empty = ""
+        for _ in range(4):
+            if cursor >= len(content):
+                break
+            nxt_end = content.find("\n", cursor)
+            if nxt_end == -1:
+                nxt_end = len(content)
+            candidate = content[cursor:nxt_end].strip()
+            cursor = nxt_end + 1
+            if candidate:
+                next_non_empty = candidate
+                break
+
+        if not next_non_empty:
+            return True
+
+        next_low = next_non_empty.lower()
+        # Related links like AM-Req-30114 are usually followed by the real sentence,
+        # not by attribute/category lines.
+        if REQ_ID_REGEX.search(next_non_empty):
+            return False
+        if re.search(
+            r"(?i)\b(systeem|system|proces|process|onderhoudbaarheid|betrouwbaarheid|"
+            r"toekomstvastheid|functioneel|aspect|activiteit|raakvlak)\b",
+            next_non_empty,
+        ) and "," in next_non_empty:
+            return True
+        if next_low.startswith(("systeem,", "system,", "proces,", "process,")):
+            return True
+        return False
+
+    primary_matches = [m for m in matches if _is_primary_requirement_match(m)]
+    if primary_matches:
+        matches = primary_matches
+
     blocks = []
 
     if matches:
