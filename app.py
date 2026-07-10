@@ -618,7 +618,7 @@ def load_user(user_id):
 # Helpers
 # =========================================================
 def is_admin():
-    return True
+    return current_user.is_authenticated and current_user.is_admin
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -4830,16 +4830,68 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
 {% endmacro %}
 """
 
+AUTH_NAV_LINKS = """
+        {% if current_user.is_authenticated %}
+        <a class="btn btn-gray" href="{{ url_for('logout') }}">Logout ({{ current_user.username }})</a>
+        {% if current_user.is_admin %}
+        <a class="btn btn-green" href="{{ url_for('admin_users') }}">Users</a>
+        {% endif %}
+        {% else %}
+        <a class="btn btn-gray" href="{{ url_for('login') }}">Login</a>
+        {% endif %}
+"""
+
 PORTAL_NAV_LINKS = """
         <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
         <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
         <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+        {% if current_user.is_authenticated and current_user.is_admin %}
         <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
+        {% endif %}
 """
 
 PORTAL_NAV_ACTIONS = """
     <div class="actions">
-""" + PORTAL_NAV_LINKS + """
+""" + PORTAL_NAV_LINKS + AUTH_NAV_LINKS + """
+    </div>
+"""
+
+DICTIONARY_NAV_LINKS = """
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
+        <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definition</a>
+        {% if current_user.is_authenticated and current_user.is_admin %}
+        <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definition</a>
+        {% endif %}
+"""
+
+DICTIONARY_NAV_ACTIONS = """
+    <div class="actions">
+""" + DICTIONARY_NAV_LINKS + AUTH_NAV_LINKS + """
+    </div>
+"""
+
+MANAGE_DEFINITIONS_NAV_LINKS = """
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
+        <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+"""
+
+MANAGE_DEFINITIONS_NAV_ACTIONS = """
+    <div class="actions">
+""" + MANAGE_DEFINITIONS_NAV_LINKS + AUTH_NAV_LINKS + """
+    </div>
+"""
+
+ADMIN_DOCUMENTS_NAV_LINKS = """
+        <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
+        <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+        <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
+"""
+
+ADMIN_DOCUMENTS_NAV_ACTIONS = """
+    <div class="actions">
+""" + ADMIN_DOCUMENTS_NAV_LINKS + AUTH_NAV_LINKS + """
     </div>
 """
 
@@ -5500,7 +5552,7 @@ DOCS_TEMPLATE = """
         <div class="topbar-brand">
             <h1>Documents &amp; upload</h1>
         </div>
-""" + PORTAL_NAV_ACTIONS + """
+""" + ADMIN_DOCUMENTS_NAV_ACTIONS + """
     </div>
 
     """ + UPLOAD_PANEL + """
@@ -6287,7 +6339,9 @@ TABLE_TEMPLATE = """
 """ + PORTAL_NAV_ACTIONS + """
     </div>
     <div style="margin:12px 0; display:flex; gap:8px; flex-wrap:wrap;">
+        {% if current_user.is_authenticated and current_user.is_admin %}
         <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
+        {% endif %}
         {% if tables %}
         <a class="btn btn-purple" href="{{ url_for('export_table_xlsx', document_id=doc.id) }}">Export Excel</a>
         {% endif %}
@@ -6319,7 +6373,11 @@ TABLE_TEMPLATE = """
         {% else %}
         <div class="notice" style="margin-top:12px;">
             The table was not indexed yet, or the source file was lost after a server restart.
+            {% if current_user.is_authenticated and current_user.is_admin %}
             Go to <a href="{{ url_for('admin_documents') }}">Documents</a> and click <strong>Reindex</strong> for this file.
+            {% else %}
+            Ask an admin to reindex this document.
+            {% endif %}
         </div>
         {% endif %}
     {% endif %}
@@ -6346,10 +6404,7 @@ DICTIONARY_TEMPLATE = """
             <h1>Definitions</h1>
             <div class="small">Abbreviations and reference text lookup</div>
         </div>
-        <div class="actions">
-""" + PORTAL_NAV_LINKS + """
-            <a class="btn btn-green" href="{{ url_for('admin_dictionaries') }}">Manage definitions</a>
-        </div>
+""" + DICTIONARY_NAV_ACTIONS + """
     </div>
 
     <div class="dict-search-panel">
@@ -6428,7 +6483,7 @@ ADMIN_DICTIONARIES_TEMPLATE = """
         <div class="topbar-brand">
             <h1>Manage definitions</h1>
         </div>
-""" + PORTAL_NAV_ACTIONS + """
+""" + MANAGE_DEFINITIONS_NAV_ACTIONS + """
     </div>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -7469,7 +7524,11 @@ def dictionary_lookup():
 
 
 @app.route("/admin/dictionaries", methods=["GET", "POST"])
+@login_required
 def admin_dictionaries():
+    if not is_admin():
+        abort(403)
+
     if request.method == "POST":
         upload = request.files.get("dictionary_file")
         if not upload or not upload.filename:
@@ -7537,7 +7596,11 @@ def admin_dictionaries():
 
 
 @app.route("/admin/dictionaries/delete/<int:source_id>")
+@login_required
 def delete_dictionary_source(source_id):
+    if not is_admin():
+        abort(403)
+
     source = db.session.get(DictionarySource, source_id)
     if not source:
         flash("Definition file not found.", "error")
@@ -7651,6 +7714,7 @@ def api_translate_all(document_id):
 
 
 @app.route("/document/<int:document_id>/export-translation-pdf")
+@login_required
 def export_translation_pdf(document_id):
     doc = db.session.get(DocumentRecord, document_id)
     if not doc or doc.extension.lower() not in TRANSLATABLE_EXTENSIONS:
@@ -7714,8 +7778,32 @@ def logout():
 
 
 @app.route("/admin/users", methods=["GET", "POST"])
+@login_required
 def admin_users():
-    return redirect(url_for("home"))
+    if not is_admin():
+        abort(403)
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        role = request.form.get("role", USER_ROLE)
+
+        if not username or not password:
+            flash("Username and password are required.")
+        elif User.query.filter_by(username=username).first():
+            flash("Username already exists.")
+        else:
+            user_cls = cast(Any, User)
+            new_user = user_cls(username=username, role=role)
+            new_user.set_password(password)
+            db.session.add(new_user)
+            db.session.commit()
+            flash(f"User '{username}' created.")
+
+        return redirect(url_for("admin_users"))
+
+    users = User.query.order_by(User.id).all()
+    return render_template_string(USERS_TEMPLATE, users=users)
 
 def build_admin_documents_page_context():
     docs = DocumentRecord.query.order_by(DocumentRecord.uploaded_at.desc()).all()
@@ -7762,7 +7850,11 @@ def flash_upload_results(results):
 
 
 @app.route("/upload", methods=["GET", "POST"])
+@login_required
 def upload_files():
+    if not is_admin():
+        abort(403)
+
     if request.method == "GET":
         return redirect(url_for("admin_documents"))
 
@@ -7862,7 +7954,7 @@ def _handle_upload_post():
                 extension=ext,
                 file_hash=file_hash,
                 size_bytes=size_bytes,
-                uploaded_by=current_user.id if current_user.is_authenticated else None,
+                uploaded_by=current_user.id,
             )
             db.session.add(doc)
             try:
@@ -7906,11 +7998,19 @@ def _handle_upload_post():
     return redirect_admin_documents("admin-feedback")
 
 @app.route("/admin/documents")
+@login_required
 def admin_documents():
+    if not is_admin():
+        abort(403)
+
     return render_template_string(DOCS_TEMPLATE, **build_admin_documents_page_context())
 
 @app.route("/reindex/<int:document_id>")
+@login_required
 def reindex_document(document_id):
+    if not is_admin():
+        abort(403)
+
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
         flash("Document not found.", "error")
@@ -7932,7 +8032,11 @@ def reindex_document(document_id):
 
 
 @app.route("/reindex-multiple", methods=["POST"])
+@login_required
 def bulk_reindex_documents():
+    if not is_admin():
+        abort(403)
+
     raw_ids = request.form.getlist("document_ids")
     if not raw_ids:
         flash("No documents selected.", "warning")
@@ -7975,7 +8079,11 @@ def bulk_reindex_documents():
 
 
 @app.route("/delete/<int:document_id>")
+@login_required
 def delete_document(document_id):
+    if not is_admin():
+        abort(403)
+
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
         flash("Document not found.", "error")
@@ -8071,7 +8179,11 @@ def table_preview(document_id):
 
 
 @app.route("/table/<int:document_id>/refresh")
+@login_required
 def refresh_table_preview(document_id):
+    if not is_admin():
+        abort(403)
+
     doc = db.session.get(DocumentRecord, document_id)
     if not doc:
         flash("Document not found.")
@@ -8431,7 +8543,11 @@ def export_table_xlsx(document_id):
 
 
 @app.route("/delete-multiple", methods=["POST"])
+@login_required
 def bulk_delete_documents():
+    if not is_admin():
+        abort(403)
+
     raw_ids = request.form.getlist("document_ids")
     if not raw_ids:
         flash("No documents selected.", "warning")
