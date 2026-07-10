@@ -4864,7 +4864,7 @@ HOME_TEMPLATE = """
         <div class="actions">
             <a class="btn btn-gray" href="{{ url_for('home') }}">Home page</a>
             <a class="btn btn-purple" href="{{ url_for('admin_documents') }}">Documents &amp; upload</a>
-            <a class="btn btn-gray" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
+            <a class="btn btn-green" href="{{ url_for('requirement_browser') }}">Requirement Browser</a>
             <a class="btn btn-purple" href="{{ url_for('dictionary_lookup') }}">Definitions</a>
         </div>
     </div>
