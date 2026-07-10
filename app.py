@@ -6818,10 +6818,20 @@ def sort_requirement_content_rows(rows, query_id):
 
 
 def _looks_like_requirement_category(line):
-    low = (line or "").lower()
-    return bool(
-        re.search(r"\b(systeem|system|aspect|betrouwbaarheid|reliability)\b", low)
-    ) and "," in (line or "")
+    cleaned = _clean_requirement_field_line(line)
+    if not cleaned or "," not in cleaned:
+        return False
+    if _is_standalone_requirement_id_line(cleaned):
+        return False
+    low = cleaned.lower()
+    if re.search(
+        r"(?i)\b(systeem|system|proces|process|onderhoudbaarheid|betrouwbaarheid|"
+        r"toekomstvastheid|functioneel|aspect|activiteit|raakvlak|ontwerprandvoorwaarde|"
+        r"reliability|maintainability|design\s+constraint)\b",
+        low,
+    ):
+        return True
+    return bool(re.match(r"(?i)^(systeem|system|proces|process)\s*,", cleaned))
 
 
 def _is_standalone_requirement_id_line(line):
@@ -7033,27 +7043,41 @@ def _parse_structured_requirement_fields(requirement_id, full_text, lang="nl"):
             applicable = _collapse_requirement_text(body_match.group(1))
 
     req_lower = (requirement_id or "").strip().lower()
-    if not title and req_lower:
+    req_idx = -1
+    if req_lower:
         req_idx = next((i for i, line in enumerate(lines) if req_lower in line.lower()), -1)
-        if req_idx >= 0:
-            for cand in lines[req_idx + 1 : req_idx + 6]:
-                if _is_requirement_metadata_line(cand):
+
+    if not applicable and req_idx >= 0:
+        for cand in lines[req_idx + 1 : req_idx + 6]:
+            if _is_requirement_metadata_line(cand):
+                continue
+            if _looks_like_requirement_category(cand):
+                applicable = _collapse_requirement_text(cand)
+                break
+            if _looks_like_requirement_content_line(cand, lang):
+                break
+            if _is_standalone_requirement_id_line(cand):
+                break
+
+    if not title and req_idx >= 0:
+        for cand in lines[req_idx + 1 : req_idx + 6]:
+            if _is_requirement_metadata_line(cand):
+                continue
+            if req_lower in cand.lower():
+                continue
+            low = cand.lower()
+            if re.search(r"(?i)\b(zone|functie|function|instelling|component|beveiliging\s*-\s*)", cand):
+                title = cand
+                break
+        if not title:
+            for cand in lines[req_idx + 1 : req_idx + 4]:
+                if _is_requirement_metadata_line(cand) or req_lower in cand.lower():
                     continue
-                if req_lower in cand.lower():
+                if _looks_like_requirement_category(cand):
                     continue
-                low = cand.lower()
-                if re.search(r"(?i)\b(zone|functie|function|instelling|component|beveiliging\s*-\s*)", cand):
+                if len(cand) > 12:
                     title = cand
                     break
-            if not title:
-                for cand in lines[req_idx + 1 : req_idx + 4]:
-                    if _is_requirement_metadata_line(cand) or req_lower in cand.lower():
-                        continue
-                    if _looks_like_requirement_category(cand):
-                        continue
-                    if len(cand) > 12:
-                        title = cand
-                        break
 
     if lang == "en" and not title:
         for cand in lines:
