@@ -22,6 +22,13 @@ SYSTEM_PROMPTS = {
     ),
 }
 
+FIELD_EXPLAIN_SYSTEM_PROMPT = (
+    "You explain technical acronyms and abbreviations used in Dutch/English TenneT "
+    "high-voltage substation, telecom, and electrical specifications. "
+    "Reply in English with one or two concise sentences. Include the expanded form "
+    "when known (for example CDG = Cabinet Door Group). Return only the explanation."
+)
+
 
 def translation_enabled():
     global _enabled
@@ -61,6 +68,18 @@ def provider_configured():
     if provider == "anthropic":
         return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
     return True
+
+
+def field_explanations_enabled():
+    value = os.environ.get("ENABLE_FIELD_EXPLANATIONS", "").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    openai_ok = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    anthropic_ok = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    if value in {"1", "true", "yes", "on"}:
+        return openai_ok or anthropic_ok
+    provider = translation_provider()
+    return provider in {"openai", "anthropic"} and provider_configured()
 
 
 def provider_status():
@@ -202,6 +221,84 @@ def _translate_anthropic(text, target_lang):
 def _translate_google(text, target_lang):
     translator = _get_google_translator(target_lang)
     return translator.translate(text)
+
+
+def _explain_openai(prompt):
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    model = _provider_model("openai")
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": FIELD_EXPLAIN_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    result = _http_json_post(
+        "https://api.openai.com/v1/chat/completions",
+        {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+    return (result["choices"][0]["message"]["content"] or "").strip()
+
+
+def _explain_anthropic(prompt):
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set.")
+
+    model = _provider_model("anthropic")
+    payload = {
+        "model": model,
+        "max_tokens": 256,
+        "temperature": 0.1,
+        "system": FIELD_EXPLAIN_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    result = _http_json_post(
+        "https://api.anthropic.com/v1/messages",
+        {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+    parts = []
+    for block in result.get("content", []):
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "\n".join(parts).strip()
+
+
+def explain_field_term(term, context=""):
+    term = (term or "").strip().upper()
+    if not term or len(term) < 2:
+        return ""
+    if not field_explanations_enabled():
+        return ""
+
+    prompt = f"Explain the acronym or technical term: {term}"
+    context = (context or "").strip()
+    if context:
+        prompt += f"\n\nContext from the specification:\n{context[:900]}"
+
+    openai_ok = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    anthropic_ok = bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    try:
+        if openai_ok:
+            return _explain_openai(prompt)
+        if anthropic_ok:
+            return _explain_anthropic(prompt)
+    except Exception as exc:
+        print(f"Field explanation error ({term}): {exc}")
+    return ""
 
 
 def _translate_chunk(text, target_lang):

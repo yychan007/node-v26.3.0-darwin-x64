@@ -280,6 +280,9 @@ def _handle_unexpected_exception(exc):
     except Exception:
         pass
     message = str(exc) or repr(exc)
+    print(f"Unhandled server error on {request.path}: {message}")
+    if request.path.startswith("/api/"):
+        return jsonify({"error": message}), 500
     return (
         render_template_string(
             """
@@ -3982,6 +3985,14 @@ FIELD_EXPLANATION_STOPWORDS = {
 ACRONYM_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,5}\b")
 
 
+def ensure_field_explanation_cache_table():
+    from sqlalchemy import inspect
+
+    inspector = inspect(db.engine)
+    if "field_explanation_cache" not in inspector.get_table_names():
+        db.create_all()
+
+
 def field_explanations_enabled():
     return translation.field_explanations_enabled()
 
@@ -4053,9 +4064,14 @@ def lookup_dictionary_term_explanation(term):
     term = (term or "").strip()
     if not term:
         return None
-    entries = search_dictionary_entries(
-        term, limit=5, entry_kinds=["abbreviation", "reference"]
-    )
+    try:
+        entries = search_dictionary_entries(
+            term, limit=5, entry_kinds=["abbreviation", "reference"]
+        )
+    except Exception as exc:
+        print(f"Dictionary lookup error for {term}: {exc}")
+        db.session.rollback()
+        return None
     if not entries:
         return None
 
@@ -9874,6 +9890,7 @@ def api_translate_text():
 @app.route("/api/field-explanations", methods=["POST"])
 def api_field_explanations():
     try:
+        ensure_field_explanation_cache_table()
         payload = request.get_json(silent=True) or {}
         texts = payload.get("texts") or []
         if isinstance(texts, str):
