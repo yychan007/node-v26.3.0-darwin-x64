@@ -29,6 +29,7 @@ For production, also set:
 """
 
 import gzip
+import base64
 import os
 import re
 import io
@@ -4137,9 +4138,20 @@ def explain_single_field_term(term, context=""):
 
 
 def build_explanation_context_text(*texts):
-    return " ".join(
-        part.strip() for part in texts if part and str(part).strip()
-    )[:2000]
+    combined = " ".join(
+        re.sub(r"\s+", " ", str(part)).strip()
+        for part in texts
+        if part and str(part).strip()
+    )
+    return combined[:2000]
+
+
+def build_explanation_context_bundle(*texts):
+    text = build_explanation_context_text(*texts)
+    if not text:
+        return {"explanation_context": "", "explanation_context_b64": ""}
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return {"explanation_context": text, "explanation_context_b64": encoded}
 
 
 def build_field_explanations_fast(*texts, max_terms=FIELD_EXPLANATION_MAX_TERMS):
@@ -4934,7 +4946,6 @@ button { background:#0069d9; }
 }
 .field-explanation-item:first-of-type { margin-top:0; }
 .field-explanation-source { color:#64748b; font-size:12px; }
-.field-explanations-host:empty { display:none; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
 .info { background:#eef6ff; border-left:4px solid #339af0; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
@@ -5388,9 +5399,12 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
             </td>
         </tr>
     </table>
-    {% if item.explanation_context %}
-    <div class="field-explanations-host" data-context="{{ item.explanation_context|e }}"></div>
-    {% endif %}
+    <div class="field-explanations-host" data-context-b64="{{ item.explanation_context_b64|default('', true) }}">
+        <div class="field-explanations-panel">
+            <div class="field-explanations-title">Field explanations</div>
+            <div class="viewer-status">Loading field explanations...</div>
+        </div>
+    </div>
 </div>
 {% endmacro %}
 """
@@ -5524,9 +5538,22 @@ FIELD_EXPLANATIONS_SCRIPT = """
         if (!host || host.dataset.loaded === "1" || host.dataset.loaded === "loading") {
             return;
         }
-        const context = host.getAttribute("data-context") || "";
-        if (!context.trim()) {
-            host.innerHTML = "";
+        let context = "";
+        const contextB64 = host.getAttribute("data-context-b64") || "";
+        if (contextB64) {
+            try {
+                context = atob(contextB64);
+            } catch (err) {
+                context = "";
+            }
+        }
+        if (!context) {
+            context = host.getAttribute("data-context") || "";
+        }
+        context = context.replace(/\\s+/g, " ").trim();
+        if (!context) {
+            host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">No requirement text available for acronym lookup.</div></div>';
+            host.dataset.loaded = "1";
             return;
         }
         host.dataset.loaded = "loading";
@@ -5558,7 +5585,7 @@ FIELD_EXPLANATIONS_SCRIPT = """
             } else if (data.message) {
                 host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">' + escapeHtml(data.message) + '</div></div>';
             } else {
-                host.innerHTML = "";
+                host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">No acronym explanations available yet. Upload Definitions or enable AI.</div></div>';
             }
         } catch (err) {
             host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">' + escapeHtml(err.message || "Could not load field explanations.") + '</div></div>';
@@ -8329,11 +8356,15 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
         or fields.get("content_nl")
         or fields.get("applicable_nl")
     )
-    result_dict["explanation_context"] = build_explanation_context_text(
-        fields.get("content_en"),
-        fields.get("content_nl"),
-        fields.get("applicable_en"),
-        fields.get("applicable_nl"),
+    result_dict.update(
+        build_explanation_context_bundle(
+            fields.get("title_en"),
+            fields.get("title_nl"),
+            fields.get("content_en"),
+            fields.get("content_nl"),
+            fields.get("applicable_en"),
+            fields.get("applicable_nl"),
+        )
     )
     return result_dict
 
@@ -8467,7 +8498,9 @@ def _build_requirement_browser_content_row(block):
         "snippet": compact_display_text(block.full_text or "")[:900].rstrip()
         + ("..." if len(compact_display_text(block.full_text or "")) > 900 else ""),
         **fields,
-        "explanation_context": build_explanation_context_text(
+        **build_explanation_context_bundle(
+            fields.get("title_en"),
+            fields.get("title_nl"),
             fields.get("content_en"),
             fields.get("content_nl"),
             fields.get("applicable_en"),
@@ -8504,7 +8537,9 @@ def _build_requirement_browser_content_from_document(doc, requirement_id):
         "page": 1,
         "snippet": "",
         **fields,
-        "explanation_context": build_explanation_context_text(
+        **build_explanation_context_bundle(
+            fields.get("title_en"),
+            fields.get("title_nl"),
             fields.get("content_en"),
             fields.get("content_nl"),
             fields.get("applicable_en"),
@@ -9905,6 +9940,7 @@ def api_field_explanations():
                     "explanations": [],
                     "enabled": field_explanations_enabled(),
                     "html": "",
+                    "message": "No requirement text supplied for acronym lookup.",
                 }
             )
 
@@ -9912,9 +9948,19 @@ def api_field_explanations():
             int(payload.get("max_terms") or FIELD_EXPLANATION_MAX_TERMS),
             12,
         )
+        terms = extract_field_acronyms(combined, max_terms=max_terms)
+        if not terms:
+            return jsonify(
+                {
+                    "explanations": [],
+                    "enabled": field_explanations_enabled(),
+                    "html": "",
+                    "terms": [],
+                    "message": "No acronyms detected in this requirement text.",
+                }
+            )
         explanations = build_field_explanations_for_text(combined, max_terms=max_terms)
         serialized = serialize_field_explanations(explanations)
-        terms = extract_field_acronyms(combined, max_terms=max_terms)
         message = ""
         if terms and not explanations:
             if field_explanations_enabled():
