@@ -367,8 +367,6 @@ if DOCX_AVAILABLE:
     ALLOWED_EXTENSIONS.add("docx")
 
 RESULTS_PER_PAGE = 10
-REQUIREMENT_LIST_SEARCH_TOP_K = 200
-REQUIREMENT_LIST_DISPLAY_MAX = 80
 SEARCH_PREFILTER_TERM_LIMIT = 12
 SEARCH_PREFILTER_MIN_TERM_LEN = 2
 
@@ -4520,6 +4518,7 @@ def _searchable_term_filters(terms):
 
 def fetch_requirement_blocks_for_search(query, active_terms):
     q = (query or "").strip()
+    base_query = RequirementBlock.query.options(joinedload(RequirementBlock.document))
     if is_requirement_id_search(q):
         normalized = normalize_requirement_lookup_id(q)
         variants = requirement_lookup_variants(normalized)
@@ -4529,18 +4528,13 @@ def fetch_requirement_blocks_for_search(query, active_terms):
         ]
         if not id_filters:
             id_filters = [RequirementBlock.requirement_id.ilike(f"%{normalized}%")]
-        return (
-            RequirementBlock.query.options(joinedload(RequirementBlock.document))
-            .filter(db.or_(*id_filters))
-            .all()
-        )
+        return base_query.filter(db.or_(*id_filters)).all()
 
     terms = list(dict.fromkeys(list(active_terms or []) + ([q] if q else [])))
     filters = _searchable_term_filters(terms)
-    query_obj = RequirementBlock.query.options(joinedload(RequirementBlock.document))
     if not filters:
-        return query_obj.all()
-    return query_obj.join(DocumentRecord).filter(db.or_(*filters)).all()
+        return base_query.all()
+    return base_query.join(DocumentRecord).filter(db.or_(*filters)).all()
 
 
 def build_lightweight_search_result(row, score, active_terms, query):
@@ -4564,8 +4558,6 @@ def build_lightweight_search_result(row, score, active_terms, query):
         "page": display_page,
         "requirement_id": row.requirement_id,
         "title": row.title,
-        "title_nl": (row.title or "").strip(),
-        "title_en": "",
         "section": row.section,
         "major_section": getattr(row, "major_section", "") or "",
         "category": row.category,
@@ -4646,8 +4638,6 @@ def build_document_fallback_results(query, active_terms, seen_keys, top_k=10, en
             "page": page,
             "requirement_id": "",
             "title": doc.original_filename,
-            "title_nl": doc.original_filename,
-            "title_en": "",
             "section": "Document match",
             "category": "Document",
             "definition": "",
@@ -4687,46 +4677,6 @@ def grouped_search_summary(results):
         "top_categories": top_categories,
         "top_requirement_ids": req_ids[:8]
     }
-
-
-def build_compact_requirement_list(results, max_items=REQUIREMENT_LIST_DISPLAY_MAX):
-    seen = set()
-    items = []
-    total_unique = 0
-    for row in results or []:
-        if row.get("is_document_fallback"):
-            continue
-        req_id = (row.get("requirement_id") or "").strip()
-        if not req_id or not is_trackable_am_req_id(req_id):
-            continue
-        req_key = normalize_requirement_id_key(req_id)
-        if req_key in seen:
-            continue
-        seen.add(req_key)
-        total_unique += 1
-        if len(items) >= max_items:
-            continue
-        title_en = (row.get("title_en") or "").strip()
-        title_nl = (row.get("title_nl") or row.get("title") or "").strip()
-        items.append(
-            {
-                "requirement_id": req_id,
-                "title_nl": title_nl,
-                "title_en": title_en,
-                "section": (row.get("major_section") or row.get("section") or "").strip(),
-                "category": (row.get("category") or "").strip(),
-                "document_id": row.get("document_id"),
-                "page": row.get("page") or 1,
-                "block_id": row.get("block_id"),
-                "filename": row.get("filename") or "",
-                "relevance": row.get("relevance") or 0,
-                "is_pdf": bool(row.get("is_pdf")),
-                "is_docx": bool(row.get("is_docx")),
-                "is_txt": bool(row.get("is_txt")),
-            }
-        )
-    items.sort(key=lambda item: (-float(item.get("relevance") or 0), item.get("requirement_id") or ""))
-    return items, total_unique
 
 
 def search_requirements(query, top_k=30, active_terms=None, enrich_results=True):
@@ -5098,14 +5048,6 @@ button { background:#0069d9; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
 .info { background:#eef6ff; border-left:4px solid #339af0; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
-.requirement-list-panel { margin-top:16px; }
-.requirement-list-table { width:100%; min-width:720px; font-size:13px; }
-.requirement-list-table th { white-space:nowrap; background:#f8fafc; }
-.requirement-list-table td { vertical-align:top; }
-.requirement-list-table .req-id-cell { white-space:nowrap; font-weight:700; }
-.requirement-list-table .req-title-cell { min-width:220px; max-width:420px; }
-.requirement-list-table .req-actions-cell { white-space:nowrap; }
-.requirement-list-note { color:#64748b; font-size:13px; margin-top:8px; }
 .filename { font-size:18px; font-weight:bold; color:#b00020; }
 .meta { color:#555; margin:8px 0; font-size:14px; }
 .meta-prominent {
@@ -6119,75 +6061,9 @@ HOME_TEMPLATE = """
         </div>
         {% endif %}
 
-        {% if requirement_list and current_page == 1 and 'text' in result_types %}
-        <div class="search-meta-panel requirement-list-panel">
-            <div class="panel-title">
-                Matching requirements
-                ({{ requirement_list|length }}{% if requirement_list_total > requirement_list|length %} shown · {{ requirement_list_total }} unique{% else %} · {{ requirement_list_total }}{% endif %})
-            </div>
-            <div class="small" style="margin-bottom:10px;">
-                Compact list for keyword searches such as <strong>aarding</strong> / <strong>earthing</strong>.
-                Click a requirement ID to open the Requirement Browser.
-            </div>
-            <div class="table-scroll-wrap">
-                <table class="data-table requirement-list-table">
-                    <tr>
-                        <th>Requirement</th>
-                        <th>Title (EN)</th>
-                        <th>Section</th>
-                        <th>Page</th>
-                        <th>Actions</th>
-                    </tr>
-                    {% for item in requirement_list %}
-                    <tr>
-                        <td class="req-id-cell">
-                            <a href="{{ url_for('requirement_browser', req_lookup=item.requirement_id) }}">{{ item.requirement_id }}</a>
-                        </td>
-                        <td class="req-title-cell">
-                            {% if item.title_en %}
-                            {{ item.title_en }}
-                            {% elif item.title_nl %}
-                            {{ item.title_nl }}
-                            {% else %}
-                            -
-                            {% endif %}
-                        </td>
-                        <td>{{ item.section or item.category or '-' }}</td>
-                        <td>{{ item.page or '?' }}</td>
-                        <td class="req-actions-cell">
-                            <a href="{{ url_for('requirement_browser', req_lookup=item.requirement_id) }}">Browse</a>
-                            {% if item.is_pdf %}
-                            · <a href="{{ url_for('pdf_viewer', document_id=item.document_id, page=item.page or 1) }}" target="_blank">PDF</a>
-                            {% elif item.is_docx %}
-                            · <a href="{{ url_for('docx_viewer', document_id=item.document_id, page=item.page or 1) }}" target="_blank">DOCX</a>
-                            {% elif item.is_txt %}
-                            · <a href="{{ url_for('document_view', document_id=item.document_id, page=item.page or 1) }}" target="_blank">TXT</a>
-                            {% endif %}
-                            {% if item.block_id %}
-                            · <a href="{{ url_for('requirement_detail', block_id=item.block_id) }}" target="_blank">Detail</a>
-                            {% endif %}
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </table>
-            </div>
-            {% if requirement_list_total > requirement_list|length %}
-            <div class="requirement-list-note">
-                Showing the top {{ requirement_list|length }} unique requirements by relevance.
-                See detailed text results below for more matches.
-            </div>
-            {% endif %}
-        </div>
-        {% elif query and current_page == 1 and 'text' in result_types and not resolved_requirement_id %}
-        <div class="search-meta-panel search-empty-notice">
-            <div class="panel-title">Matching requirements</div>
-            <div class="warning compact-warning">No indexed requirement IDs matched this keyword.</div>
-        </div>
-        {% endif %}
-
         {% if 'text' in result_types %}
         <div class="search-results-text">
-        <h3 id="detailed-text-results">Detailed text results for "{{ query }}"{% if resolved_requirement_id and resolved_requirement_id|lower != query|lower %} <span class="small">(as <strong>{{ resolved_requirement_id }}</strong>)</span>{% endif %}</h3>
+        <h3>Text results for "{{ query }}"{% if resolved_requirement_id and resolved_requirement_id|lower != query|lower %} <span class="small">(as <strong>{{ resolved_requirement_id }}</strong>)</span>{% endif %}</h3>
 
         {% if results %}
             {% for res in results %}
@@ -9795,8 +9671,6 @@ def home():
         summary = {"top_categories": [], "top_requirement_ids": []}
         document_matches = []
         table_results = []
-        requirement_list = []
-        requirement_list_total = 0
         result_types = ["drawings", "text", "tables"]
 
         if search_query:
@@ -9821,10 +9695,8 @@ def home():
                 all_results, _ = search_requirements(
                     search_query,
                     active_terms=selected_terms,
-                    top_k=REQUIREMENT_LIST_SEARCH_TOP_K,
                     enrich_results=False,
                 )
-                requirement_list, requirement_list_total = build_compact_requirement_list(all_results)
                 if table_results:
                     table_doc_ids = {t["document_id"] for t in table_results}
                     all_results = [
@@ -9837,8 +9709,7 @@ def home():
                 current_page = min(current_page, total_pages)
                 start_idx = (current_page - 1) * RESULTS_PER_PAGE
                 end_idx = start_idx + RESULTS_PER_PAGE
-                page_results = all_results[start_idx:end_idx]
-                results = enrich_search_results_batch(page_results)
+                results = enrich_search_results_batch(all_results[start_idx:end_idx])
 
         return _db_recover_and_retry(
             lambda: render_template_string(
@@ -9850,8 +9721,6 @@ def home():
             results=results,
             document_matches=document_matches,
             table_results=table_results,
-            requirement_list=requirement_list,
-            requirement_list_total=requirement_list_total,
             all_expanded_terms=all_expanded_terms,
             selected_terms=selected_terms,
             exact_terms=exact_terms,
@@ -9898,8 +9767,6 @@ def home():
             results=[],
             document_matches=[],
             table_results=[],
-            requirement_list=[],
-            requirement_list_total=0,
             all_expanded_terms=[],
             selected_terms=[],
             exact_terms=[],
@@ -9964,8 +9831,6 @@ def requirement_browser():
         results=[],
         document_matches=[],
         table_results=[],
-        requirement_list=[],
-        requirement_list_total=0,
         all_expanded_terms=[],
         selected_terms=[],
         exact_terms=[],
