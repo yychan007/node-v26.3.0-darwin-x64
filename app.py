@@ -180,6 +180,7 @@ REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS = 8.0
 REQUIREMENT_LOOKUP_MAX_MASTER_DOCS = 1
 TABLE_VIEWER_PAGE_SIZE = 20
 TABLE_VIEWER_MAX_PAGE_SIZE = 500
+FIELD_EXPLANATION_MAX_TERMS = 8
 TABLE_MASTER_SHEET_INDEX_CAP = 500
 _spreadsheet_sheet_cache = {}
 
@@ -564,6 +565,16 @@ class TranslationCache(db.Model):
     source_text = db.Column(db.Text, default="")
     translated_text = db.Column(db.Text, default="")
     provider = db.Column(db.String(32), default="")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class FieldExplanationCache(db.Model):
+    __tablename__ = "field_explanation_cache"
+
+    term_key = db.Column(db.String(64), primary_key=True)
+    term = db.Column(db.String(64), nullable=False, index=True)
+    explanation = db.Column(db.Text, default="")
+    source = db.Column(db.String(16), default="")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -1395,6 +1406,21 @@ def build_layout_translation_payload(doc, page_num, target_lang="en"):
     }
 
 
+def _attach_field_explanations_to_page_response(
+    response, source="", translated="", translation_html=""
+):
+    explanation_text = " ".join(
+        part
+        for part in [source, translated, strip_html_legacy(translation_html)]
+        if part
+    ).strip()
+    if explanation_text:
+        response["field_explanations"] = serialize_field_explanations(
+            build_field_explanations_for_text(explanation_text)
+        )
+    return response
+
+
 def get_or_translate_page(doc, page_num, target_lang="en"):
     target_lang = "en"
     row = DocumentPageTranslation.query.filter_by(
@@ -1422,7 +1448,12 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
         if layout_payload:
             response["translation_html"] = layout_payload.get("translation_html") or ""
             response["layout"] = True
-        return response
+        return _attach_field_explanations_to_page_response(
+            response,
+            cached_source,
+            cached_translation,
+            layout_payload.get("translation_html") if layout_payload else "",
+        )
 
     if layout_payload:
         source = layout_payload.get("source") or ""
@@ -1487,7 +1518,9 @@ def get_or_translate_page(doc, page_num, target_lang="en"):
     if layout_payload:
         response["translation_html"] = translation_html
         response["layout"] = True
-    return response
+    return _attach_field_explanations_to_page_response(
+        response, source, translated, translation_html if layout_payload else ""
+    )
 
 
 def count_pdf_pages(doc):
@@ -3922,6 +3955,194 @@ def search_dictionary_entries(query, limit=50, entry_kinds=None):
     return [entry for _, entry in ranked[:limit]]
 
 
+FIELD_EXPLANATION_STOPWORDS = {
+    "EN", "NL", "PDF", "DOC", "TXT", "CSV", "XLS", "XLSX", "HTTP", "HTTPS", "URL",
+    "API", "UTC", "OK", "NO", "YES", "AND", "THE", "FOR", "OR", "TO", "OF", "IN",
+    "IS", "IT", "BE", "AS", "AT", "BY", "ON", "IF", "AM", "REQ", "FIG", "TAB", "ROW",
+    "IEC", "NEN", "DIN", "ISO", "VDE", "KV", "MV", "LV", "AC", "DC",
+}
+
+ACRONYM_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,5}\b")
+
+
+def field_explanations_enabled():
+    return translation.field_explanations_enabled()
+
+
+def extract_field_acronyms(*texts, max_terms=FIELD_EXPLANATION_MAX_TERMS):
+    counts = Counter()
+    for text in texts:
+        for match in ACRONYM_TOKEN_RE.finditer(text or ""):
+            token = match.group(0)
+            if token in FIELD_EXPLANATION_STOPWORDS:
+                continue
+            if token.isdigit():
+                continue
+            counts[token] += 1
+    ordered = [term for term, _count in counts.most_common(max_terms * 2)]
+    return ordered[:max_terms]
+
+
+def _field_explanation_cache_key(term):
+    return hashlib.sha256((term or "").strip().upper().encode("utf-8")).hexdigest()
+
+
+def get_cached_field_explanation(term):
+    row = FieldExplanationCache.query.get(_field_explanation_cache_key(term))
+    if not row or not (row.explanation or "").strip():
+        return None
+    return {
+        "term": row.term,
+        "explanation": row.explanation,
+        "source": row.source or "cache",
+    }
+
+
+def store_cached_field_explanation(term, explanation, source):
+    explanation = (explanation or "").strip()
+    term = (term or "").strip().upper()
+    if not term or not explanation:
+        return
+    term_key = _field_explanation_cache_key(term)
+    row = FieldExplanationCache.query.get(term_key)
+    if row:
+        return
+    cache_cls = cast(Any, FieldExplanationCache)
+    db.session.add(
+        cache_cls(
+            term_key=term_key,
+            term=term,
+            explanation=explanation,
+            source=source or "ai",
+        )
+    )
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def lookup_dictionary_term_explanation(term):
+    term = (term or "").strip()
+    if not term:
+        return None
+    entries = search_dictionary_entries(
+        term, limit=5, entry_kinds=["abbreviation", "reference"]
+    )
+    if not entries:
+        return None
+
+    term_upper = term.upper()
+    for entry in entries:
+        if (entry.term or "").strip().upper() != term_upper:
+            continue
+        explanation = (
+            (entry.content_en or "").strip()
+            or (entry.content_nl or "").strip()
+            or (entry.content or "").strip()
+        )
+        if explanation:
+            return {
+                "term": term_upper,
+                "explanation": explanation,
+                "source": "dictionary",
+                "dictionary_term": entry.term,
+            }
+
+    entry = entries[0]
+    explanation = (
+        (entry.content_en or "").strip()
+        or (entry.content_nl or "").strip()
+        or (entry.content or "").strip()
+    )
+    if not explanation:
+        return None
+    return {
+        "term": term_upper,
+        "explanation": explanation,
+        "source": "dictionary",
+        "dictionary_term": entry.term,
+    }
+
+
+def explain_single_field_term(term, context=""):
+    term = (term or "").strip().upper()
+    if not term:
+        return None
+
+    cached = get_cached_field_explanation(term)
+    if cached:
+        return cached
+
+    dictionary_hit = lookup_dictionary_term_explanation(term)
+    if dictionary_hit:
+        store_cached_field_explanation(
+            term, dictionary_hit["explanation"], source="dictionary"
+        )
+        return dictionary_hit
+
+    if not field_explanations_enabled():
+        return None
+
+    explanation = translation.explain_field_term(term, context=context)
+    if not explanation:
+        return None
+
+    result = {"term": term, "explanation": explanation, "source": "ai"}
+    store_cached_field_explanation(term, explanation, source="ai")
+    return result
+
+
+def build_field_explanations_for_text(*texts, max_terms=FIELD_EXPLANATION_MAX_TERMS):
+    terms = extract_field_acronyms(*texts, max_terms=max_terms)
+    if not terms:
+        return []
+    context = " ".join(part for part in texts if part).strip()[:1200]
+    results = []
+    for term in terms:
+        hit = explain_single_field_term(term, context=context)
+        if hit:
+            results.append(hit)
+    return results
+
+
+def serialize_field_explanations(explanations):
+    return [
+        {
+            "term": item.get("term", ""),
+            "explanation": item.get("explanation", ""),
+            "source": item.get("source", ""),
+            "dictionary_term": item.get("dictionary_term", ""),
+        }
+        for item in (explanations or [])
+    ]
+
+
+def format_field_explanations_html(explanations):
+    if not explanations:
+        return ""
+    parts = [
+        '<div class="field-explanations-panel">',
+        '<div class="field-explanations-title">Field explanations</div>',
+    ]
+    for item in explanations:
+        term = html.escape(item.get("term") or "")
+        explanation = html.escape(item.get("explanation") or "")
+        source = item.get("source") or ""
+        source_label = "Definitions" if source == "dictionary" else "AI"
+        dict_term = item.get("dictionary_term") or item.get("term") or ""
+        dict_url = html.escape(url_for("dictionary_lookup", q=dict_term))
+        parts.append(
+            f'<div class="field-explanation-item">'
+            f'<strong><a href="{dict_url}" target="_blank" rel="noopener">{term}</a></strong>'
+            f" — {explanation}"
+            f' <span class="field-explanation-source">({source_label})</span>'
+            f"</div>"
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
 # =========================================================
 # Search
 # =========================================================
@@ -4621,6 +4842,30 @@ button { background:#0069d9; }
 .dict-result-lang-label { display:inline-block; min-width:2.6em; font-weight:800; color:#475569; }
 .dict-result-meta { margin-top:10px; font-size:13px; color:#64748b; }
 .dict-empty { margin-top:16px; padding:14px 16px; background:#fff3cd; border-left:4px solid #ffc107; border-radius:6px; }
+.field-explanations-panel {
+  margin-top:14px;
+  padding:12px 14px;
+  background:#f8fafc;
+  border:1px solid #dbe1ea;
+  border-left:4px solid #6f42c1;
+  border-radius:8px;
+}
+.field-explanations-title {
+  font-size:13px;
+  font-weight:700;
+  color:#475569;
+  margin-bottom:8px;
+  text-transform:uppercase;
+  letter-spacing:0.03em;
+}
+.field-explanation-item {
+  font-size:13px;
+  line-height:1.5;
+  color:#334155;
+  margin-top:6px;
+}
+.field-explanation-item:first-of-type { margin-top:0; }
+.field-explanation-source { color:#64748b; font-size:12px; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
 .info { background:#eef6ff; border-left:4px solid #339af0; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
@@ -5074,6 +5319,9 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
             </td>
         </tr>
     </table>
+    {% if item.field_explanations %}
+    {{ item.field_explanations_html|safe }}
+    {% endif %}
 </div>
 {% endmacro %}
 """
@@ -6491,6 +6739,7 @@ iframe { width:100%; height:100%; border:none; }
                 <h4>English translation — {{ page_label }} {{ page }} / {{ total_pages }}</h4>
                 <div id="translated-text">...</div>
             </div>
+            <div id="field-explanations"></div>
         </div>
         {% endif %}
     </div>
@@ -6642,17 +6891,58 @@ TABLE_VIEWER_TEMPLATE = """
 <title>Table viewer - {{ doc.original_filename }}</title>
 """ + BASE_CSS + """
 <style>
-.table-scroll-wrap { width:100%; overflow:auto; border:1px solid #dbe1ea; border-radius:8px; background:#fff; max-height:72vh; min-height:520px; }
-#data-table { width:100%; border-collapse:collapse; font-size:13px; }
-#data-table th, #data-table td { border:1px solid #e2e8f0; padding:8px 10px; vertical-align:top; text-align:left; white-space:pre-wrap; word-break:break-word; }
-#data-table th { position:sticky; top:0; background:#f8fafc; z-index:1; font-weight:600; }
-#data-table tr:nth-child(even) td { background:#fbfdff; }
-#data-table tr.row-highlight td { background:#fff3cd !important; }
+.table-viewer-scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid #dbe1ea;
+  border-radius: 8px;
+  background: #fff;
+  max-height: 72vh;
+  min-height: 520px;
+}
+#data-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  table-layout: auto;
+}
+#data-table th,
+#data-table td {
+  border: 1px solid #e2e8f0;
+  padding: 8px 12px;
+  vertical-align: top;
+  text-align: left;
+  min-width: 140px;
+  max-width: 420px;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+#data-table th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  z-index: 1;
+  font-weight: 600;
+  white-space: nowrap;
+  min-width: 120px;
+  max-width: none;
+}
+#data-table td.col-wide {
+  min-width: 260px;
+  max-width: 520px;
+}
+#data-table tr:nth-child(even) td { background: #fbfdff; }
+#data-table tr.row-highlight td { background: #fff3cd !important; }
 .viewer-toolbar { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:12px 0; }
 .viewer-toolbar select { min-width:220px; padding:8px; }
 .viewer-status { color:#64748b; font-size:14px; }
 .page-nav { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 .page-nav input[type="number"] { width:72px; padding:6px 8px; }
+.table-scroll-hint { color:#64748b; font-size:13px; margin:0 0 8px; }
 </style>
 </head>
 <body>
@@ -6690,7 +6980,8 @@ TABLE_VIEWER_TEMPLATE = """
     {% if error_msg %}
     <div class="warning">{{ error_msg }}</div>
     {% else %}
-    <div class="table-scroll-wrap">
+    <div class="table-scroll-hint">Scroll left/right to see all columns.</div>
+    <div class="table-scroll-wrap table-viewer-scroll">
         <table id="data-table">
             <thead id="table-head"></thead>
             <tbody id="table-body"></tbody>
@@ -6764,6 +7055,15 @@ TABLE_VIEWER_TEMPLATE = """
             }
             columnDefs.forEach(function(col) {
                 const td = document.createElement("td");
+                const header = (col.headerName || col.field || "").toLowerCase();
+                if (
+                    header.includes("description")
+                    || header.includes("title")
+                    || header.includes("statement")
+                    || header.includes("comment")
+                ) {
+                    td.className = "col-wide";
+                }
                 td.textContent = row[col.field] || "";
                 tr.appendChild(td);
             });
@@ -7963,6 +8263,12 @@ def _build_requirement_browser_content_row(block):
         summary_nl=(block.summary or "").strip(),
         definition_nl=(block.definition or "").strip(),
     )
+    field_explanations = build_field_explanations_for_text(
+        fields.get("content_en"),
+        fields.get("content_nl"),
+        fields.get("applicable_en"),
+        fields.get("applicable_nl"),
+    )
 
     return {
         "block_id": block.id,
@@ -7975,6 +8281,8 @@ def _build_requirement_browser_content_row(block):
         "snippet": compact_display_text(block.full_text or "")[:900].rstrip()
         + ("..." if len(compact_display_text(block.full_text or "")) > 900 else ""),
         **fields,
+        "field_explanations": field_explanations,
+        "field_explanations_html": format_field_explanations_html(field_explanations),
         "is_pdf": ext == "pdf",
         "is_docx": ext == "docx",
         "is_txt": ext == "txt",
@@ -7996,6 +8304,13 @@ def _build_requirement_browser_content_from_document(doc, requirement_id):
     if not any(fields.values()):
         return None
 
+    field_explanations = build_field_explanations_for_text(
+        fields.get("content_en"),
+        fields.get("content_nl"),
+        fields.get("applicable_en"),
+        fields.get("applicable_nl"),
+    )
+
     return {
         "block_id": None,
         "document_id": doc.id,
@@ -8006,6 +8321,8 @@ def _build_requirement_browser_content_from_document(doc, requirement_id):
         "page": 1,
         "snippet": "",
         **fields,
+        "field_explanations": field_explanations,
+        "field_explanations_html": format_field_explanations_html(field_explanations),
         "is_pdf": ext == "pdf",
         "is_docx": ext == "docx",
         "is_txt": ext == "txt",
