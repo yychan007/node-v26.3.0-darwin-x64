@@ -178,6 +178,10 @@ REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS = 300
 _requirement_master_scan_cache = {}
 REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS = 8.0
 REQUIREMENT_LOOKUP_MAX_MASTER_DOCS = 1
+TABLE_VIEWER_PAGE_SIZE = 200
+TABLE_VIEWER_MAX_PAGE_SIZE = 500
+TABLE_MASTER_SHEET_INDEX_CAP = 500
+_spreadsheet_sheet_cache = {}
 
 REQUIREMENT_MASTER_RESULT_CACHE_TTL_SECONDS = 300
 _requirement_master_result_cache = {}
@@ -417,6 +421,11 @@ BARE_REQUIREMENT_NUMBER_RE = re.compile(r'^\d{3,6}(?:\.\d{1,4})?$')
 SHORTHAND_REQUIREMENT_RE = re.compile(
     r'^(?:am[-\s]*)?req[-\s]*(\d{3,6}(?:\.\d{1,4})?)$',
     re.IGNORECASE,
+)
+REQUIREMENT_LINK_MARKER_RE = re.compile(
+    r"[\u2190-\u21ff\u27a0-\u27bf\u2900-\u297f"
+    r"\uf0c1\uf0c2\uf08e\uf0e7"
+    r"]+"
 )
 
 DOCUMENT_TYPE_STANDARD = "standard"
@@ -700,6 +709,41 @@ def requirement_search_aliases(query):
     if raw.lower() not in {alias.lower() for alias in aliases}:
         aliases.append(raw)
     return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def get_strict_requirement_search_terms(query):
+    normalized = normalize_requirement_lookup_id(query)
+    if not is_trackable_am_req_id(normalized):
+        return []
+    terms = [normalized, normalized.lower()]
+    number_match = re.search(r"(\d+(?:\.\d+)?)$", normalized, re.IGNORECASE)
+    if number_match:
+        terms.append(number_match.group(1))
+    return list(dict.fromkeys(terms))
+
+
+def text_contains_requirement_id(text, requirement_id):
+    target_key = normalize_requirement_id_key(normalize_requirement_lookup_id(requirement_id))
+    if not target_key or not text:
+        return False
+    for raw_id in REQ_ID_REGEX.findall(text):
+        if normalize_requirement_id_key(raw_id) == target_key:
+            return True
+    return False
+
+
+def find_matching_requirement_blocks(doc_id, requirement_id):
+    target_key = normalize_requirement_id_key(normalize_requirement_lookup_id(requirement_id))
+    if not target_key:
+        return []
+    blocks = RequirementBlock.query.filter_by(document_id=doc_id).all()
+    matched = [
+        row
+        for row in blocks
+        if normalize_requirement_id_key(row.requirement_id or "") == target_key
+    ]
+    matched.sort(key=lambda row: (row.page or 0, row.id or 0))
+    return matched
 
 
 def get_all_expanded_terms(query):
@@ -1031,7 +1075,9 @@ def pdf_page_is_visual_drawing_page(doc, page_num, page_text="", pdf_doc=None):
         return False
 
 
-def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4):
+def select_pdf_drawing_pages(
+    doc, query, active_terms, center_page, max_images=4, strict_requirement_id=""
+):
     offsets = load_page_offsets(doc)
     if not offsets:
         return []
@@ -1039,12 +1085,20 @@ def select_pdf_drawing_pages(doc, query, active_terms, center_page, max_images=4
         return []
 
     q = (query or "").lower().strip()
-    query_terms = [t for t in re.findall(r"[a-z0-9\-]+", q) if len(t) > 1]
+    strict_terms = get_strict_requirement_search_terms(strict_requirement_id)
+    query_terms = []
+    if not strict_terms:
+        query_terms = [t for t in re.findall(r"[a-z0-9\-]+", q) if len(t) > 2]
     expanded_terms = [(t or "").lower().strip() for t in (active_terms or []) if t]
-    expanded_terms = [t for t in expanded_terms if len(t) > 1]
+    if strict_terms:
+        expanded_terms = [term.lower() for term in strict_terms]
+    else:
+        expanded_terms = [t for t in expanded_terms if len(t) > 2]
     total_pages = max((p for _s, _e, p in offsets), default=1)
 
     def page_matches_terms(page_text):
+        if strict_requirement_id:
+            return text_contains_requirement_id(page_text, strict_requirement_id)
         page_text = (page_text or "").lower()
         if q and q in page_text:
             return True
@@ -1940,12 +1994,21 @@ def collect_docx_drawing_image_candidates(document_path, min_area=50000):
     return candidates
 
 
-def score_docx_drawing_candidate(candidate, query, active_terms):
+def score_docx_drawing_candidate(candidate, query, active_terms, strict_requirement_id=""):
     context = f"{candidate.get('context', '')} {candidate.get('caption', '')}".lower()
     if any(marker in context for marker in CONTENTS_MARKERS):
         return -1.0
     if not candidate.get("in_drawing_zone") and not any(marker in context for marker in DRAWING_MARKERS):
         return -1.0
+
+    if strict_requirement_id:
+        full_context = f"{candidate.get('context', '')} {candidate.get('caption', '')}"
+        if not text_contains_requirement_id(full_context, strict_requirement_id):
+            return -1.0
+        score = 12.0 if candidate.get("in_drawing_zone") else 6.0
+        if any(marker in context for marker in DRAWING_MARKERS):
+            score += 4.0
+        return score
 
     score = 4.0 if candidate.get("in_drawing_zone") else 0.0
     if any(marker in context for marker in DRAWING_MARKERS):
@@ -1968,7 +2031,9 @@ def score_docx_drawing_candidate(candidate, query, active_terms):
     return score
 
 
-def select_docx_drawing_images(document_path, query, active_terms, max_images=4, min_area=50000):
+def select_docx_drawing_images(
+    document_path, query, active_terms, max_images=4, min_area=50000, strict_requirement_id=""
+):
     candidates = collect_docx_drawing_image_candidates(document_path, min_area=min_area)
     if not candidates:
         return []
@@ -1979,7 +2044,9 @@ def select_docx_drawing_images(document_path, query, active_terms, max_images=4,
         image_index = candidate["image_index"]
         if image_index in seen:
             continue
-        score = score_docx_drawing_candidate(candidate, query, active_terms)
+        score = score_docx_drawing_candidate(
+            candidate, query, active_terms, strict_requirement_id=strict_requirement_id
+        )
         if score <= 0:
             continue
         seen.add(image_index)
@@ -2175,7 +2242,9 @@ def normalize_excel_sheet(raw_df, max_rows=200):
         if value.strip()
     }
     is_master_sheet = "speccode" in header_keys and "sourcedocument" in header_keys
-    effective_max_rows = len(sheet) if is_master_sheet else max_rows
+    effective_max_rows = (
+        min(len(sheet), TABLE_MASTER_SHEET_INDEX_CAP) if is_master_sheet else max_rows
+    )
 
     data_end_row = min(len(sheet), header_row_idx + effective_max_rows + 5)
     block = sheet.iloc[header_row_idx:data_end_row]
@@ -4374,6 +4443,11 @@ def search_documents(query, top_k=10, active_terms=None):
         active_terms = exact_terms
     else:
         active_terms = resolve_active_search_terms(query, active_terms)
+
+    strict_requirement_id = ""
+    if is_requirement_id_search(query):
+        strict_requirement_id = normalize_requirement_lookup_id(query)
+
     scored = []
 
     for doc in DocumentRecord.query.all():
@@ -4404,39 +4478,51 @@ def search_documents(query, top_k=10, active_terms=None):
     for doc, score in scored:
         if len(results) >= top_k:
             break
-        requirement_id = "-"
-        block_rows = RequirementBlock.query.filter_by(document_id=doc.id).all()
-        if block_rows:
-            best_req = None
-            best_score = -1.0
-            for row in block_rows:
-                row_req = (row.requirement_id or "").strip()
-                if not row_req:
-                    continue
-                row_score = lexical_score(row, query, active_terms, exact_terms)
-                if row_score > best_score:
-                    best_score = row_score
-                    best_req = row_req
-            if best_req:
-                requirement_id = best_req
-            else:
+
+        matching_blocks = []
+        if strict_requirement_id:
+            matching_blocks = find_matching_requirement_blocks(doc.id, strict_requirement_id)
+            if not matching_blocks:
+                continue
+
+        requirement_id = strict_requirement_id or "-"
+        if not strict_requirement_id:
+            block_rows = RequirementBlock.query.filter_by(document_id=doc.id).all()
+            if block_rows:
+                best_req = None
+                best_score = -1.0
                 for row in block_rows:
                     row_req = (row.requirement_id or "").strip()
-                    if row_req:
-                        requirement_id = row_req
-                        break
+                    if not row_req:
+                        continue
+                    row_score = lexical_score(row, query, active_terms, exact_terms)
+                    if row_score > best_score:
+                        best_score = row_score
+                        best_req = row_req
+                if best_req:
+                    requirement_id = best_req
+                else:
+                    for row in block_rows:
+                        row_req = (row.requirement_id or "").strip()
+                        if row_req:
+                            requirement_id = row_req
+                            break
 
-        page = resolve_result_page(
-            doc,
-            0,
-            doc.text_preview or "",
-            active_terms,
-            query,
-            1,
-        )
+        page = 1
+        if matching_blocks:
+            page = matching_blocks[0].page or 1
+        else:
+            page = resolve_result_page(
+                doc,
+                0,
+                doc.text_preview or "",
+                active_terms,
+                query,
+                1,
+            )
 
         # Better virtual-page estimate for docx/txt (since page_offsets_json is not meaningful there)
-        if doc.extension.lower() in {"docx", "txt"}:
+        if not matching_blocks and doc.extension.lower() in {"docx", "txt"}:
             try:
                 full_text = get_document_full_text(doc)
                 hit_pos = find_hit_position(full_text, active_terms, query)
@@ -4460,6 +4546,7 @@ def search_documents(query, top_k=10, active_terms=None):
                 active_terms=active_terms,
                 center_page=page or 1,
                 max_images=4,
+                strict_requirement_id=strict_requirement_id,
             )
         if doc.extension.lower() == "docx" and storage.document_exists(doc.stored_filename, DOC_FOLDER):
             try:
@@ -4469,6 +4556,7 @@ def search_documents(query, top_k=10, active_terms=None):
                         query=query,
                         active_terms=active_terms,
                         max_images=4,
+                        strict_requirement_id=strict_requirement_id,
                     )
             except Exception as exc:
                 print(f"DOCX image preview error for doc {doc.id}: {exc}")
@@ -5226,7 +5314,7 @@ HOME_TEMPLATE = """
                             <strong>{{ row.document_name }}</strong>
                             · Sheet: {{ row.sheet_name }}
                             · Row: {{ row.row_number }}
-                            · <a href="{{ url_for('table_preview', document_id=row.document_id) }}" target="_blank">Open table</a>
+                            · <a href="{{ url_for('table_viewer', document_id=row.document_id, sheet=row.sheet_name, highlight=req_lookup.normalized_id or req_lookup_query) }}" target="_blank">Open source table</a>
                         </div>
                         <div class="table-scroll-wrap" style="margin-top:8px;">
                             <table class="data-table" style="width:max-content; min-width:100%;">
@@ -5286,21 +5374,10 @@ HOME_TEMPLATE = """
                     <div class="summary-box" style="margin-top:10px;">
                         <div><strong>{{ t.document_name }}</strong></div>
                         <div class="meta">Sheet: {{ t.sheet_name }} · Format: {{ t.table_format }}</div>
-                        <div style="margin-top:8px;">
-                            <strong>Table 1 / Dutch (Original)</strong>
-                            <div class="table-scroll-wrap" style="margin-top:6px;">
-                                <div class="data-table">{{ t.html_table|safe }}</div>
-                            </div>
+                        <div class="meta" style="margin-top:8px;">
+                            Large spreadsheets open in the virtual table viewer (only visible rows are loaded).
                         </div>
-                        {% if t.html_table_en %}
-                        <div style="margin-top:10px;">
-                            <strong>Table 2 / English (Translation)</strong>
-                            <div class="table-scroll-wrap" style="margin-top:6px;">
-                                <div class="data-table">{{ t.html_table_en|safe }}</div>
-                            </div>
-                        </div>
-                        {% endif %}
-                        <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open table</a>
+                        <a class="btn btn-green btn-small" style="margin-top:8px;" href="{{ url_for('table_viewer', document_id=t.document_id, sheet=t.sheet_name, highlight=req_lookup.normalized_id or req_lookup_query) }}" target="_blank">Open source table</a>
                     </div>
                     {% endfor %}
                 </div>
@@ -6526,6 +6603,196 @@ iframe { width:100%; height:100%; border:none; }
 </html>
 """
 
+TABLE_VIEWER_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Table viewer - {{ doc.original_filename }}</title>
+""" + BASE_CSS + """
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.4/styles/ag-grid.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.4/styles/ag-theme-alpine.css">
+<style>
+#table-viewer-grid { width:100%; height:72vh; min-height:520px; }
+.viewer-toolbar { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:12px 0; }
+.viewer-toolbar select { min-width:220px; padding:8px; }
+.viewer-status { color:#64748b; font-size:14px; }
+.highlight-note { margin:10px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="topbar">
+        <div class="topbar-brand">
+            <h1>Table viewer</h1>
+            <div class="small">{{ doc.original_filename }}</div>
+        </div>
+""" + PORTAL_NAV_ACTIONS + """
+    </div>
+
+    <div class="viewer-toolbar">
+        <label for="sheet-select"><strong>Sheet:</strong></label>
+        <select id="sheet-select"></select>
+        <span class="viewer-status" id="viewer-status">Loading table...</span>
+        {% if highlight_req %}
+        <span class="viewer-status">Highlight: <strong>{{ highlight_req }}</strong></span>
+        {% endif %}
+        {% if current_user.is_authenticated and current_user.is_admin %}
+        <a class="btn btn-green btn-small" href="{{ url_for('export_table_xlsx', document_id=doc.id) }}">Export Excel</a>
+        {% endif %}
+        <a class="btn btn-gray btn-small" href="{{ url_for('table_preview', document_id=doc.id) }}">Classic preview</a>
+    </div>
+
+    {% if error_msg %}
+    <div class="warning">{{ error_msg }}</div>
+    {% else %}
+    <div id="table-viewer-grid" class="ag-theme-alpine"></div>
+    {% endif %}
+</div>
+
+{% if not error_msg %}
+<script src="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.4/dist/ag-grid-community.min.js"></script>
+<script>
+(function() {
+    const documentId = {{ doc.id }};
+    const initialSheet = {{ initial_sheet|tojson }};
+    const highlightReq = {{ highlight_req|tojson }};
+    const pageSize = {{ page_size }};
+    const gridHost = document.getElementById("table-viewer-grid");
+    const sheetSelect = document.getElementById("sheet-select");
+    const statusEl = document.getElementById("viewer-status");
+    let gridApi = null;
+    let currentSheet = initialSheet || "";
+    let highlightInfo = null;
+
+    function setStatus(text) {
+        statusEl.textContent = text;
+    }
+
+    function buildDatasource(sheetName) {
+        return {
+            rowCount: undefined,
+            getRows: function(params) {
+                const limit = params.endRow - params.startRow;
+                const url = `/api/table/${documentId}/rows?sheet=${encodeURIComponent(sheetName)}&offset=${params.startRow}&limit=${limit}&highlight=${encodeURIComponent(highlightReq || "")}`;
+                fetch(url)
+                    .then(function(resp) { return resp.json(); })
+                    .then(function(data) {
+                        if (data.error) {
+                            params.failCallback();
+                            setStatus(data.error);
+                            return;
+                        }
+                        highlightInfo = data.highlight || highlightInfo;
+                        const total = typeof data.total === "number" ? data.total : undefined;
+                        params.successCallback(data.rows || [], total);
+                        if (typeof total === "number") {
+                            setStatus(`${total.toLocaleString()} rows · virtual scrolling enabled`);
+                        }
+                        if (highlightInfo && typeof highlightInfo.data_index === "number") {
+                            gridApi.ensureIndexVisible(highlightInfo.data_index, "middle");
+                        }
+                    })
+                    .catch(function(err) {
+                        console.error(err);
+                        params.failCallback();
+                        setStatus("Could not load table rows.");
+                    });
+            }
+        };
+    }
+
+    function initGrid(columnDefs, sheetName) {
+        if (gridApi) {
+            gridApi.destroy();
+            gridApi = null;
+        }
+        const gridOptions = {
+            columnDefs: columnDefs || [],
+            defaultColDef: {
+                resizable: true,
+                sortable: false,
+                filter: false,
+                minWidth: 140,
+            },
+            rowModelType: "infinite",
+            cacheBlockSize: pageSize,
+            maxBlocksInCache: 4,
+            infiniteInitialRowCount: pageSize,
+            pagination: false,
+            animateRows: false,
+            rowSelection: "single",
+            getRowId: function(params) {
+                return String(params.data._excel_row_num || params.data.__rowId || Math.random());
+            },
+            getRowStyle: function(params) {
+                if (highlightInfo && params.data && highlightInfo.excel_row_num && params.data._excel_row_num === highlightInfo.excel_row_num) {
+                    return { background: "#fff3cd" };
+                }
+                return null;
+            },
+            onGridReady: function(params) {
+                gridApi = params.api;
+                params.api.setGridOption("datasource", buildDatasource(sheetName));
+            },
+        };
+        agGrid.createGrid(gridHost, gridOptions);
+    }
+
+    function loadSheet(sheetName) {
+        currentSheet = sheetName;
+        setStatus("Loading columns...");
+        fetch(`/api/table/${documentId}/meta?sheet=${encodeURIComponent(sheetName)}&highlight=${encodeURIComponent(highlightReq || "")}`)
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    setStatus(data.error);
+                    return;
+                }
+                highlightInfo = data.highlight || null;
+                initGrid(data.column_defs || [], sheetName);
+                if (typeof data.row_count === "number") {
+                    setStatus(`${data.row_count.toLocaleString()} rows · sheet ${sheetName}`);
+                }
+            })
+            .catch(function(err) {
+                console.error(err);
+                setStatus("Could not load sheet metadata.");
+            });
+    }
+
+    fetch(`/api/table/${documentId}/meta?highlight=${encodeURIComponent(highlightReq || "")}`)
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            const sheets = data.sheets || [];
+            sheetSelect.innerHTML = "";
+            sheets.forEach(function(sheet) {
+                const option = document.createElement("option");
+                option.value = sheet.name;
+                option.textContent = `${sheet.name}${sheet.row_count ? " (" + sheet.row_count.toLocaleString() + " rows)" : ""}`;
+                if (sheet.name === (initialSheet || data.active_sheet)) {
+                    option.selected = true;
+                }
+                sheetSelect.appendChild(option);
+            });
+            const chosen = initialSheet || data.active_sheet || (sheets[0] && sheets[0].name) || "";
+            loadSheet(chosen);
+        })
+        .catch(function(err) {
+            console.error(err);
+            setStatus("Could not load spreadsheet metadata.");
+        });
+
+    sheetSelect.addEventListener("change", function() {
+        loadSheet(sheetSelect.value);
+    });
+})();
+</script>
+{% endif %}
+</body>
+</html>
+"""
+
 TABLE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -6543,6 +6810,9 @@ TABLE_TEMPLATE = """
 """ + PORTAL_NAV_ACTIONS + """
     </div>
     <div style="margin:12px 0; display:flex; gap:8px; flex-wrap:wrap;">
+        {% if tables %}
+        <a class="btn btn-green" href="{{ url_for('table_viewer', document_id=doc.id) }}">Open virtual table viewer</a>
+        {% endif %}
         {% if current_user.is_authenticated and current_user.is_admin %}
         <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
         {% endif %}
@@ -6899,11 +7169,14 @@ def _looks_like_requirement_category(line):
     if re.search(
         r"(?i)\b(systeem|system|proces|process|onderhoudbaarheid|betrouwbaarheid|"
         r"toekomstvastheid|functioneel|aspect|activiteit|raakvlak|ontwerprandvoorwaarde|"
-        r"reliability|maintainability|design\s+constraint)\b",
+        r"reliability|maintainability|design\s+constraint|constraint)\b",
         low,
     ):
         return True
-    return bool(re.match(r"(?i)^(systeem|system|proces|process)\s*,", cleaned))
+    return bool(
+        re.match(r"(?i)^(systeem|system|proces|process|ontwerprandvoorwaarde|constraint)\s*,?", cleaned)
+        or re.match(r"(?i)^(ontwerprandvoorwaarde|design\s+constraint|constraint)$", cleaned)
+    )
 
 
 def _looks_like_requirement_hidden_link_line(line):
@@ -6954,6 +7227,159 @@ def _is_standalone_requirement_id_line(line):
     )
 
 
+def _strip_merged_requirement_field_prefix(text):
+    value = _clean_requirement_field_line(text)
+    if not value or " | " not in value:
+        return value
+    left, right = value.split(" | ", 1)
+    left = left.strip()
+    right = right.strip()
+    if not right:
+        return value
+    if _looks_like_requirement_category(left) or re.match(
+        r"(?i)^(constraint|ontwerprandvoorwaarde|design\s+constraint)$",
+        left,
+    ):
+        return right
+    return value
+
+
+def _line_has_minor_requirement_reference(line, candidate_id):
+    cleaned = _clean_requirement_field_line(line)
+    if not cleaned or not candidate_id:
+        return False
+    if _is_standalone_requirement_id_line(cleaned):
+        return False
+    remainder = REQ_ID_REGEX.sub("", cleaned).strip(" .,;:-")
+    return len(remainder) > 12
+
+
+def _strip_requirement_link_markers(text):
+    value = _clean_requirement_field_line(text or "")
+    if not value:
+        return ""
+    value = REQUIREMENT_LINK_MARKER_RE.sub("", value)
+    return re.sub(r"\s+", " ", value).strip(" |-:.")
+
+
+def _cell_looks_like_related_link_marker(cell, page_width=1.0):
+    text = _strip_requirement_link_markers(cell.get("text") or "")
+    if not text:
+        return True
+    if len(text) <= 3 and not any(ch.isalnum() for ch in text):
+        return True
+    if re.fullmatch(r"[-_=./\\|]+", text):
+        return True
+    if re.search(r"(?i)\b(gerelateerd|related|link|ref)\b", text):
+        return True
+    width_ratio = max(float(cell.get("x1", 0)) - float(cell.get("x0", 0)), 1.0) / max(
+        float(page_width or 1.0), 1.0
+    )
+    return len(text) <= 12 and width_ratio < 0.18
+
+
+def _normalize_pipe_layout_line(line):
+    raw = _clean_requirement_field_line(line)
+    if not raw:
+        return ""
+    return re.sub(r"\s*\|\s*", " | ", raw)
+
+
+def _extract_related_from_pipe_layout_line(line, primary_key):
+    raw = _normalize_pipe_layout_line(line)
+    if not raw or " | " not in raw:
+        return ""
+
+    parts = [part.strip() for part in raw.split(" | ")]
+    for idx, part in enumerate(parts):
+        if not part:
+            continue
+        ids = REQ_ID_REGEX.findall(part)
+        if len(ids) != 1 or not _is_standalone_requirement_id_line(part):
+            continue
+        candidate = normalize_requirement_lookup_id(ids[0])
+        cand_key = normalize_requirement_id_key(candidate)
+        if not candidate or cand_key == primary_key:
+            continue
+
+        prefix_parts = parts[:idx]
+        prefix_text = " | ".join(prefix_parts).strip()
+        prefix_clean = _strip_requirement_link_markers(prefix_text)
+        if not prefix_clean:
+            return candidate
+        if len(prefix_clean) <= 12 and not any(ch.isalpha() for ch in prefix_clean):
+            return candidate
+        if _looks_like_requirement_category(prefix_clean):
+            continue
+        if len(prefix_clean) <= 36 and not _looks_like_requirement_statement(prefix_clean, "nl"):
+            return candidate
+    return ""
+
+
+def _extract_related_requirement_from_pdf_layout(doc, page_num, requirement_id):
+    layout = extract_pdf_page_layout_rows(doc, page_num)
+    if not layout or not layout.get("rows"):
+        return ""
+
+    primary = normalize_requirement_lookup_id(requirement_id)
+    primary_key = normalize_requirement_id_key(primary)
+    if not primary_key:
+        return ""
+
+    page_width = float(layout.get("page_width") or 1.0)
+    rows = layout["rows"]
+    primary_row_idx = -1
+    for idx, row in enumerate(rows):
+        row_text = " | ".join((cell.get("text") or "").strip() for cell in row.get("cells", []))
+        if primary_key in normalize_requirement_id_key(row_text):
+            primary_row_idx = idx
+            break
+
+    if primary_row_idx < 0:
+        return ""
+
+    stop_pattern = re.compile(
+        r"(?i)^(figure|explanation|verification|phase|method|remark|test|berekening|calculation)\b"
+    )
+    related_candidates = []
+
+    for row in rows[primary_row_idx + 1 :]:
+        cells = row.get("cells") or []
+        if not cells:
+            continue
+        row_text = " | ".join((cell.get("text") or "").strip() for cell in cells).strip()
+        if stop_pattern.search(row_text):
+            break
+
+        pipe_related = _extract_related_from_pipe_layout_line(row_text, primary_key)
+        if pipe_related:
+            return pipe_related
+
+        if len(cells) >= 2:
+            left_cell = cells[0]
+            for right_cell in cells[1:]:
+                right_text = (right_cell.get("text") or "").strip()
+                if not _is_standalone_requirement_id_line(right_text):
+                    continue
+                candidate = normalize_requirement_lookup_id(REQ_ID_REGEX.findall(right_text)[0])
+                cand_key = normalize_requirement_id_key(candidate)
+                if not candidate or cand_key == primary_key:
+                    continue
+                if _cell_looks_like_related_link_marker(left_cell, page_width):
+                    return candidate
+                related_candidates.append(candidate)
+
+        if len(cells) == 1:
+            only_text = (cells[0].get("text") or "").strip()
+            if _is_standalone_requirement_id_line(only_text):
+                candidate = normalize_requirement_lookup_id(REQ_ID_REGEX.findall(only_text)[0])
+                cand_key = normalize_requirement_id_key(candidate)
+                if candidate and cand_key != primary_key:
+                    related_candidates.append(candidate)
+
+    return related_candidates[0] if related_candidates else ""
+
+
 def _extract_related_requirement_id(requirement_id, full_text):
     primary = normalize_requirement_lookup_id(requirement_id)
     if not primary:
@@ -6980,17 +7406,63 @@ def _extract_related_requirement_id(requirement_id, full_text):
     stop_pattern = re.compile(
         r"(?i)^(figure|explanation|verification|phase|method|remark|test|berekening|calculation)\b"
     )
+    related_hits = []
+    seen_keys = set()
+
     for line in lines[primary_idx + 1 :]:
-        if _looks_like_requirement_statement(line, lang="nl") or _looks_like_requirement_statement(
-            line, lang="en"
-        ):
-            break
         if stop_pattern.search(line):
             break
-        if not _is_standalone_requirement_id_line(line):
+        if _is_requirement_metadata_line(line):
             continue
-        candidate = normalize_requirement_lookup_id(REQ_ID_REGEX.findall(line)[0])
-        if normalize_requirement_id_key(candidate) != primary_key:
+
+        pipe_related = _extract_related_from_pipe_layout_line(line, primary_key)
+        if pipe_related:
+            return pipe_related
+
+        for raw_id in REQ_ID_REGEX.findall(line):
+            candidate = normalize_requirement_lookup_id(raw_id)
+            cand_key = normalize_requirement_id_key(candidate)
+            if not candidate or cand_key == primary_key or cand_key in seen_keys:
+                continue
+            seen_keys.add(cand_key)
+            related_hits.append(
+                {
+                    "id": candidate,
+                    "line": line,
+                    "standalone": _is_standalone_requirement_id_line(line),
+                    "minor_reference": _line_has_minor_requirement_reference(line, candidate),
+                    "pipe_layout": bool(pipe_related),
+                }
+            )
+
+    for hit in related_hits:
+        if hit.get("pipe_layout"):
+            return hit["id"]
+
+    for hit in related_hits:
+        if hit["standalone"]:
+            return hit["id"]
+
+    for hit in related_hits:
+        if not hit["minor_reference"]:
+            return hit["id"]
+
+    if related_hits:
+        return related_hits[-1]["id"]
+
+    segment = "\n".join(lines[primary_idx + 1 :])
+    # Fallback: capture standalone related IDs in the block tail text.
+    for match in REQ_ID_REGEX.finditer(segment):
+        candidate = normalize_requirement_lookup_id(match.group(1))
+        cand_key = normalize_requirement_id_key(candidate)
+        if not candidate or cand_key == primary_key:
+            continue
+        line_start = segment.rfind("\n", 0, match.start()) + 1
+        line_end = segment.find("\n", match.start())
+        if line_end == -1:
+            line_end = len(segment)
+        line = segment[line_start:line_end].strip()
+        if _is_standalone_requirement_id_line(line):
             return candidate
 
     return ""
@@ -7253,6 +7725,28 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
         summary_nl=(result_dict.get("summary") or "").strip(),
         definition_nl=(result_dict.get("definition") or "").strip(),
     )
+    if not fields.get("related_requirement_id") and doc and is_trackable_am_req_id(requirement_id):
+        if ext == "pdf":
+            layout_related = _extract_related_requirement_from_pdf_layout(
+                doc, page_num, requirement_id
+            )
+            if layout_related:
+                fields["related_requirement_id"] = layout_related
+        if not fields.get("related_requirement_id"):
+            page_text = extract_single_page_text(doc, page_num) if ext in {"pdf", "docx", "txt"} else ""
+            layout_source = ""
+            if ext == "pdf":
+                layout_payload = extract_pdf_page_layout_rows(doc, page_num)
+                if layout_payload and layout_payload.get("rows"):
+                    layout_source = "\n".join(
+                        " | ".join((cell.get("text") or "").strip() for cell in row.get("cells", []))
+                        for row in layout_payload["rows"]
+                    )
+            for candidate_text in (layout_source, page_text, translated_text, full_text_nl):
+                related = _extract_related_requirement_id(requirement_id, candidate_text or "")
+                if related:
+                    fields["related_requirement_id"] = related
+                    break
     result_dict.update(fields)
     if requirement_id:
         result_dict["requirement_id"] = requirement_id
@@ -7344,6 +7838,11 @@ def _build_requirement_content_fields(
             )
         if not content_en:
             content_en = (translate_to_english(content_nl) or "").strip()
+
+    if content_nl:
+        content_nl = _strip_merged_requirement_field_prefix(content_nl)
+    if content_en:
+        content_en = _strip_merged_requirement_field_prefix(content_en)
 
     related_requirement_id = _extract_related_requirement_id(requirement_id, full_text_nl)
     if not related_requirement_id and (full_text_en or "").strip():
@@ -7543,6 +8042,356 @@ def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_collect=200):
             pass
 
     return matched, sheets_scanned
+
+
+def _find_xlsx_sheet_header(ws, max_row=60):
+    best_row = None
+    best_count = 0
+    iter_rows_fn = getattr(ws, "iter_rows", None)
+    if not callable(iter_rows_fn):
+        return None
+    for r_idx, row in enumerate(
+        cast(Any, iter_rows_fn)(min_row=1, max_row=max_row, values_only=True),
+        start=1,
+    ):
+        values = [normalize_cell_text(v) for v in (row or [])]
+        count = sum(1 for value in values if value)
+        if count > best_count:
+            best_count = count
+            best_row = (r_idx, values)
+    if not best_row or best_count < 2:
+        return None
+    header_row_idx, header_values = best_row
+    columns = []
+    for idx, label in enumerate(header_values):
+        cleaned = normalize_cell_text(label) or f"Column {idx + 1}"
+        columns.append(cleaned)
+    header_keys = [
+        re.sub(r"[^a-z0-9]+", "", (label or "").strip().lower()) for label in columns
+    ]
+    spec_idx = header_keys.index("speccode") if "speccode" in header_keys else -1
+    return {
+        "header_row_idx": header_row_idx,
+        "columns": columns,
+        "header_keys": header_keys,
+        "spec_idx": spec_idx,
+        "is_master": "speccode" in header_keys and "sourcedocument" in header_keys,
+    }
+
+
+def _count_xlsx_sheet_data_rows(ws, header_row_idx):
+    count = 0
+    iter_rows_fn = getattr(ws, "iter_rows", None)
+    if not callable(iter_rows_fn):
+        return 0
+    for row in cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True):
+        if any(normalize_cell_text(v) for v in (row or [])):
+            count += 1
+    return count
+
+
+def _sheet_column_defs(columns):
+    column_defs = []
+    for idx, label in enumerate(columns):
+        column_defs.append(
+            {
+                "field": f"col_{idx}",
+                "headerName": label,
+                "minWidth": 140,
+            }
+        )
+    return column_defs
+
+
+def _row_values_to_record(columns, values, excel_row_num):
+    record = {"_excel_row_num": excel_row_num}
+    for idx, _label in enumerate(columns):
+        value = values[idx] if idx < len(values) else ""
+        record[f"col_{idx}"] = normalize_cell_text(value)
+    return record
+
+
+def _find_xlsx_highlight_row(ws, header_info, highlight_req):
+    if not highlight_req or header_info.get("spec_idx", -1) < 0:
+        return None
+    variants = requirement_lookup_variants(highlight_req)
+    if not variants:
+        return None
+    spec_idx = header_info["spec_idx"]
+    header_row_idx = header_info["header_row_idx"]
+    data_index = 0
+    iter_rows_fn = getattr(ws, "iter_rows", None)
+    if not callable(iter_rows_fn):
+        return None
+    for excel_row_num, row in enumerate(
+        cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True),
+        start=header_row_idx + 1,
+    ):
+        cells = [normalize_cell_text(v) for v in (row or [])]
+        if not any(cells):
+            continue
+        spec_val = cells[spec_idx] if spec_idx < len(cells) else ""
+        if spec_val and any(requirement_id_matches_text(variant, spec_val) for variant in variants):
+            return {"data_index": data_index, "excel_row_num": excel_row_num}
+        data_index += 1
+    return None
+
+
+def _fetch_xlsx_rows_page(xlsx_path, sheet_name, offset=0, limit=200, highlight_req="", cache_key=""):
+    wb = load_workbook(filename=xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
+        header_info = _find_xlsx_sheet_header(ws)
+        if not header_info:
+            return {"columns": [], "column_defs": [], "rows": [], "total": 0, "highlight": None}
+
+        columns = header_info["columns"]
+        header_row_idx = header_info["header_row_idx"]
+        cached = _spreadsheet_sheet_cache.get(cache_key) if cache_key else None
+        highlight = cached.get("highlight") if cached else None
+        if highlight_req and highlight is None:
+            highlight = _find_xlsx_highlight_row(ws, header_info, highlight_req)
+            if cache_key:
+                _spreadsheet_sheet_cache.setdefault(cache_key, {})["highlight"] = highlight
+
+        rows = []
+        data_index = 0
+        target_end = offset + limit
+        iter_rows_fn = getattr(ws, "iter_rows", None)
+        if not callable(iter_rows_fn):
+            return {"columns": columns, "column_defs": _sheet_column_defs(columns), "rows": [], "total": 0, "highlight": highlight}
+
+        for excel_row_num, row in enumerate(
+            cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True),
+            start=header_row_idx + 1,
+        ):
+            cells = [normalize_cell_text(v) for v in (row or [])]
+            if not any(cells):
+                continue
+            if data_index >= offset and len(rows) < limit:
+                rows.append(_row_values_to_record(columns, cells, excel_row_num))
+            data_index += 1
+            if data_index >= target_end and len(rows) >= limit:
+                break
+
+        total = None
+        if cache_key and cache_key in _spreadsheet_sheet_cache:
+            total = _spreadsheet_sheet_cache[cache_key].get("total")
+        if total is None:
+            total = data_index
+            if cache_key:
+                _spreadsheet_sheet_cache.setdefault(cache_key, {})["total"] = total
+
+        return {
+            "columns": columns,
+            "column_defs": _sheet_column_defs(columns),
+            "rows": rows,
+            "total": total,
+            "highlight": highlight,
+        }
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _fetch_csv_rows_page(csv_path, offset=0, limit=200, highlight_req=""):
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    if df.empty:
+        return {"columns": [], "column_defs": [], "rows": [], "total": 0, "highlight": None}
+    df = df.fillna("").astype(str)
+    columns = [str(col) for col in df.columns.tolist()]
+    column_defs = _sheet_column_defs(columns)
+    variants = requirement_lookup_variants(highlight_req) if highlight_req else []
+    highlight = None
+    rows = []
+    data_index = 0
+    for idx, row in df.iterrows():
+        values = [normalize_cell_text(row.get(col, "")) for col in columns]
+        if not any(values):
+            continue
+        if variants and highlight is None:
+            joined = " | ".join(values)
+            if any(requirement_id_matches_text(variant, joined) for variant in variants):
+                highlight = {"data_index": data_index, "excel_row_num": int(idx) + 2}
+        if data_index < offset:
+            data_index += 1
+            continue
+        if len(rows) >= limit:
+            data_index += 1
+            continue
+        rows.append(_row_values_to_record(columns, values, int(idx) + 2))
+        data_index += 1
+    total = data_index if not rows else max(data_index, offset + len(rows))
+    # Re-count non-empty rows for total
+    total = sum(
+        1
+        for _, row in df.iterrows()
+        if any(normalize_cell_text(row.get(col, "")) for col in columns)
+    )
+    return {
+        "columns": columns,
+        "column_defs": column_defs,
+        "rows": rows,
+        "total": total,
+        "highlight": highlight,
+    }
+
+
+def get_spreadsheet_table_sheets(doc):
+    ext = (doc.extension or "").lower()
+    previews = TablePreview.query.filter_by(document_id=doc.id).order_by(TablePreview.id.asc()).all()
+    preview_names = [p.sheet_name for p in previews if p.sheet_name]
+
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return [
+            {"name": name or "Sheet 1", "row_count": None, "is_master": False, "columns": []}
+            for name in preview_names
+        ]
+
+    sheets = []
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+            if ext == "xlsx":
+                wb = load_workbook(filename=full_path, read_only=True, data_only=True)
+                try:
+                    for ws in wb.worksheets:
+                        header_info = _find_xlsx_sheet_header(ws)
+                        if not header_info:
+                            continue
+                        sheets.append(
+                            {
+                                "name": ws.title,
+                                "row_count": _count_xlsx_sheet_data_rows(
+                                    ws, header_info["header_row_idx"]
+                                ),
+                                "is_master": header_info.get("is_master", False),
+                                "columns": header_info.get("columns", []),
+                            }
+                        )
+                finally:
+                    wb.close()
+            elif ext == "csv":
+                df = pd.read_csv(full_path, dtype=str, keep_default_na=False, nrows=0)
+                columns = [str(col) for col in df.columns.tolist()]
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    row_count = max(sum(1 for _ in handle) - 1, 0)
+                sheets.append(
+                    {
+                        "name": "CSV",
+                        "row_count": row_count,
+                        "is_master": False,
+                        "columns": columns,
+                    }
+                )
+    except Exception as exc:
+        print(f"Spreadsheet sheet list error for doc {doc.id}: {exc}")
+
+    if sheets:
+        return sheets
+    return [
+        {"name": name or "Sheet 1", "row_count": None, "is_master": False, "columns": []}
+        for name in preview_names
+    ]
+
+
+def get_spreadsheet_table_page(doc, sheet_name="", offset=0, limit=TABLE_VIEWER_PAGE_SIZE, highlight_req=""):
+    ext = (doc.extension or "").lower()
+    limit = max(1, min(int(limit or TABLE_VIEWER_PAGE_SIZE), TABLE_VIEWER_MAX_PAGE_SIZE))
+    offset = max(0, int(offset or 0))
+
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return {
+            "columns": [],
+            "column_defs": [],
+            "rows": [],
+            "total": 0,
+            "highlight": None,
+            "error": "Source file not found on server. Re-upload and reindex.",
+        }
+
+    try:
+        with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+            if ext == "xlsx":
+                sheets = get_spreadsheet_table_sheets(doc)
+                chosen = sheet_name or (sheets[0]["name"] if sheets else "")
+                cache_key = f"{doc.id}:{chosen}"
+                payload = _fetch_xlsx_rows_page(
+                    full_path,
+                    chosen,
+                    offset=offset,
+                    limit=limit,
+                    highlight_req=highlight_req,
+                    cache_key=cache_key,
+                )
+                payload["sheet_name"] = chosen
+                return payload
+            if ext == "csv":
+                payload = _fetch_csv_rows_page(
+                    full_path, offset=offset, limit=limit, highlight_req=highlight_req
+                )
+                payload["sheet_name"] = "CSV"
+                return payload
+    except Exception as exc:
+        print(f"Spreadsheet page fetch error for doc {doc.id}: {exc}")
+        return {
+            "columns": [],
+            "column_defs": [],
+            "rows": [],
+            "total": 0,
+            "highlight": None,
+            "error": str(exc),
+        }
+
+    return {
+        "columns": [],
+        "column_defs": [],
+        "rows": [],
+        "total": 0,
+        "highlight": None,
+        "error": "Unsupported spreadsheet format.",
+    }
+
+
+def get_spreadsheet_table_meta(doc, sheet_name="", highlight_req=""):
+    sheets = get_spreadsheet_table_sheets(doc)
+    active_sheet = sheet_name or (sheets[0]["name"] if sheets else "")
+    highlight = None
+    cache_key = f"{doc.id}:{active_sheet}"
+
+    if storage.document_exists(doc.stored_filename, DOC_FOLDER) and (doc.extension or "").lower() == "xlsx":
+        try:
+            with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+                wb = load_workbook(filename=full_path, read_only=True, data_only=True)
+                try:
+                    ws = wb[active_sheet] if active_sheet in wb.sheetnames else wb.worksheets[0]
+                    header_info = _find_xlsx_sheet_header(ws)
+                    if header_info:
+                        row_count = _count_xlsx_sheet_data_rows(ws, header_info["header_row_idx"])
+                        _spreadsheet_sheet_cache[cache_key] = {
+                            "total": row_count,
+                            "columns": header_info.get("columns", []),
+                        }
+                        if highlight_req:
+                            highlight = _find_xlsx_highlight_row(ws, header_info, highlight_req)
+                            _spreadsheet_sheet_cache[cache_key]["highlight"] = highlight
+                finally:
+                    wb.close()
+        except Exception as exc:
+            print(f"Spreadsheet meta error for doc {doc.id}: {exc}")
+            return {"sheets": sheets, "active_sheet": active_sheet, "error": str(exc)}
+
+    cached = _spreadsheet_sheet_cache.get(cache_key, {})
+    active_meta = next((s for s in sheets if s.get("name") == active_sheet), None) or {}
+    column_defs = _sheet_column_defs(cached.get("columns") or active_meta.get("columns") or [])
+    return {
+        "sheets": sheets,
+        "active_sheet": active_sheet,
+        "row_count": cached.get("total", active_meta.get("row_count")),
+        "column_defs": column_defs,
+        "highlight": highlight or cached.get("highlight"),
+    }
 
 
 def build_requirement_rows_from_tables(req_id, max_rows=10):
@@ -7774,8 +8623,6 @@ def build_requirement_lookup_result(raw_query, max_blocks=8, max_tables=8):
                     "document_name": doc.original_filename if doc else f"Document {row.document_id}",
                     "sheet_name": row.sheet_name or "-",
                     "table_format": row.table_format or "-",
-                    "html_table": render_table_preview_html(row, "nl"),
-                    "html_table_en": "" if should_skip_table_translation(doc) else render_table_preview_html(row, "en"),
                 }
             )
             if len(table_rows) >= max_tables:
@@ -8637,6 +9484,59 @@ def requirement_detail(block_id):
         block=block_view,
         pdf2image_available=PDF2IMAGE_AVAILABLE
     )
+
+@app.route("/table-viewer/<int:document_id>")
+def table_viewer(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc:
+        abort(404)
+    if doc.extension.lower() not in {"csv", "xlsx"}:
+        abort(404)
+
+    error_msg = ""
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        error_msg = (
+            f"Source file '{doc.original_filename}' was not found on the server. "
+            "Re-upload the spreadsheet in Documents, then click Reindex."
+        )
+
+    return render_template_string(
+        TABLE_VIEWER_TEMPLATE,
+        doc=doc,
+        initial_sheet=request.args.get("sheet", "").strip(),
+        highlight_req=request.args.get("highlight", "").strip(),
+        page_size=TABLE_VIEWER_PAGE_SIZE,
+        error_msg=error_msg,
+    )
+
+
+@app.route("/api/table/<int:document_id>/meta")
+def api_spreadsheet_meta(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc or doc.extension.lower() not in {"csv", "xlsx"}:
+        abort(404)
+    payload = get_spreadsheet_table_meta(
+        doc,
+        sheet_name=request.args.get("sheet", "").strip(),
+        highlight_req=request.args.get("highlight", "").strip(),
+    )
+    return jsonify(payload)
+
+
+@app.route("/api/table/<int:document_id>/rows")
+def api_spreadsheet_rows(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc or doc.extension.lower() not in {"csv", "xlsx"}:
+        abort(404)
+    payload = get_spreadsheet_table_page(
+        doc,
+        sheet_name=request.args.get("sheet", "").strip(),
+        offset=request.args.get("offset", 0, type=int),
+        limit=request.args.get("limit", TABLE_VIEWER_PAGE_SIZE, type=int),
+        highlight_req=request.args.get("highlight", "").strip(),
+    )
+    return jsonify(payload)
+
 
 @app.route("/table/<int:document_id>")
 def table_preview(document_id):
