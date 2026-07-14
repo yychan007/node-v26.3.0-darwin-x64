@@ -178,7 +178,7 @@ REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS = 300
 _requirement_master_scan_cache = {}
 REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS = 8.0
 REQUIREMENT_LOOKUP_MAX_MASTER_DOCS = 1
-TABLE_VIEWER_PAGE_SIZE = 200
+TABLE_VIEWER_PAGE_SIZE = 20
 TABLE_VIEWER_MAX_PAGE_SIZE = 500
 TABLE_MASTER_SHEET_INDEX_CAP = 500
 _spreadsheet_sheet_cache = {}
@@ -6148,6 +6148,11 @@ def build_document_view_context(doc, page=1, highlight_image_index=None):
         "pdf_available": file_available and ext == "pdf",
         "pdf_file_missing": pdf_source_file_missing(doc) if ext == "pdf" else False,
         "pdf_url": url_for("serve_document", document_id=doc.id) if ext == "pdf" and file_available else "",
+        "page_image_url": (
+            url_for("page_image", document_id=doc.id, page=page)
+            if ext == "pdf" and file_available
+            else ""
+        ),
         "download_url": url_for("serve_document", document_id=doc.id) if file_available else "",
         "original_text": original_text,
         "docx_image_indexes": docx_image_indexes,
@@ -6173,6 +6178,15 @@ body { margin:0; }
 .original-pane { flex: 1 1 58%; min-width: 320px; border-right:1px solid #ddd; position:relative; overflow:auto; }
 .translation-pane { flex: 1 1 42%; min-width: 280px; overflow:auto; background:#f8fafc; padding:16px; }
 iframe { width:100%; height:100%; border:none; }
+.pdf-page-image {
+  display:block;
+  width:100%;
+  height:auto;
+  padding:16px;
+  box-sizing:border-box;
+  background:#fff;
+}
+.pdf-view-toggle { margin:0 16px 12px; }
 .file-missing { padding:24px; color:#842029; background:#f8d7da; border:1px solid #f5c2c7; margin:16px; border-radius:8px; line-height:1.6; }
 .original-text-box { margin:16px; padding:16px; background:white; border:1px solid #e2e8f0; border-radius:8px; white-space:pre-wrap; line-height:1.55; }
 .translation-box { background:white; border:1px solid #e2e8f0; border-left:4px solid #28a745; border-radius:8px; padding:14px; line-height:1.55; margin-bottom:14px; }
@@ -6387,6 +6401,9 @@ iframe { width:100%; height:100%; border:none; }
             {% if download_url %}
             <a class="btn btn-gray btn-small" href="{{ download_url }}">Download original</a>
             {% endif %}
+            {% if pdf_url %}
+            <a class="btn btn-gray btn-small" href="{{ pdf_url }}#page={{ page }}" target="_blank" rel="noopener">Open PDF in new tab</a>
+            {% endif %}
             {% if translation_enabled %}
             <button class="btn btn-green btn-small" id="reload-translation">Refresh</button>
             <button class="btn btn-purple btn-small" id="export-translation" disabled>Export this page (.txt)</button>
@@ -6398,7 +6415,21 @@ iframe { width:100%; height:100%; border:none; }
         <div class="original-pane">
             {% if view_mode == 'pdf' %}
                 {% if pdf_available %}
-                <iframe src="{{ pdf_url }}#page={{ page }}"></iframe>
+                {% if request.args.get('view') == 'embed' %}
+                <iframe src="{{ pdf_url }}#page={{ page }}" title="Original PDF page {{ page }}"></iframe>
+                {% else %}
+                <img
+                    class="pdf-page-image"
+                    src="{{ page_image_url }}"
+                    alt="Original PDF page {{ page }}"
+                    onerror="this.style.display='none'; document.getElementById('pdf-image-fallback').style.display='block';"
+                />
+                <div id="pdf-image-fallback" class="file-missing" style="display:none;">
+                    <strong>Could not render this page as an image.</strong><br>
+                    Use <strong>Open PDF in new tab</strong> above, or
+                    <a href="{{ url_for(viewer_route, document_id=document_id, page=page, view='embed') }}">try embedded PDF view</a>.
+                </div>
+                {% endif %}
                 {% elif original_text %}
                 <div style="padding:16px;">
                     <h3 style="margin-top:0;">Original text — {{ page_label }} {{ page }}</h3>
@@ -6610,14 +6641,18 @@ TABLE_VIEWER_TEMPLATE = """
 <meta charset="utf-8">
 <title>Table viewer - {{ doc.original_filename }}</title>
 """ + BASE_CSS + """
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.4/styles/ag-grid.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.4/styles/ag-theme-alpine.css">
 <style>
-#table-viewer-grid { width:100%; height:72vh; min-height:520px; }
+.table-scroll-wrap { width:100%; overflow:auto; border:1px solid #dbe1ea; border-radius:8px; background:#fff; max-height:72vh; min-height:520px; }
+#data-table { width:100%; border-collapse:collapse; font-size:13px; }
+#data-table th, #data-table td { border:1px solid #e2e8f0; padding:8px 10px; vertical-align:top; text-align:left; white-space:pre-wrap; word-break:break-word; }
+#data-table th { position:sticky; top:0; background:#f8fafc; z-index:1; font-weight:600; }
+#data-table tr:nth-child(even) td { background:#fbfdff; }
+#data-table tr.row-highlight td { background:#fff3cd !important; }
 .viewer-toolbar { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin:12px 0; }
 .viewer-toolbar select { min-width:220px; padding:8px; }
 .viewer-status { color:#64748b; font-size:14px; }
-.highlight-note { margin:10px 0; }
+.page-nav { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.page-nav input[type="number"] { width:72px; padding:6px 8px; }
 </style>
 </head>
 <body>
@@ -6633,6 +6668,15 @@ TABLE_VIEWER_TEMPLATE = """
     <div class="viewer-toolbar">
         <label for="sheet-select"><strong>Sheet:</strong></label>
         <select id="sheet-select"></select>
+        <div class="page-nav">
+            <button class="btn btn-gray btn-small" id="prev-page" type="button">Prev</button>
+            <span class="viewer-status" id="page-info">Page 1</span>
+            <button class="btn btn-gray btn-small" id="next-page" type="button">Next</button>
+            <form id="page-jump-form" style="display:flex; gap:6px; align-items:center; margin:0;">
+                <input type="number" id="page-input" min="1" value="1" aria-label="Jump to page">
+                <button class="btn btn-gray btn-small" type="submit">Go</button>
+            </form>
+        </div>
         <span class="viewer-status" id="viewer-status">Loading table...</span>
         {% if highlight_req %}
         <span class="viewer-status">Highlight: <strong>{{ highlight_req }}</strong></span>
@@ -6646,102 +6690,130 @@ TABLE_VIEWER_TEMPLATE = """
     {% if error_msg %}
     <div class="warning">{{ error_msg }}</div>
     {% else %}
-    <div id="table-viewer-grid" class="ag-theme-alpine"></div>
+    <div class="table-scroll-wrap">
+        <table id="data-table">
+            <thead id="table-head"></thead>
+            <tbody id="table-body"></tbody>
+        </table>
+    </div>
     {% endif %}
 </div>
 
 {% if not error_msg %}
-<script src="https://cdn.jsdelivr.net/npm/ag-grid-community@31.3.4/dist/ag-grid-community.min.js"></script>
 <script>
 (function() {
     const documentId = {{ doc.id }};
     const initialSheet = {{ initial_sheet|tojson }};
     const highlightReq = {{ highlight_req|tojson }};
     const pageSize = {{ page_size }};
-    const gridHost = document.getElementById("table-viewer-grid");
+    const tableHead = document.getElementById("table-head");
+    const tableBody = document.getElementById("table-body");
     const sheetSelect = document.getElementById("sheet-select");
     const statusEl = document.getElementById("viewer-status");
-    let gridApi = null;
+    const pageInfoEl = document.getElementById("page-info");
+    const prevBtn = document.getElementById("prev-page");
+    const nextBtn = document.getElementById("next-page");
+    const pageInput = document.getElementById("page-input");
+    const pageJumpForm = document.getElementById("page-jump-form");
+
     let currentSheet = initialSheet || "";
     let highlightInfo = null;
+    let columnDefs = [];
+    let totalRows = 0;
+    let currentPage = 0;
+    let loading = false;
 
     function setStatus(text) {
         statusEl.textContent = text;
     }
 
-    function buildDatasource(sheetName) {
-        return {
-            rowCount: undefined,
-            getRows: function(params) {
-                const limit = params.endRow - params.startRow;
-                const url = `/api/table/${documentId}/rows?sheet=${encodeURIComponent(sheetName)}&offset=${params.startRow}&limit=${limit}&highlight=${encodeURIComponent(highlightReq || "")}`;
-                fetch(url)
-                    .then(function(resp) { return resp.json(); })
-                    .then(function(data) {
-                        if (data.error) {
-                            params.failCallback();
-                            setStatus(data.error);
-                            return;
-                        }
-                        highlightInfo = data.highlight || highlightInfo;
-                        const total = typeof data.total === "number" ? data.total : undefined;
-                        params.successCallback(data.rows || [], total);
-                        if (typeof total === "number") {
-                            setStatus(`${total.toLocaleString()} rows · virtual scrolling enabled`);
-                        }
-                        if (highlightInfo && typeof highlightInfo.data_index === "number") {
-                            gridApi.ensureIndexVisible(highlightInfo.data_index, "middle");
-                        }
-                    })
-                    .catch(function(err) {
-                        console.error(err);
-                        params.failCallback();
-                        setStatus("Could not load table rows.");
-                    });
-            }
-        };
+    function pageCount() {
+        return Math.max(1, Math.ceil((totalRows || 0) / pageSize));
     }
 
-    function initGrid(columnDefs, sheetName) {
-        if (gridApi) {
-            gridApi.destroy();
-            gridApi = null;
+    function updatePageControls() {
+        const pages = pageCount();
+        currentPage = Math.max(0, Math.min(currentPage, pages - 1));
+        pageInfoEl.textContent = `Page ${currentPage + 1} / ${pages}`;
+        pageInput.value = String(currentPage + 1);
+        pageInput.max = String(pages);
+        prevBtn.disabled = loading || currentPage <= 0;
+        nextBtn.disabled = loading || currentPage >= pages - 1;
+    }
+
+    function renderTable(rows) {
+        if (!columnDefs.length) {
+            tableHead.innerHTML = "";
+            tableBody.innerHTML = "";
+            return;
         }
-        const gridOptions = {
-            columnDefs: columnDefs || [],
-            defaultColDef: {
-                resizable: true,
-                sortable: false,
-                filter: false,
-                minWidth: 140,
-            },
-            rowModelType: "infinite",
-            cacheBlockSize: pageSize,
-            maxBlocksInCache: 4,
-            infiniteInitialRowCount: pageSize,
-            pagination: false,
-            animateRows: false,
-            rowSelection: "single",
-            getRowId: function(params) {
-                return String(params.data._excel_row_num || params.data.__rowId || Math.random());
-            },
-            getRowStyle: function(params) {
-                if (highlightInfo && params.data && highlightInfo.excel_row_num && params.data._excel_row_num === highlightInfo.excel_row_num) {
-                    return { background: "#fff3cd" };
-                }
-                return null;
-            },
-            onGridReady: function(params) {
-                gridApi = params.api;
-                params.api.setGridOption("datasource", buildDatasource(sheetName));
-            },
-        };
-        agGrid.createGrid(gridHost, gridOptions);
+        const headRow = document.createElement("tr");
+        columnDefs.forEach(function(col) {
+            const th = document.createElement("th");
+            th.textContent = col.headerName || col.field || "";
+            headRow.appendChild(th);
+        });
+        tableHead.innerHTML = "";
+        tableHead.appendChild(headRow);
+
+        tableBody.innerHTML = "";
+        rows.forEach(function(row) {
+            const tr = document.createElement("tr");
+            if (highlightInfo && row && highlightInfo.excel_row_num && row._excel_row_num === highlightInfo.excel_row_num) {
+                tr.className = "row-highlight";
+            }
+            columnDefs.forEach(function(col) {
+                const td = document.createElement("td");
+                td.textContent = row[col.field] || "";
+                tr.appendChild(td);
+            });
+            tableBody.appendChild(tr);
+        });
     }
 
-    function loadSheet(sheetName) {
+    function loadPage(page) {
+        if (loading || !currentSheet) return;
+        loading = true;
+        currentPage = Math.max(0, page);
+        updatePageControls();
+        const offset = currentPage * pageSize;
+        setStatus(`Loading page ${currentPage + 1}...`);
+        fetch(`/api/table/${documentId}/rows?sheet=${encodeURIComponent(currentSheet)}&offset=${offset}&limit=${pageSize}&highlight=${encodeURIComponent(highlightReq || "")}`)
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    setStatus(data.error);
+                    renderTable([]);
+                    return;
+                }
+                if (data.column_defs && data.column_defs.length) {
+                    columnDefs = data.column_defs;
+                }
+                if (typeof data.total === "number") {
+                    totalRows = data.total;
+                }
+                if (data.highlight) {
+                    highlightInfo = data.highlight;
+                }
+                renderTable(data.rows || []);
+                setStatus(`${(totalRows || 0).toLocaleString()} rows · ${pageSize} rows per page`);
+                updatePageControls();
+            })
+            .catch(function(err) {
+                console.error(err);
+                setStatus("Could not load table rows.");
+            })
+            .finally(function() {
+                loading = false;
+                updatePageControls();
+            });
+    }
+
+    function loadSheetMeta(sheetName) {
         currentSheet = sheetName;
-        setStatus("Loading columns...");
+        currentPage = 0;
+        highlightInfo = null;
+        setStatus("Loading sheet info...");
         fetch(`/api/table/${documentId}/meta?sheet=${encodeURIComponent(sheetName)}&highlight=${encodeURIComponent(highlightReq || "")}`)
             .then(function(resp) { return resp.json(); })
             .then(function(data) {
@@ -6749,11 +6821,13 @@ TABLE_VIEWER_TEMPLATE = """
                     setStatus(data.error);
                     return;
                 }
+                columnDefs = data.column_defs || [];
+                totalRows = typeof data.row_count === "number" ? data.row_count : 0;
                 highlightInfo = data.highlight || null;
-                initGrid(data.column_defs || [], sheetName);
-                if (typeof data.row_count === "number") {
-                    setStatus(`${data.row_count.toLocaleString()} rows · sheet ${sheetName}`);
+                if (highlightInfo && typeof highlightInfo.data_index === "number") {
+                    currentPage = Math.floor(highlightInfo.data_index / pageSize);
                 }
+                loadPage(currentPage);
             })
             .catch(function(err) {
                 console.error(err);
@@ -6776,7 +6850,7 @@ TABLE_VIEWER_TEMPLATE = """
                 sheetSelect.appendChild(option);
             });
             const chosen = initialSheet || data.active_sheet || (sheets[0] && sheets[0].name) || "";
-            loadSheet(chosen);
+            loadSheetMeta(chosen);
         })
         .catch(function(err) {
             console.error(err);
@@ -6784,7 +6858,19 @@ TABLE_VIEWER_TEMPLATE = """
         });
 
     sheetSelect.addEventListener("change", function() {
-        loadSheet(sheetSelect.value);
+        loadSheetMeta(sheetSelect.value);
+    });
+    prevBtn.addEventListener("click", function() {
+        if (currentPage > 0) loadPage(currentPage - 1);
+    });
+    nextBtn.addEventListener("click", function() {
+        if (currentPage < pageCount() - 1) loadPage(currentPage + 1);
+    });
+    pageJumpForm.addEventListener("submit", function(event) {
+        event.preventDefault();
+        const target = parseInt(pageInput.value, 10);
+        if (!Number.isFinite(target)) return;
+        loadPage(target - 1);
     });
 })();
 </script>
@@ -6811,7 +6897,7 @@ TABLE_TEMPLATE = """
     </div>
     <div style="margin:12px 0; display:flex; gap:8px; flex-wrap:wrap;">
         {% if tables %}
-        <a class="btn btn-green" href="{{ url_for('table_viewer', document_id=doc.id) }}">Open virtual table viewer</a>
+        <a class="btn btn-green" href="{{ url_for('table_viewer', document_id=doc.id) }}">Open table viewer</a>
         {% endif %}
         {% if current_user.is_authenticated and current_user.is_admin %}
         <a class="btn btn-green" href="{{ url_for('refresh_table_preview', document_id=doc.id) }}">Refresh table &amp; translate</a>
@@ -8080,14 +8166,39 @@ def _find_xlsx_sheet_header(ws, max_row=60):
 
 
 def _count_xlsx_sheet_data_rows(ws, header_row_idx):
-    count = 0
+    summary = _scan_xlsx_sheet_summary(ws, {"header_row_idx": header_row_idx, "spec_idx": -1})
+    return summary["total"]
+
+
+def _scan_xlsx_sheet_summary(ws, header_info, highlight_req=""):
+    """Count data rows and optionally locate a highlighted requirement in one pass."""
+    header_row_idx = header_info["header_row_idx"]
+    spec_idx = header_info.get("spec_idx", -1)
+    variants = requirement_lookup_variants(highlight_req) if highlight_req and spec_idx >= 0 else []
+    highlight = None
+    data_index = 0
     iter_rows_fn = getattr(ws, "iter_rows", None)
     if not callable(iter_rows_fn):
-        return 0
-    for row in cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True):
-        if any(normalize_cell_text(v) for v in (row or [])):
-            count += 1
-    return count
+        return {"total": 0, "highlight": None}
+    for excel_row_num, row in enumerate(
+        cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True),
+        start=header_row_idx + 1,
+    ):
+        cells = [normalize_cell_text(v) for v in (row or [])]
+        if not any(cells):
+            continue
+        if variants and highlight is None:
+            spec_val = cells[spec_idx] if spec_idx < len(cells) else ""
+            if spec_val and any(requirement_id_matches_text(variant, spec_val) for variant in variants):
+                highlight = {"data_index": data_index, "excel_row_num": excel_row_num}
+        data_index += 1
+    return {"total": data_index, "highlight": highlight}
+
+
+def _find_xlsx_highlight_row(ws, header_info, highlight_req):
+    if not highlight_req or header_info.get("spec_idx", -1) < 0:
+        return None
+    return _scan_xlsx_sheet_summary(ws, header_info, highlight_req).get("highlight")
 
 
 def _sheet_column_defs(columns):
@@ -8109,32 +8220,6 @@ def _row_values_to_record(columns, values, excel_row_num):
         value = values[idx] if idx < len(values) else ""
         record[f"col_{idx}"] = normalize_cell_text(value)
     return record
-
-
-def _find_xlsx_highlight_row(ws, header_info, highlight_req):
-    if not highlight_req or header_info.get("spec_idx", -1) < 0:
-        return None
-    variants = requirement_lookup_variants(highlight_req)
-    if not variants:
-        return None
-    spec_idx = header_info["spec_idx"]
-    header_row_idx = header_info["header_row_idx"]
-    data_index = 0
-    iter_rows_fn = getattr(ws, "iter_rows", None)
-    if not callable(iter_rows_fn):
-        return None
-    for excel_row_num, row in enumerate(
-        cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True),
-        start=header_row_idx + 1,
-    ):
-        cells = [normalize_cell_text(v) for v in (row or [])]
-        if not any(cells):
-            continue
-        spec_val = cells[spec_idx] if spec_idx < len(cells) else ""
-        if spec_val and any(requirement_id_matches_text(variant, spec_val) for variant in variants):
-            return {"data_index": data_index, "excel_row_num": excel_row_num}
-        data_index += 1
-    return None
 
 
 def _fetch_xlsx_rows_page(xlsx_path, sheet_name, offset=0, limit=200, highlight_req="", cache_key=""):
@@ -8368,14 +8453,16 @@ def get_spreadsheet_table_meta(doc, sheet_name="", highlight_req=""):
                     ws = wb[active_sheet] if active_sheet in wb.sheetnames else wb.worksheets[0]
                     header_info = _find_xlsx_sheet_header(ws)
                     if header_info:
-                        row_count = _count_xlsx_sheet_data_rows(ws, header_info["header_row_idx"])
+                        summary = _scan_xlsx_sheet_summary(
+                            ws, header_info, highlight_req=highlight_req
+                        )
+                        row_count = summary["total"]
+                        highlight = summary.get("highlight")
                         _spreadsheet_sheet_cache[cache_key] = {
                             "total": row_count,
                             "columns": header_info.get("columns", []),
+                            "highlight": highlight,
                         }
-                        if highlight_req:
-                            highlight = _find_xlsx_highlight_row(ws, header_info, highlight_req)
-                            _spreadsheet_sheet_cache[cache_key]["highlight"] = highlight
                 finally:
                     wb.close()
         except Exception as exc:
