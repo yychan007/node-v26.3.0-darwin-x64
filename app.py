@@ -178,7 +178,7 @@ REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS = 300
 _requirement_master_scan_cache = {}
 REQUIREMENT_LOOKUP_MAX_SCAN_SECONDS = 8.0
 REQUIREMENT_LOOKUP_MAX_MASTER_DOCS = 1
-TABLE_VIEWER_PAGE_SIZE = 20
+TABLE_VIEWER_PAGE_SIZE = 5
 TABLE_VIEWER_MAX_PAGE_SIZE = 500
 FIELD_EXPLANATION_MAX_TERMS = 8
 TABLE_MASTER_SHEET_INDEX_CAP = 500
@@ -1409,15 +1409,6 @@ def build_layout_translation_payload(doc, page_num, target_lang="en"):
 def _attach_field_explanations_to_page_response(
     response, source="", translated="", translation_html=""
 ):
-    explanation_text = " ".join(
-        part
-        for part in [source, translated, strip_html_legacy(translation_html)]
-        if part
-    ).strip()
-    if explanation_text:
-        response["field_explanations"] = serialize_field_explanations(
-            build_field_explanations_for_text(explanation_text)
-        )
     return response
 
 
@@ -4093,6 +4084,31 @@ def explain_single_field_term(term, context=""):
     return result
 
 
+def build_explanation_context_text(*texts):
+    return " ".join(
+        part.strip() for part in texts if part and str(part).strip()
+    )[:2000]
+
+
+def build_field_explanations_fast(*texts, max_terms=FIELD_EXPLANATION_MAX_TERMS):
+    terms = extract_field_acronyms(*texts, max_terms=max_terms)
+    if not terms:
+        return []
+    results = []
+    for term in terms:
+        cached = get_cached_field_explanation(term)
+        if cached:
+            results.append(cached)
+            continue
+        dictionary_hit = lookup_dictionary_term_explanation(term)
+        if dictionary_hit:
+            store_cached_field_explanation(
+                term, dictionary_hit["explanation"], source="dictionary"
+            )
+            results.append(dictionary_hit)
+    return results
+
+
 def build_field_explanations_for_text(*texts, max_terms=FIELD_EXPLANATION_MAX_TERMS):
     terms = extract_field_acronyms(*texts, max_terms=max_terms)
     if not terms:
@@ -4866,6 +4882,7 @@ button { background:#0069d9; }
 }
 .field-explanation-item:first-of-type { margin-top:0; }
 .field-explanation-source { color:#64748b; font-size:12px; }
+.field-explanations-host:empty { display:none; }
 .warning { background:#fdecea; border-left:4px solid #dc3545; }
 .info { background:#eef6ff; border-left:4px solid #339af0; }
 .result-item { margin-top:16px; padding:16px; border-left:4px solid #0069d9; background:#fafafa; border-radius:6px; }
@@ -5319,8 +5336,8 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
             </td>
         </tr>
     </table>
-    {% if item.field_explanations %}
-    {{ item.field_explanations_html|safe }}
+    {% if item.explanation_context %}
+    <div class="field-explanations-host" data-context="{{ item.explanation_context|e }}"></div>
     {% endif %}
 </div>
 {% endmacro %}
@@ -5424,6 +5441,80 @@ USERS_NAV_ACTIONS = """
     </div>
 """
 
+FIELD_EXPLANATIONS_SCRIPT = """
+<script>
+(function() {
+    function escapeHtml(value) {
+        return String(value || "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+    }
+
+    function renderFieldExplanationsHtml(explanations) {
+        if (!explanations || !explanations.length) {
+            return "";
+        }
+        let html = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div>';
+        explanations.forEach(function(item) {
+            const term = escapeHtml(item.term || "");
+            const explanation = escapeHtml(item.explanation || "");
+            const source = item.source === "dictionary" ? "Definitions" : "AI";
+            const dictUrl = "/dictionary?q=" + encodeURIComponent(item.dictionary_term || item.term || "");
+            html += '<div class="field-explanation-item"><strong><a href="' + dictUrl + '" target="_blank" rel="noopener">' + term + '</a></strong> — ' + explanation + ' <span class="field-explanation-source">(' + source + ')</span></div>';
+        });
+        html += "</div>";
+        return html;
+    }
+
+    async function loadFieldExplanationsForHost(host) {
+        if (!host || host.dataset.loaded === "1" || host.dataset.loaded === "loading") {
+            return;
+        }
+        const context = host.getAttribute("data-context") || "";
+        if (!context.trim()) {
+            host.innerHTML = "";
+            return;
+        }
+        host.dataset.loaded = "loading";
+        host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">Loading field explanations...</div></div>';
+        try {
+            const resp = await fetch("/api/field-explanations", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({text: context})
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                throw new Error(data.error || "Request failed");
+            }
+            if (data.html) {
+                host.innerHTML = data.html;
+            } else if (data.explanations && data.explanations.length) {
+                host.innerHTML = renderFieldExplanationsHtml(data.explanations);
+            } else if (data.message) {
+                host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">' + escapeHtml(data.message) + '</div></div>';
+            } else {
+                host.innerHTML = "";
+            }
+        } catch (err) {
+            host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">Could not load field explanations.</div></div>';
+        }
+        host.dataset.loaded = "1";
+    }
+
+    window.loadFieldExplanationsForHost = loadFieldExplanationsForHost;
+    window.initFieldExplanationHosts = function(root) {
+        (root || document).querySelectorAll(".field-explanations-host").forEach(loadFieldExplanationsForHost);
+    };
+    document.addEventListener("DOMContentLoaded", function() {
+        window.initFieldExplanationHosts();
+    });
+})();
+</script>
+"""
+
 HOME_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -5455,6 +5546,7 @@ HOME_TEMPLATE = """
         {% if search_mode == 'requirement' %}
         This page is dedicated to requirement ID lookup. Example IDs:
         <strong>AM-Req-1144.04</strong>, <strong>AM-Req-35288</strong>, <strong>AM-Req-36605</strong>.
+        Acronyms in requirement text (e.g. <strong>CDG</strong>, <strong>MMF</strong>) show <strong>Field explanations</strong> below each result.
         {% else %}
         Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>, or just <strong>5457</strong> for <strong>AM-Req-5457</strong>.
         For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Definitions</strong></a>
@@ -5909,6 +6001,7 @@ HOME_TEMPLATE = """
     {% endif %}
 </div>
 <button id="back-to-top" class="btn btn-gray back-to-top" onclick="scrollToTopSmooth()">Back to top</button>
+""" + FIELD_EXPLANATIONS_SCRIPT + """
 </body>
 </html>
 """
@@ -6802,6 +6895,7 @@ iframe { width:100%; height:100%; border:none; }
     const fileBase = {{ filename|tojson }};
     const statusEl = document.getElementById("translation-status");
     const translatedEl = document.getElementById("translated-text");
+    const fieldExplanationsEl = document.getElementById("field-explanations");
     const exportBtn = document.getElementById("export-translation");
     let currentTranslation = "";
 
@@ -6850,6 +6944,19 @@ iframe { width:100%; height:100%; border:none; }
                 statusEl.textContent = data.error;
             }
             exportBtn.disabled = !currentTranslation.trim();
+            if (fieldExplanationsEl) {
+                const context = [data.source, data.translation].filter(Boolean).join(" ").trim();
+                if (context) {
+                    fieldExplanationsEl.className = "field-explanations-host";
+                    fieldExplanationsEl.setAttribute("data-context", context);
+                    fieldExplanationsEl.removeAttribute("data-loaded");
+                    if (window.loadFieldExplanationsForHost) {
+                        window.loadFieldExplanationsForHost(fieldExplanationsEl);
+                    }
+                } else {
+                    fieldExplanationsEl.innerHTML = "";
+                }
+            }
         } catch (err) {
             statusEl.textContent = "Translation error: " + err.message;
             translatedEl.textContent = "";
@@ -6878,6 +6985,7 @@ iframe { width:100%; height:100%; border:none; }
     exportBtn.addEventListener("click", exportTranslation);
     loadCurrentTranslation();
     </script>
+    """ + FIELD_EXPLANATIONS_SCRIPT + """
     {% endif %}
 </body>
 </html>
@@ -8143,6 +8251,12 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
         or fields.get("content_nl")
         or fields.get("applicable_nl")
     )
+    result_dict["explanation_context"] = build_explanation_context_text(
+        fields.get("content_en"),
+        fields.get("content_nl"),
+        fields.get("applicable_en"),
+        fields.get("applicable_nl"),
+    )
     return result_dict
 
 
@@ -8263,12 +8377,6 @@ def _build_requirement_browser_content_row(block):
         summary_nl=(block.summary or "").strip(),
         definition_nl=(block.definition or "").strip(),
     )
-    field_explanations = build_field_explanations_for_text(
-        fields.get("content_en"),
-        fields.get("content_nl"),
-        fields.get("applicable_en"),
-        fields.get("applicable_nl"),
-    )
 
     return {
         "block_id": block.id,
@@ -8281,8 +8389,12 @@ def _build_requirement_browser_content_row(block):
         "snippet": compact_display_text(block.full_text or "")[:900].rstrip()
         + ("..." if len(compact_display_text(block.full_text or "")) > 900 else ""),
         **fields,
-        "field_explanations": field_explanations,
-        "field_explanations_html": format_field_explanations_html(field_explanations),
+        "explanation_context": build_explanation_context_text(
+            fields.get("content_en"),
+            fields.get("content_nl"),
+            fields.get("applicable_en"),
+            fields.get("applicable_nl"),
+        ),
         "is_pdf": ext == "pdf",
         "is_docx": ext == "docx",
         "is_txt": ext == "txt",
@@ -8304,13 +8416,6 @@ def _build_requirement_browser_content_from_document(doc, requirement_id):
     if not any(fields.values()):
         return None
 
-    field_explanations = build_field_explanations_for_text(
-        fields.get("content_en"),
-        fields.get("content_nl"),
-        fields.get("applicable_en"),
-        fields.get("applicable_nl"),
-    )
-
     return {
         "block_id": None,
         "document_id": doc.id,
@@ -8321,8 +8426,12 @@ def _build_requirement_browser_content_from_document(doc, requirement_id):
         "page": 1,
         "snippet": "",
         **fields,
-        "field_explanations": field_explanations,
-        "field_explanations_html": format_field_explanations_html(field_explanations),
+        "explanation_context": build_explanation_context_text(
+            fields.get("content_en"),
+            fields.get("content_nl"),
+            fields.get("applicable_en"),
+            fields.get("applicable_nl"),
+        ),
         "is_pdf": ext == "pdf",
         "is_docx": ext == "docx",
         "is_txt": ext == "txt",
@@ -9413,6 +9522,58 @@ def api_translate_text():
             "translation": translated,
             "lang": "en",
             "provider": get_translation_provider(),
+        }
+    )
+
+
+@app.route("/api/field-explanations", methods=["POST"])
+def api_field_explanations():
+    payload = request.get_json(silent=True) or {}
+    texts = payload.get("texts") or []
+    if isinstance(texts, str):
+        texts = [texts]
+    text = (payload.get("text") or "").strip()
+    if text:
+        texts.append(text)
+    combined = build_explanation_context_text(*texts)
+    if not combined:
+        return jsonify(
+            {
+                "explanations": [],
+                "enabled": field_explanations_enabled(),
+                "html": "",
+            }
+        )
+
+    max_terms = min(
+        int(payload.get("max_terms") or FIELD_EXPLANATION_MAX_TERMS),
+        12,
+    )
+    explanations = build_field_explanations_for_text(combined, max_terms=max_terms)
+    serialized = serialize_field_explanations(explanations)
+    terms = extract_field_acronyms(combined, max_terms=max_terms)
+    message = ""
+    if terms and not explanations:
+        if field_explanations_enabled():
+            message = (
+                "No definitions found for: "
+                + ", ".join(terms)
+                + ". Upload acronym definitions or wait for AI cache to build."
+            )
+        else:
+            message = (
+                "No definitions found for: "
+                + ", ".join(terms)
+                + ". Upload definitions in Definitions, or set OPENAI_API_KEY / "
+                "ANTHROPIC_API_KEY with ENABLE_FIELD_EXPLANATIONS=true."
+            )
+    return jsonify(
+        {
+            "explanations": serialized,
+            "enabled": field_explanations_enabled(),
+            "html": format_field_explanations_html(explanations),
+            "terms": terms,
+            "message": message,
         }
     )
 
