@@ -28,6 +28,7 @@ For production, also set:
     APP_SECRET_KEY=<strong-random-secret>
 """
 
+import gzip
 import os
 import re
 import io
@@ -167,11 +168,12 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(DEFAULT_DATA_DIR))).expanduser()
 DOC_FOLDER = DATA_DIR / "documents"
 DICT_FOLDER = DATA_DIR / "dictionaries"
 PREVIEW_FOLDER = DATA_DIR / "previews"
+TABLE_CACHE_FOLDER = DATA_DIR / "table_cache"
 DATABASE_PATH = Path(
     os.environ.get("DATABASE_PATH", str(DATA_DIR / "search_portal.db"))
 ).expanduser()
 
-for path in (DATA_DIR, DOC_FOLDER, DICT_FOLDER, PREVIEW_FOLDER, DATABASE_PATH.parent):
+for path in (DATA_DIR, DOC_FOLDER, DICT_FOLDER, PREVIEW_FOLDER, TABLE_CACHE_FOLDER, DATABASE_PATH.parent):
     path.mkdir(parents=True, exist_ok=True)
 
 REQUIREMENT_MASTER_SCAN_CACHE_TTL_SECONDS = 300
@@ -576,6 +578,24 @@ class FieldExplanationCache(db.Model):
     explanation = db.Column(db.Text, default="")
     source = db.Column(db.String(16), default="")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class SpreadsheetSheetIndex(db.Model):
+    __tablename__ = "spreadsheet_sheet_indexes"
+    __table_args__ = (
+        db.UniqueConstraint("document_id", "sheet_name", name="uq_spreadsheet_sheet_index"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    document_id = db.Column(
+        db.Integer, db.ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sheet_name = db.Column(db.String(255), nullable=False, default="")
+    row_count = db.Column(db.Integer, default=0)
+    columns_json = db.Column(db.Text, default="")
+    spec_index_json = db.Column(db.Text, default="")
+    source_mtime = db.Column(db.Float, default=0.0)
+    built_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 class DocumentPageTranslation(db.Model):
@@ -3205,6 +3225,7 @@ def regenerate_table_previews(doc_record):
 def remove_existing_blocks(doc_id):
     RequirementBlock.query.filter_by(document_id=doc_id).delete()
     TablePreview.query.filter_by(document_id=doc_id).delete()
+    remove_spreadsheet_caches_for_document(doc_id)
     db.session.commit()
 
 def index_document_record(doc_record):
@@ -3292,6 +3313,11 @@ def _index_document_record_impl(doc_record):
 
     save_table_previews(doc_record.id, tables)
     db.session.commit()
+    if is_spreadsheet_document(doc_record):
+        try:
+            build_spreadsheet_caches_for_document(doc_record)
+        except Exception as exc:
+            print(f"Spreadsheet cache build after reindex failed for doc {doc_record.id}: {exc}")
     dedupe_requirement_blocks_by_id()
 
 def dedupe_lookup(file_hash):
@@ -3979,7 +4005,12 @@ def _field_explanation_cache_key(term):
 
 
 def get_cached_field_explanation(term):
-    row = FieldExplanationCache.query.get(_field_explanation_cache_key(term))
+    try:
+        row = FieldExplanationCache.query.get(_field_explanation_cache_key(term))
+    except Exception as exc:
+        print(f"Field explanation cache read error ({term}): {exc}")
+        db.session.rollback()
+        return None
     if not row or not (row.explanation or "").strip():
         return None
     return {
@@ -3995,7 +4026,12 @@ def store_cached_field_explanation(term, explanation, source):
     if not term or not explanation:
         return
     term_key = _field_explanation_cache_key(term)
-    row = FieldExplanationCache.query.get(term_key)
+    try:
+        row = FieldExplanationCache.query.get(term_key)
+    except Exception as exc:
+        print(f"Field explanation cache lookup error ({term}): {exc}")
+        db.session.rollback()
+        row = None
     if row:
         return
     cache_cls = cast(Any, FieldExplanationCache)
@@ -5485,9 +5521,19 @@ FIELD_EXPLANATIONS_SCRIPT = """
                 headers: {"Content-Type": "application/json"},
                 body: JSON.stringify({text: context})
             });
-            const data = await resp.json();
+            const raw = await resp.text();
+            let data = {};
+            try {
+                data = raw ? JSON.parse(raw) : {};
+            } catch (parseErr) {
+                throw new Error(
+                    raw.trim().startsWith("<")
+                        ? "Server returned HTML instead of JSON. Redeploy the latest app version."
+                        : "Invalid server response."
+                );
+            }
             if (!resp.ok) {
-                throw new Error(data.error || "Request failed");
+                throw new Error(data.error || data.message || "Request failed");
             }
             if (data.html) {
                 host.innerHTML = data.html;
@@ -5499,7 +5545,7 @@ FIELD_EXPLANATIONS_SCRIPT = """
                 host.innerHTML = "";
             }
         } catch (err) {
-            host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">Could not load field explanations.</div></div>';
+            host.innerHTML = '<div class="field-explanations-panel"><div class="field-explanations-title">Field explanations</div><div class="viewer-status">' + escapeHtml(err.message || "Could not load field explanations.") + '</div></div>';
         }
         host.dataset.loaded = "1";
     }
@@ -7179,6 +7225,39 @@ TABLE_VIEWER_TEMPLATE = """
         });
     }
 
+    function applyBootstrapData(data) {
+        if (data.error) {
+            setStatus(data.error);
+            renderTable([]);
+            return;
+        }
+        columnDefs = data.column_defs || [];
+        totalRows = typeof data.total === "number" ? data.total : (data.row_count || 0);
+        highlightInfo = data.highlight || null;
+        if (typeof data.offset === "number" && data.offset >= 0) {
+            currentPage = Math.floor(data.offset / pageSize);
+        } else if (highlightInfo && typeof highlightInfo.data_index === "number") {
+            currentPage = Math.floor(highlightInfo.data_index / pageSize);
+        }
+        renderTable(data.rows || []);
+        const cacheLabel = data.cache_ready ? "cached" : "loaded";
+        setStatus(`${(totalRows || 0).toLocaleString()} rows · ${pageSize} per page · ${cacheLabel}`);
+        updatePageControls();
+    }
+
+    function populateSheetSelect(sheets, activeSheet) {
+        sheetSelect.innerHTML = "";
+        sheets.forEach(function(sheet) {
+            const option = document.createElement("option");
+            option.value = sheet.name;
+            option.textContent = `${sheet.name}${sheet.row_count ? " (" + sheet.row_count.toLocaleString() + " rows)" : ""}`;
+            if (sheet.name === activeSheet) {
+                option.selected = true;
+            }
+            sheetSelect.appendChild(option);
+        });
+    }
+
     function loadPage(page) {
         if (loading || !currentSheet) return;
         loading = true;
@@ -7217,56 +7296,39 @@ TABLE_VIEWER_TEMPLATE = """
             });
     }
 
-    function loadSheetMeta(sheetName) {
-        currentSheet = sheetName;
+    function loadSheetBootstrap(sheetName) {
+        currentSheet = sheetName || "";
         currentPage = 0;
         highlightInfo = null;
-        setStatus("Loading sheet info...");
-        fetch(`/api/table/${documentId}/meta?sheet=${encodeURIComponent(sheetName)}&highlight=${encodeURIComponent(highlightReq || "")}`)
+        loading = true;
+        updatePageControls();
+        setStatus("Loading table… first open can take up to a minute, then pages are instant.");
+        const sheetQuery = sheetName ? `sheet=${encodeURIComponent(sheetName)}&` : "";
+        fetch(`/api/table/${documentId}/bootstrap?${sheetQuery}limit=${pageSize}&highlight=${encodeURIComponent(highlightReq || "")}`)
             .then(function(resp) { return resp.json(); })
             .then(function(data) {
-                if (data.error) {
-                    setStatus(data.error);
-                    return;
+                const sheets = data.sheets || [];
+                const activeSheet = data.active_sheet || sheetName || (sheets[0] && sheets[0].name) || "";
+                currentSheet = activeSheet;
+                if (sheets.length) {
+                    populateSheetSelect(sheets, activeSheet);
                 }
-                columnDefs = data.column_defs || [];
-                totalRows = typeof data.row_count === "number" ? data.row_count : 0;
-                highlightInfo = data.highlight || null;
-                if (highlightInfo && typeof highlightInfo.data_index === "number") {
-                    currentPage = Math.floor(highlightInfo.data_index / pageSize);
-                }
-                loadPage(currentPage);
+                applyBootstrapData(data);
             })
             .catch(function(err) {
                 console.error(err);
-                setStatus("Could not load sheet metadata.");
+                setStatus("Could not load spreadsheet.");
+            })
+            .finally(function() {
+                loading = false;
+                updatePageControls();
             });
     }
 
-    fetch(`/api/table/${documentId}/meta?highlight=${encodeURIComponent(highlightReq || "")}`)
-        .then(function(resp) { return resp.json(); })
-        .then(function(data) {
-            const sheets = data.sheets || [];
-            sheetSelect.innerHTML = "";
-            sheets.forEach(function(sheet) {
-                const option = document.createElement("option");
-                option.value = sheet.name;
-                option.textContent = `${sheet.name}${sheet.row_count ? " (" + sheet.row_count.toLocaleString() + " rows)" : ""}`;
-                if (sheet.name === (initialSheet || data.active_sheet)) {
-                    option.selected = true;
-                }
-                sheetSelect.appendChild(option);
-            });
-            const chosen = initialSheet || data.active_sheet || (sheets[0] && sheets[0].name) || "";
-            loadSheetMeta(chosen);
-        })
-        .catch(function(err) {
-            console.error(err);
-            setStatus("Could not load spreadsheet metadata.");
-        });
+    loadSheetBootstrap(initialSheet || "");
 
     sheetSelect.addEventListener("change", function() {
-        loadSheetMeta(sheetSelect.value);
+        loadSheetBootstrap(sheetSelect.value);
     });
     prevBtn.addEventListener("click", function() {
         if (currentPage > 0) loadPage(currentPage - 1);
@@ -8556,6 +8618,243 @@ def _scan_requirement_master_xlsx_rows(xlsx_path, variants, max_collect=200):
     return matched, sheets_scanned
 
 
+def _spreadsheet_memory_cache_key(doc_id, sheet_name):
+    return f"{doc_id}:{sheet_name or 'sheet'}"
+
+
+def _spreadsheet_cache_file_path(doc_id, sheet_name):
+    safe_sheet = re.sub(r"[^\w\-.]+", "_", sheet_name or "sheet")[:80]
+    return TABLE_CACHE_FOLDER / f"doc_{doc_id}_{safe_sheet}.json.gz"
+
+
+def _source_file_mtime(full_path):
+    return Path(full_path).stat().st_mtime
+
+
+def _clear_spreadsheet_memory_cache_for_document(doc_id):
+    prefix = f"{doc_id}:"
+    for key in list(_spreadsheet_sheet_cache.keys()):
+        if key.startswith(prefix):
+            _spreadsheet_sheet_cache.pop(key, None)
+
+
+def remove_spreadsheet_caches_for_document(doc_id):
+    _clear_spreadsheet_memory_cache_for_document(doc_id)
+    SpreadsheetSheetIndex.query.filter_by(document_id=doc_id).delete()
+    for cache_path in TABLE_CACHE_FOLDER.glob(f"doc_{doc_id}_*.json.gz"):
+        try:
+            cache_path.unlink(missing_ok=True)
+        except Exception as exc:
+            print(f"Spreadsheet cache delete error for {cache_path}: {exc}")
+
+
+def _serialize_spreadsheet_cache_payload(payload):
+    return {
+        "version": 1,
+        "columns": payload.get("columns") or [],
+        "records": payload.get("records") or [],
+        "spec_index": payload.get("spec_index") or {},
+        "total": int(payload.get("total") or 0),
+        "source_mtime": float(payload.get("source_mtime") or 0.0),
+        "is_master": bool(payload.get("is_master")),
+    }
+
+
+def _hydrate_spreadsheet_cache_payload(raw_payload):
+    payload = dict(raw_payload or {})
+    payload["columns"] = payload.get("columns") or []
+    payload["records"] = payload.get("records") or []
+    payload["spec_index"] = payload.get("spec_index") or {}
+    payload["total"] = int(payload.get("total") or len(payload["records"]))
+    payload["column_defs"] = _sheet_column_defs(payload["columns"])
+    return payload
+
+
+def _load_spreadsheet_cache_payload(doc_id, sheet_name, source_mtime):
+    cache_key = _spreadsheet_memory_cache_key(doc_id, sheet_name)
+    memory_payload = _spreadsheet_sheet_cache.get(cache_key)
+    if (
+        memory_payload
+        and memory_payload.get("records")
+        and float(memory_payload.get("source_mtime") or 0.0) == float(source_mtime)
+    ):
+        return memory_payload
+
+    cache_path = _spreadsheet_cache_file_path(doc_id, sheet_name)
+    if not cache_path.exists():
+        return None
+    try:
+        with gzip.open(cache_path, "rt", encoding="utf-8") as handle:
+            raw_payload = json.load(handle)
+        if float(raw_payload.get("source_mtime") or 0.0) != float(source_mtime):
+            return None
+        payload = _hydrate_spreadsheet_cache_payload(raw_payload)
+        _spreadsheet_sheet_cache[cache_key] = payload
+        return payload
+    except Exception as exc:
+        print(f"Spreadsheet cache read error for doc {doc_id} sheet {sheet_name}: {exc}")
+        return None
+
+
+def _save_spreadsheet_cache_payload(doc_id, sheet_name, payload):
+    cache_path = _spreadsheet_cache_file_path(doc_id, sheet_name)
+    serializable = _serialize_spreadsheet_cache_payload(payload)
+    try:
+        TABLE_CACHE_FOLDER.mkdir(parents=True, exist_ok=True)
+        with gzip.open(cache_path, "wt", encoding="utf-8") as handle:
+            json.dump(serializable, handle, ensure_ascii=False)
+    except Exception as exc:
+        print(f"Spreadsheet cache write error for doc {doc_id} sheet {sheet_name}: {exc}")
+
+    index_row = SpreadsheetSheetIndex.query.filter_by(
+        document_id=doc_id, sheet_name=sheet_name
+    ).first()
+    if not index_row:
+        index_cls = cast(Any, SpreadsheetSheetIndex)
+        index_row = index_cls(document_id=doc_id, sheet_name=sheet_name)
+        db.session.add(index_row)
+    index_row.row_count = serializable["total"]
+    index_row.columns_json = json.dumps(serializable["columns"], ensure_ascii=False)
+    index_row.spec_index_json = json.dumps(serializable["spec_index"], ensure_ascii=False)
+    index_row.source_mtime = serializable["source_mtime"]
+    index_row.built_at = datetime.utcnow()
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+
+def _find_xlsx_sheet_header_from_df(raw_df, max_row=60):
+    if raw_df is None or raw_df.empty:
+        return None
+    best_row = None
+    best_count = 0
+    scan_limit = min(max_row, len(raw_df))
+    for iloc_idx in range(scan_limit):
+        values = [normalize_cell_text(v) for v in raw_df.iloc[iloc_idx].tolist()]
+        count = sum(1 for value in values if value)
+        if count > best_count:
+            best_count = count
+            best_row = (iloc_idx, values)
+    if not best_row or best_count < 2:
+        return None
+    header_iloc, header_values = best_row
+    columns = []
+    for idx, label in enumerate(header_values):
+        cleaned = normalize_cell_text(label) or f"Column {idx + 1}"
+        columns.append(cleaned)
+    header_keys = [
+        re.sub(r"[^a-z0-9]+", "", (label or "").strip().lower()) for label in columns
+    ]
+    spec_idx = header_keys.index("speccode") if "speccode" in header_keys else -1
+    return {
+        "header_row_idx": header_iloc + 1,
+        "header_iloc": header_iloc,
+        "columns": columns,
+        "header_keys": header_keys,
+        "spec_idx": spec_idx,
+        "is_master": "speccode" in header_keys and "sourcedocument" in header_keys,
+    }
+
+
+def _build_xlsx_sheet_records_from_dataframe(raw_df, header_info):
+    header_iloc = header_info.get("header_iloc", max(header_info.get("header_row_idx", 1) - 1, 0))
+    columns = header_info.get("columns") or []
+    spec_idx = header_info.get("spec_idx", -1)
+    records = []
+    spec_index = {}
+    data_index = 0
+    for iloc_idx in range(header_iloc + 1, len(raw_df)):
+        cells = [normalize_cell_text(v) for v in raw_df.iloc[iloc_idx].tolist()]
+        if not any(cells):
+            continue
+        excel_row_num = iloc_idx + 1
+        record = _row_values_to_record(columns, cells, excel_row_num)
+        records.append(record)
+        if spec_idx >= 0:
+            spec_val = cells[spec_idx] if spec_idx < len(cells) else ""
+            normalized_spec = normalize_requirement_lookup_id(spec_val) or spec_val.strip().upper()
+            if normalized_spec:
+                spec_index[normalized_spec.lower()] = {
+                    "data_index": data_index,
+                    "excel_row_num": excel_row_num,
+                }
+        data_index += 1
+    return records, spec_index
+
+
+def _resolve_highlight_from_spreadsheet_cache(payload, highlight_req):
+    if not highlight_req or not payload:
+        return None
+    variants = requirement_lookup_variants(highlight_req)
+    spec_index = payload.get("spec_index") or {}
+    for variant in variants:
+        normalized = normalize_requirement_lookup_id(variant) or (variant or "").strip()
+        if not normalized:
+            continue
+        hit = spec_index.get(normalized.lower())
+        if hit:
+            return hit
+    return None
+
+
+def _build_xlsx_sheet_cache_from_file(full_path, sheet_name):
+    started = time.perf_counter()
+    raw_df = pd.read_excel(full_path, sheet_name=sheet_name, header=None, dtype=object)
+    header_info = _find_xlsx_sheet_header_from_df(raw_df)
+    if not header_info:
+        return None
+    records, spec_index = _build_xlsx_sheet_records_from_dataframe(raw_df, header_info)
+    payload = _hydrate_spreadsheet_cache_payload(
+        {
+            "columns": header_info.get("columns") or [],
+            "records": records,
+            "spec_index": spec_index,
+            "total": len(records),
+            "source_mtime": _source_file_mtime(full_path),
+            "is_master": bool(header_info.get("is_master")),
+        }
+    )
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    print(
+        f"Built spreadsheet cache for {Path(full_path).name} [{sheet_name}]: "
+        f"{len(records)} rows in {elapsed_ms} ms"
+    )
+    return payload
+
+
+def warm_spreadsheet_sheet_cache(doc, sheet_name, highlight_req=""):
+    if not sheet_name:
+        return None
+    cache_key = _spreadsheet_memory_cache_key(doc.id, sheet_name)
+    with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+        source_mtime = _source_file_mtime(full_path)
+        payload = _load_spreadsheet_cache_payload(doc.id, sheet_name, source_mtime)
+        if payload is None:
+            payload = _build_xlsx_sheet_cache_from_file(full_path, sheet_name)
+            if payload is None:
+                return None
+            _spreadsheet_sheet_cache[cache_key] = payload
+            _save_spreadsheet_cache_payload(doc.id, sheet_name, payload)
+        payload["highlight"] = _resolve_highlight_from_spreadsheet_cache(payload, highlight_req)
+        _spreadsheet_sheet_cache[cache_key] = payload
+        return payload
+
+
+def build_spreadsheet_caches_for_document(doc):
+    if (doc.extension or "").lower() != "xlsx":
+        return
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return
+    with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
+        workbook = pd.ExcelFile(full_path)
+        for sheet_name in workbook.sheet_names:
+            try:
+                warm_spreadsheet_sheet_cache(doc, sheet_name)
+            except Exception as exc:
+                print(f"Spreadsheet cache build error for doc {doc.id} sheet {sheet_name}: {exc}")
+
+
 def _find_xlsx_sheet_header(ws, max_row=60):
     best_row = None
     best_count = 0
@@ -8648,63 +8947,27 @@ def _row_values_to_record(columns, values, excel_row_num):
     return record
 
 
-def _fetch_xlsx_rows_page(xlsx_path, sheet_name, offset=0, limit=200, highlight_req="", cache_key=""):
-    wb = load_workbook(filename=xlsx_path, read_only=True, data_only=True)
-    try:
-        ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
-        header_info = _find_xlsx_sheet_header(ws)
-        if not header_info:
-            return {"columns": [], "column_defs": [], "rows": [], "total": 0, "highlight": None}
-
-        columns = header_info["columns"]
-        header_row_idx = header_info["header_row_idx"]
-        cached = _spreadsheet_sheet_cache.get(cache_key) if cache_key else None
-        highlight = cached.get("highlight") if cached else None
-        if highlight_req and highlight is None:
-            highlight = _find_xlsx_highlight_row(ws, header_info, highlight_req)
-            if cache_key:
-                _spreadsheet_sheet_cache.setdefault(cache_key, {})["highlight"] = highlight
-
-        rows = []
-        data_index = 0
-        target_end = offset + limit
-        iter_rows_fn = getattr(ws, "iter_rows", None)
-        if not callable(iter_rows_fn):
-            return {"columns": columns, "column_defs": _sheet_column_defs(columns), "rows": [], "total": 0, "highlight": highlight}
-
-        for excel_row_num, row in enumerate(
-            cast(Any, iter_rows_fn)(min_row=header_row_idx + 1, values_only=True),
-            start=header_row_idx + 1,
-        ):
-            cells = [normalize_cell_text(v) for v in (row or [])]
-            if not any(cells):
-                continue
-            if data_index >= offset and len(rows) < limit:
-                rows.append(_row_values_to_record(columns, cells, excel_row_num))
-            data_index += 1
-            if data_index >= target_end and len(rows) >= limit:
-                break
-
-        total = None
-        if cache_key and cache_key in _spreadsheet_sheet_cache:
-            total = _spreadsheet_sheet_cache[cache_key].get("total")
-        if total is None:
-            total = data_index
-            if cache_key:
-                _spreadsheet_sheet_cache.setdefault(cache_key, {})["total"] = total
-
+def _fetch_xlsx_rows_page_from_doc(doc, sheet_name, offset=0, limit=200, highlight_req=""):
+    cache_payload = warm_spreadsheet_sheet_cache(doc, sheet_name, highlight_req=highlight_req)
+    if not cache_payload:
         return {
-            "columns": columns,
-            "column_defs": _sheet_column_defs(columns),
-            "rows": rows,
-            "total": total,
-            "highlight": highlight,
+            "columns": [],
+            "column_defs": [],
+            "rows": [],
+            "total": 0,
+            "highlight": None,
         }
-    finally:
-        try:
-            wb.close()
-        except Exception:
-            pass
+    records = cache_payload.get("records") or []
+    offset = max(0, int(offset or 0))
+    limit = max(1, int(limit or TABLE_VIEWER_PAGE_SIZE))
+    return {
+        "columns": cache_payload.get("columns") or [],
+        "column_defs": cache_payload.get("column_defs") or [],
+        "rows": records[offset : offset + limit],
+        "total": cache_payload.get("total") or len(records),
+        "highlight": cache_payload.get("highlight"),
+        "cache_ready": True,
+    }
 
 
 def _fetch_csv_rows_page(csv_path, offset=0, limit=200, highlight_req=""):
@@ -8765,24 +9028,35 @@ def get_spreadsheet_table_sheets(doc):
     try:
         with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
             if ext == "xlsx":
-                wb = load_workbook(filename=full_path, read_only=True, data_only=True)
-                try:
-                    for ws in wb.worksheets:
-                        header_info = _find_xlsx_sheet_header(ws)
-                        if not header_info:
-                            continue
-                        sheets.append(
-                            {
-                                "name": ws.title,
-                                "row_count": _count_xlsx_sheet_data_rows(
-                                    ws, header_info["header_row_idx"]
-                                ),
-                                "is_master": header_info.get("is_master", False),
-                                "columns": header_info.get("columns", []),
-                            }
-                        )
-                finally:
-                    wb.close()
+                workbook = pd.ExcelFile(full_path)
+                index_rows = {
+                    row.sheet_name: row
+                    for row in SpreadsheetSheetIndex.query.filter_by(document_id=doc.id).all()
+                }
+                for sheet_name in workbook.sheet_names:
+                    idx = index_rows.get(sheet_name)
+                    columns = []
+                    row_count = None
+                    is_master = False
+                    if idx:
+                        row_count = idx.row_count
+                        try:
+                            columns = json.loads(idx.columns_json or "[]")
+                        except Exception:
+                            columns = []
+                        header_keys = {
+                            re.sub(r"[^a-z0-9]+", "", (label or "").strip().lower())
+                            for label in columns
+                        }
+                        is_master = "speccode" in header_keys and "sourcedocument" in header_keys
+                    sheets.append(
+                        {
+                            "name": sheet_name,
+                            "row_count": row_count,
+                            "is_master": is_master,
+                            "columns": columns,
+                        }
+                    )
             elif ext == "csv":
                 df = pd.read_csv(full_path, dtype=str, keep_default_na=False, nrows=0)
                 columns = [str(col) for col in df.columns.tolist()]
@@ -8823,21 +9097,19 @@ def get_spreadsheet_table_page(doc, sheet_name="", offset=0, limit=TABLE_VIEWER_
         }
 
     try:
+        if ext == "xlsx":
+            sheets = get_spreadsheet_table_sheets(doc)
+            chosen = sheet_name or (sheets[0]["name"] if sheets else "")
+            payload = _fetch_xlsx_rows_page_from_doc(
+                doc,
+                chosen,
+                offset=offset,
+                limit=limit,
+                highlight_req=highlight_req,
+            )
+            payload["sheet_name"] = chosen
+            return payload
         with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
-            if ext == "xlsx":
-                sheets = get_spreadsheet_table_sheets(doc)
-                chosen = sheet_name or (sheets[0]["name"] if sheets else "")
-                cache_key = f"{doc.id}:{chosen}"
-                payload = _fetch_xlsx_rows_page(
-                    full_path,
-                    chosen,
-                    offset=offset,
-                    limit=limit,
-                    highlight_req=highlight_req,
-                    cache_key=cache_key,
-                )
-                payload["sheet_name"] = chosen
-                return payload
             if ext == "csv":
                 payload = _fetch_csv_rows_page(
                     full_path, offset=offset, limit=limit, highlight_req=highlight_req
@@ -8868,42 +9140,115 @@ def get_spreadsheet_table_page(doc, sheet_name="", offset=0, limit=TABLE_VIEWER_
 def get_spreadsheet_table_meta(doc, sheet_name="", highlight_req=""):
     sheets = get_spreadsheet_table_sheets(doc)
     active_sheet = sheet_name or (sheets[0]["name"] if sheets else "")
-    highlight = None
-    cache_key = f"{doc.id}:{active_sheet}"
 
-    if storage.document_exists(doc.stored_filename, DOC_FOLDER) and (doc.extension or "").lower() == "xlsx":
+    if (
+        storage.document_exists(doc.stored_filename, DOC_FOLDER)
+        and (doc.extension or "").lower() == "xlsx"
+        and active_sheet
+    ):
         try:
-            with storage.open_document_local_path(doc.stored_filename, DOC_FOLDER) as full_path:
-                wb = load_workbook(filename=full_path, read_only=True, data_only=True)
-                try:
-                    ws = wb[active_sheet] if active_sheet in wb.sheetnames else wb.worksheets[0]
-                    header_info = _find_xlsx_sheet_header(ws)
-                    if header_info:
-                        summary = _scan_xlsx_sheet_summary(
-                            ws, header_info, highlight_req=highlight_req
-                        )
-                        row_count = summary["total"]
-                        highlight = summary.get("highlight")
-                        _spreadsheet_sheet_cache[cache_key] = {
-                            "total": row_count,
-                            "columns": header_info.get("columns", []),
-                            "highlight": highlight,
-                        }
-                finally:
-                    wb.close()
+            cache_payload = warm_spreadsheet_sheet_cache(
+                doc, active_sheet, highlight_req=highlight_req
+            )
+            if cache_payload:
+                return {
+                    "sheets": sheets,
+                    "active_sheet": active_sheet,
+                    "row_count": cache_payload.get("total"),
+                    "column_defs": cache_payload.get("column_defs") or [],
+                    "highlight": cache_payload.get("highlight"),
+                    "cache_ready": True,
+                }
         except Exception as exc:
             print(f"Spreadsheet meta error for doc {doc.id}: {exc}")
             return {"sheets": sheets, "active_sheet": active_sheet, "error": str(exc)}
 
-    cached = _spreadsheet_sheet_cache.get(cache_key, {})
     active_meta = next((s for s in sheets if s.get("name") == active_sheet), None) or {}
-    column_defs = _sheet_column_defs(cached.get("columns") or active_meta.get("columns") or [])
+    column_defs = _sheet_column_defs(active_meta.get("columns") or [])
     return {
         "sheets": sheets,
         "active_sheet": active_sheet,
-        "row_count": cached.get("total", active_meta.get("row_count")),
+        "row_count": active_meta.get("row_count"),
         "column_defs": column_defs,
-        "highlight": highlight or cached.get("highlight"),
+        "highlight": None,
+    }
+
+
+def get_spreadsheet_table_bootstrap(doc, sheet_name="", highlight_req="", limit=TABLE_VIEWER_PAGE_SIZE):
+    sheets = get_spreadsheet_table_sheets(doc)
+    active_sheet = sheet_name or (sheets[0]["name"] if sheets else "")
+    limit = max(1, min(int(limit or TABLE_VIEWER_PAGE_SIZE), TABLE_VIEWER_MAX_PAGE_SIZE))
+
+    if not storage.document_exists(doc.stored_filename, DOC_FOLDER):
+        return {
+            "sheets": sheets,
+            "active_sheet": active_sheet,
+            "error": "Source file not found on server. Re-upload and reindex.",
+        }
+
+    ext = (doc.extension or "").lower()
+    if ext == "xlsx" and active_sheet:
+        try:
+            cache_payload = warm_spreadsheet_sheet_cache(
+                doc, active_sheet, highlight_req=highlight_req
+            )
+            if not cache_payload:
+                return {
+                    "sheets": sheets,
+                    "active_sheet": active_sheet,
+                    "error": "Could not read spreadsheet sheet.",
+                }
+            highlight = cache_payload.get("highlight")
+            offset = 0
+            if highlight and isinstance(highlight.get("data_index"), int):
+                offset = (highlight["data_index"] // limit) * limit
+            records = cache_payload.get("records") or []
+            return {
+                "sheets": sheets,
+                "active_sheet": active_sheet,
+                "row_count": cache_payload.get("total") or len(records),
+                "column_defs": cache_payload.get("column_defs") or [],
+                "highlight": highlight,
+                "rows": records[offset : offset + limit],
+                "offset": offset,
+                "limit": limit,
+                "total": cache_payload.get("total") or len(records),
+                "cache_ready": True,
+            }
+        except Exception as exc:
+            print(f"Spreadsheet bootstrap error for doc {doc.id}: {exc}")
+            return {"sheets": sheets, "active_sheet": active_sheet, "error": str(exc)}
+
+    page_payload = get_spreadsheet_table_page(
+        doc,
+        sheet_name=active_sheet,
+        offset=0,
+        limit=limit,
+        highlight_req=highlight_req,
+    )
+    highlight = page_payload.get("highlight")
+    offset = 0
+    if highlight and isinstance(highlight.get("data_index"), int):
+        offset = (highlight["data_index"] // limit) * limit
+    if offset:
+        page_payload = get_spreadsheet_table_page(
+            doc,
+            sheet_name=active_sheet,
+            offset=offset,
+            limit=limit,
+            highlight_req=highlight_req,
+        )
+    return {
+        "sheets": sheets,
+        "active_sheet": active_sheet,
+        "row_count": page_payload.get("total"),
+        "column_defs": page_payload.get("column_defs") or [],
+        "highlight": highlight,
+        "rows": page_payload.get("rows") or [],
+        "offset": offset,
+        "limit": limit,
+        "total": page_payload.get("total"),
+        "error": page_payload.get("error", ""),
     }
 
 
@@ -9528,54 +9873,66 @@ def api_translate_text():
 
 @app.route("/api/field-explanations", methods=["POST"])
 def api_field_explanations():
-    payload = request.get_json(silent=True) or {}
-    texts = payload.get("texts") or []
-    if isinstance(texts, str):
-        texts = [texts]
-    text = (payload.get("text") or "").strip()
-    if text:
-        texts.append(text)
-    combined = build_explanation_context_text(*texts)
-    if not combined:
+    try:
+        payload = request.get_json(silent=True) or {}
+        texts = payload.get("texts") or []
+        if isinstance(texts, str):
+            texts = [texts]
+        text = (payload.get("text") or "").strip()
+        if text:
+            texts.append(text)
+        combined = build_explanation_context_text(*texts)
+        if not combined:
+            return jsonify(
+                {
+                    "explanations": [],
+                    "enabled": field_explanations_enabled(),
+                    "html": "",
+                }
+            )
+
+        max_terms = min(
+            int(payload.get("max_terms") or FIELD_EXPLANATION_MAX_TERMS),
+            12,
+        )
+        explanations = build_field_explanations_for_text(combined, max_terms=max_terms)
+        serialized = serialize_field_explanations(explanations)
+        terms = extract_field_acronyms(combined, max_terms=max_terms)
+        message = ""
+        if terms and not explanations:
+            if field_explanations_enabled():
+                message = (
+                    "No definitions found for: "
+                    + ", ".join(terms)
+                    + ". Upload acronym definitions or wait for AI cache to build."
+                )
+            else:
+                message = (
+                    "No definitions found for: "
+                    + ", ".join(terms)
+                    + ". Upload definitions in Definitions, or set OPENAI_API_KEY / "
+                    "ANTHROPIC_API_KEY with ENABLE_FIELD_EXPLANATIONS=true."
+                )
+        return jsonify(
+            {
+                "explanations": serialized,
+                "enabled": field_explanations_enabled(),
+                "html": format_field_explanations_html(explanations),
+                "terms": terms,
+                "message": message,
+            }
+        )
+    except Exception as exc:
+        print(f"Field explanations API error: {exc}")
+        db.session.rollback()
         return jsonify(
             {
                 "explanations": [],
                 "enabled": field_explanations_enabled(),
                 "html": "",
+                "error": f"Field explanations failed: {exc}",
             }
-        )
-
-    max_terms = min(
-        int(payload.get("max_terms") or FIELD_EXPLANATION_MAX_TERMS),
-        12,
-    )
-    explanations = build_field_explanations_for_text(combined, max_terms=max_terms)
-    serialized = serialize_field_explanations(explanations)
-    terms = extract_field_acronyms(combined, max_terms=max_terms)
-    message = ""
-    if terms and not explanations:
-        if field_explanations_enabled():
-            message = (
-                "No definitions found for: "
-                + ", ".join(terms)
-                + ". Upload acronym definitions or wait for AI cache to build."
-            )
-        else:
-            message = (
-                "No definitions found for: "
-                + ", ".join(terms)
-                + ". Upload definitions in Definitions, or set OPENAI_API_KEY / "
-                "ANTHROPIC_API_KEY with ENABLE_FIELD_EXPLANATIONS=true."
-            )
-    return jsonify(
-        {
-            "explanations": serialized,
-            "enabled": field_explanations_enabled(),
-            "html": format_field_explanations_html(explanations),
-            "terms": terms,
-            "message": message,
-        }
-    )
+        ), 500
 
 
 @app.route("/api/document/<int:document_id>/translate-page")
@@ -10073,6 +10430,20 @@ def table_viewer(document_id):
         page_size=TABLE_VIEWER_PAGE_SIZE,
         error_msg=error_msg,
     )
+
+
+@app.route("/api/table/<int:document_id>/bootstrap")
+def api_spreadsheet_bootstrap(document_id):
+    doc = db.session.get(DocumentRecord, document_id)
+    if not doc or doc.extension.lower() not in {"csv", "xlsx"}:
+        abort(404)
+    payload = get_spreadsheet_table_bootstrap(
+        doc,
+        sheet_name=request.args.get("sheet", "").strip(),
+        highlight_req=request.args.get("highlight", "").strip(),
+        limit=request.args.get("limit", TABLE_VIEWER_PAGE_SIZE, type=int),
+    )
+    return jsonify(payload)
 
 
 @app.route("/api/table/<int:document_id>/meta")
@@ -10632,6 +11003,12 @@ def ensure_schema():
             db.session.commit()
 
     if "document_page_translations" not in inspector.get_table_names():
+        db.create_all()
+
+    if "field_explanation_cache" not in inspector.get_table_names():
+        db.create_all()
+
+    if "spreadsheet_sheet_indexes" not in inspector.get_table_names():
         db.create_all()
 
 
