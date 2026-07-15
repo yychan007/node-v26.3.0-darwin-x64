@@ -4911,7 +4911,6 @@ def build_search_requirements_workbook(query, rows, total_unique, active_terms=N
         "Section",
         "Page",
         "Source document",
-        "Requirement Browser URL",
     ]
     header_row = row_cursor
     for col_idx, header in enumerate(headers, start=1):
@@ -4929,7 +4928,6 @@ def build_search_requirements_workbook(query, rows, total_unique, active_terms=N
             item.get("section") or "",
             item.get("page") or "",
             item.get("filename") or "",
-            item.get("browse_url") or "",
         ]
         for col_idx, value in enumerate(values, start=1):
             cell = ws.cell(row=excel_row, column=col_idx, value=_coerce_excel_cell_value(value))
@@ -11360,13 +11358,6 @@ def export_search_requirements():
         if not rows:
             flash(f"No trackable requirement IDs found for '{query_input}'.", "warning")
             return redirect(url_for("home", q=query_input, term=selected_terms))
-
-        for item in rows:
-            item["browse_url"] = url_for(
-                "requirement_browser",
-                req_lookup=item["requirement_id"],
-                _external=True,
-            )
 
         wb = build_search_requirements_workbook(
             query_input,
