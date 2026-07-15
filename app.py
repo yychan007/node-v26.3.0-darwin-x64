@@ -41,6 +41,7 @@ import uuid
 import hashlib
 import html
 import secrets
+import threading
 import zipfile
 import tempfile
 import mimetypes
@@ -73,7 +74,7 @@ from flask_login import (  # pyright: ignore[reportMissingImports]
     current_user, UserMixin
 )
 from sqlalchemy.exc import OperationalError, PendingRollbackError  # pyright: ignore[reportMissingImports]
-from sqlalchemy.orm import joinedload  # pyright: ignore[reportMissingImports]
+from sqlalchemy.orm import joinedload, load_only  # pyright: ignore[reportMissingImports]
 from werkzeug.exceptions import HTTPException
 
 from PIL import Image
@@ -370,7 +371,8 @@ RESULTS_PER_PAGE = 10
 DEFAULT_SEARCH_RESULT_TYPES = ["text"]
 SEARCH_PREFILTER_TERM_LIMIT = 12
 SEARCH_PREFILTER_MIN_TERM_LEN = 2
-SEARCH_CANDIDATE_BLOCK_LIMIT = 500
+SEARCH_CANDIDATE_BLOCK_LIMIT = 120
+SEARCH_MAX_RESULTS = 120
 SEARCH_TABLE_CANDIDATE_LIMIT = 40
 SEARCH_TABLE_RESULT_TOP_K = 5
 VALID_SEARCH_RESULT_TYPES = {"drawings", "text", "tables"}
@@ -839,16 +841,21 @@ def term_matches_text(term, text):
     return re.search(r"\b" + re.escape(value) + r"\b", haystack) is not None
 
 
+def block_searchable_text(block, include_full_text=False):
+    parts = [
+        block.title or "",
+        block.summary or "",
+        block.definition or "",
+        block.requirement_id or "",
+        block.token_blob or "",
+    ]
+    if include_full_text:
+        parts.append(block.full_text or "")
+    return " ".join(part for part in parts if part)
+
+
 def count_exact_term_hits(block, query, exact_terms):
-    combined = " ".join(
-        [
-            block.title or "",
-            block.summary or "",
-            block.definition or "",
-            block.full_text or "",
-            block.requirement_id or "",
-        ]
-    )
+    combined = block_searchable_text(block, include_full_text=bool(getattr(block, "full_text", None)))
     hits = 0
     q = (query or "").strip().lower()
     if q and q in combined.lower():
@@ -4549,7 +4556,31 @@ def _searchable_table_filters(terms, query=""):
 
 def fetch_requirement_blocks_for_search(query, active_terms):
     q = (query or "").strip()
-    base_query = RequirementBlock.query.options(joinedload(RequirementBlock.document))
+    base_query = (
+        RequirementBlock.query.options(
+            joinedload(RequirementBlock.document).load_only(
+                DocumentRecord.id,
+                DocumentRecord.original_filename,
+                DocumentRecord.stored_filename,
+                DocumentRecord.extension,
+                DocumentRecord.is_ocr,
+            ),
+            load_only(
+                RequirementBlock.id,
+                RequirementBlock.document_id,
+                RequirementBlock.requirement_id,
+                RequirementBlock.title,
+                RequirementBlock.section,
+                RequirementBlock.major_section,
+                RequirementBlock.page,
+                RequirementBlock.char_start,
+                RequirementBlock.category,
+                RequirementBlock.definition,
+                RequirementBlock.summary,
+                RequirementBlock.token_blob,
+            ),
+        )
+    )
     if is_requirement_id_search(q):
         normalized = normalize_requirement_lookup_id(q)
         variants = requirement_lookup_variants(normalized)
@@ -4578,14 +4609,22 @@ def build_lightweight_search_result(row, score, active_terms, query):
     if not doc or is_spreadsheet_document(doc):
         return None
 
+    body_text = getattr(row, "full_text", None) or ""
     display_page = resolve_result_page(
         doc,
         row.char_start or 0,
-        row.full_text,
+        body_text or block_searchable_text(row, include_full_text=False),
         active_terms,
         query,
         row.page,
     )
+    snippet_source = type("SnippetBlock", (), {
+        "full_text": body_text or block_searchable_text(row, include_full_text=False),
+        "title": row.title,
+        "summary": row.summary,
+        "definition": row.definition,
+        "requirement_id": row.requirement_id,
+    })()
     return {
         "block_id": row.id,
         "document_id": doc.id,
@@ -4599,8 +4638,8 @@ def build_lightweight_search_result(row, score, active_terms, query):
         "category": row.category,
         "definition": row.definition,
         "summary": row.summary,
-        "full_text": row.full_text,
-        "snippet": get_result_snippet(row, active_terms, query),
+        "full_text": body_text,
+        "snippet": get_result_snippet(snippet_source, active_terms, query),
         "relevance": round(score, 2),
         "is_pdf": doc.extension.lower() == "pdf",
         "is_docx": doc.extension.lower() == "docx",
@@ -4723,9 +4762,8 @@ def requirement_match_rank(row, query, active_terms, exact_terms):
     req_id = (row.requirement_id or "").lower()
     title = (row.title or "").lower()
     summary = (row.summary or "").lower()
-    full_text = (row.full_text or "").lower()
     token_blob = (row.token_blob or "").lower()
-    combined = " ".join(part for part in [title, summary, full_text[:8000], req_id, token_blob] if part)
+    combined = block_searchable_text(row, include_full_text=False).lower()
 
     if not any(term_matches_text(term, combined) for term in active_terms):
         if not q or not term_matches_text(q, combined):
@@ -4745,20 +4783,51 @@ def requirement_match_rank(row, query, active_terms, exact_terms):
         rank += 300
     if q and q in summary:
         rank += 200
-    if q and q in full_text:
+    if q and q in token_blob:
         rank += 150
 
     for term in exact_terms:
         if term_matches_text(term, title):
             rank += 60
-        if term_matches_text(term, full_text):
+        if term_matches_text(term, token_blob):
             rank += 40
 
-    hit_pos = find_hit_position(full_text, active_terms, query)
+    hit_pos = find_hit_position(token_blob or summary, active_terms, query)
     if hit_pos >= 0:
         rank += max(0, 40 - hit_pos // 200)
 
     return rank, exact_hits
+
+
+def hydrate_block_full_texts(block_ids):
+    if not block_ids:
+        return {}
+    rows = (
+        RequirementBlock.query.filter(RequirementBlock.id.in_(block_ids))
+        .options(load_only(RequirementBlock.id, RequirementBlock.full_text))
+        .all()
+    )
+    return {row.id: (row.full_text or "") for row in rows}
+
+
+def apply_full_text_snippets(results, active_terms, query):
+    block_ids = [item["block_id"] for item in results or [] if item.get("block_id")]
+    full_text_map = hydrate_block_full_texts(block_ids)
+    for item in results or []:
+        block_id = item.get("block_id")
+        if not block_id or block_id not in full_text_map:
+            continue
+        body_text = full_text_map[block_id]
+        item["full_text"] = body_text
+        snippet_source = type("SnippetBlock", (), {
+            "full_text": body_text,
+            "title": item.get("title") or "",
+            "summary": item.get("summary") or "",
+            "definition": item.get("definition") or "",
+            "requirement_id": item.get("requirement_id") or "",
+        })()
+        item["snippet"] = get_result_snippet(snippet_source, active_terms, query)
+    return results
 
 
 def grouped_search_summary(results):
@@ -4775,7 +4844,7 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
     if not query.strip():
         return [], []
 
-    max_results = top_k if top_k is not None else SEARCH_CANDIDATE_BLOCK_LIMIT
+    max_results = min(top_k if top_k is not None else SEARCH_MAX_RESULTS, SEARCH_MAX_RESULTS)
 
     all_expanded_terms = get_all_expanded_terms(query)
     exact_terms = default_exact_search_terms(query)
@@ -4786,16 +4855,20 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
 
     q = query.lower().strip()
 
-    direct_docs = DocumentRecord.query.all()
     matched_doc_ids = []
-
-    for d in direct_docs:
-        original_name = (d.original_filename or "").lower()
-        stored_name = (d.stored_filename or "").lower()
-        base_name = original_name.rsplit(".", 1)[0] if "." in original_name else original_name
-
-        if q in {original_name, stored_name, base_name}:
-            matched_doc_ids.append(d.id)
+    if q:
+        matched_doc_ids = [
+            doc_id
+            for (doc_id,) in DocumentRecord.query.with_entities(DocumentRecord.id)
+            .filter(
+                db.or_(
+                    DocumentRecord.original_filename.ilike(f"%{q}%"),
+                    DocumentRecord.stored_filename.ilike(f"%{q}%"),
+                )
+            )
+            .limit(20)
+            .all()
+        ]
 
     rows = fetch_requirement_blocks_for_search(query, active_terms)
 
@@ -4808,12 +4881,12 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
             ranked.append((row, rank, exact_hits))
 
     ranked.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    ranked = ranked[:max_results]
+
     results = []
     seen_keys = set()
 
     for row, rank, _exact_hits in ranked:
-        if len(results) >= max_results:
-            break
         item = build_lightweight_search_result(row, rank, active_terms, query)
         if not item:
             continue
@@ -4824,7 +4897,7 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
         else:
             results.append(item)
 
-    if len(results) < max_results:
+    if len(results) < max_results and is_requirement_id_search(query):
         fallback = build_document_fallback_results(
             query,
             active_terms,
@@ -6204,19 +6277,6 @@ HOME_TEMPLATE = """
                     </div>
                     {% if res.ocr_used %}
                     <div class="meta-secondary">OCR used</div>
-                    {% endif %}
-
-                    {% if res.is_pdf %}
-                    <div class="result-page-img">
-                        <a href="{{ url_for('pdf_viewer', document_id=res.document_id, page=res.page or 1) }}" target="_blank">
-                            <img
-                                src="{{ url_for('page_image', document_id=res.document_id, page=res.page or 1) }}"
-                                loading="lazy"
-                                alt="Page {{ res.page or 1 }} preview"
-                                onerror="this.style.display='none';"
-                            />
-                        </a>
-                    </div>
                     {% endif %}
 
                     {% if res.definition and not res.show_bilingual_table %}
@@ -9819,10 +9879,13 @@ def home():
                 current_page = min(current_page, total_pages)
                 start_idx = (current_page - 1) * RESULTS_PER_PAGE
                 end_idx = start_idx + RESULTS_PER_PAGE
+                page_results = all_results[start_idx:end_idx]
+                apply_full_text_snippets(page_results, selected_terms, search_query)
                 results = enrich_search_results_batch(
-                    all_results[start_idx:end_idx],
+                    page_results,
                     lightweight=True,
                 )
+                db.session.expunge_all()
 
         return _db_recover_and_retry(
             lambda: render_template_string(
@@ -11292,12 +11355,40 @@ def ensure_schema():
 
 
 # =========================================================
-# App initialization
+# App initialization (deferred until first request)
 # =========================================================
-with app.app_context():
-    db.create_all()
-    ensure_schema()
-    create_default_admin()
+_app_initialized = False
+_app_init_lock = threading.Lock()
+
+
+def bootstrap_application():
+    """Run DB/schema/admin setup once. Deferred so gunicorn can bind PORT quickly."""
+    global _app_initialized
+    if _app_initialized:
+        return
+    with _app_init_lock:
+        if _app_initialized:
+            return
+        try:
+            db.create_all()
+            ensure_schema()
+            create_default_admin()
+            _app_initialized = True
+            print("Application bootstrap complete.")
+        except Exception as exc:
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
+            print(f"Application bootstrap error: {exc}")
+            raise
+
+
+@app.before_request
+def _ensure_app_bootstrapped():
+    if not _app_initialized:
+        bootstrap_application()
+
 
 def _running_in_notebook():
     try:
@@ -11310,6 +11401,8 @@ def _running_in_notebook():
 in_notebook = _running_in_notebook()
 
 if __name__ == "__main__":
+    with app.app_context():
+        bootstrap_application()
     port = int(os.environ.get("PORT", "5000"))
     debug = env_flag("FLASK_DEBUG", default=not IS_PRODUCTION and not in_notebook)
     app.run(
