@@ -4975,14 +4975,21 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
         ]
 
     rows = fetch_requirement_blocks_for_search(query, active_terms)
+    filter_terms = list(dict.fromkeys(list(active_terms or []) + ([q] if q else [])))
+    has_sql_prefilter = bool(_searchable_term_filters(filter_terms)) or is_requirement_id_search(query)
 
     ranked = []
     for row in rows:
         rank, exact_hits = requirement_match_rank(row, query, active_terms, exact_terms)
         if row.document_id in matched_doc_ids:
             rank += 120
-        if rank > 0:
-            ranked.append((row, rank, exact_hits))
+        if rank <= 0 and has_sql_prefilter:
+            # Row matched SQL ILIKE (often in full_text, which is not loaded here).
+            rank = 10
+            exact_hits = max(exact_hits, 1)
+        elif rank <= 0:
+            continue
+        ranked.append((row, rank, exact_hits))
 
     ranked.sort(key=lambda x: (x[2], x[1]), reverse=True)
     ranked = ranked[:max_results]
