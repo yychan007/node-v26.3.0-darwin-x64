@@ -367,8 +367,13 @@ if DOCX_AVAILABLE:
     ALLOWED_EXTENSIONS.add("docx")
 
 RESULTS_PER_PAGE = 10
+DEFAULT_SEARCH_RESULT_TYPES = ["text"]
 SEARCH_PREFILTER_TERM_LIMIT = 12
 SEARCH_PREFILTER_MIN_TERM_LEN = 2
+SEARCH_CANDIDATE_BLOCK_LIMIT = 500
+SEARCH_TABLE_CANDIDATE_LIMIT = 40
+SEARCH_TABLE_RESULT_TOP_K = 5
+VALID_SEARCH_RESULT_TYPES = {"drawings", "text", "tables"}
 
 ADMIN_ROLE = "admin"
 USER_ROLE = "user"
@@ -4516,6 +4521,32 @@ def _searchable_term_filters(terms):
     return filters
 
 
+def _searchable_table_filters(terms, query=""):
+    filters = []
+    seen_patterns = set()
+    for term in list(terms or []) + ([query] if query else []):
+        value = (term or "").strip()
+        if len(value) < SEARCH_PREFILTER_MIN_TERM_LEN:
+            continue
+        pattern_key = value.lower()
+        if pattern_key in seen_patterns:
+            continue
+        seen_patterns.add(pattern_key)
+        pattern = f"%{value}%"
+        filters.append(
+            db.or_(
+                TablePreview.sheet_name.ilike(pattern),
+                TablePreview.preview_title.ilike(pattern),
+                TablePreview.csv_text.ilike(pattern),
+                TablePreview.csv_text_en.ilike(pattern),
+                DocumentRecord.original_filename.ilike(pattern),
+            )
+        )
+        if len(filters) >= SEARCH_PREFILTER_TERM_LIMIT:
+            break
+    return filters
+
+
 def fetch_requirement_blocks_for_search(query, active_terms):
     q = (query or "").strip()
     base_query = RequirementBlock.query.options(joinedload(RequirementBlock.document))
@@ -4533,8 +4564,13 @@ def fetch_requirement_blocks_for_search(query, active_terms):
     terms = list(dict.fromkeys(list(active_terms or []) + ([q] if q else [])))
     filters = _searchable_term_filters(terms)
     if not filters:
-        return base_query.all()
-    return base_query.join(DocumentRecord).filter(db.or_(*filters)).all()
+        return base_query.limit(SEARCH_CANDIDATE_BLOCK_LIMIT).all()
+    return (
+        base_query.join(DocumentRecord)
+        .filter(db.or_(*filters))
+        .limit(SEARCH_CANDIDATE_BLOCK_LIMIT)
+        .all()
+    )
 
 
 def build_lightweight_search_result(row, score, active_terms, query):
@@ -4577,7 +4613,7 @@ def build_lightweight_search_result(row, score, active_terms, query):
     }
 
 
-def enrich_search_result_dict(result_dict):
+def enrich_search_result_dict(result_dict, lightweight=False):
     payload = dict(result_dict or {})
     doc = payload.pop("_doc", None)
     if doc is None:
@@ -4586,16 +4622,20 @@ def enrich_search_result_dict(result_dict):
             doc = db.session.get(DocumentRecord, doc_id)
     if not doc:
         return enrich_result_with_translation(payload)
+    if lightweight:
+        return enrich_result_with_translation(
+            enrich_search_result_with_bilingual_fields(payload, doc, lightweight=True)
+        )
     return enrich_result_with_translation(
         enrich_search_result_with_bilingual_fields(payload, doc)
     )
 
 
-def enrich_search_results_batch(results):
+def enrich_search_results_batch(results, lightweight=False):
     enriched = []
     for item in results or []:
         try:
-            enriched.append(enrich_search_result_dict(item))
+            enriched.append(enrich_search_result_dict(item, lightweight=lightweight))
         except Exception as exc:
             print(f"Search result enrich error: {exc}")
             payload = dict(item or {})
@@ -4669,6 +4709,58 @@ def build_document_fallback_results(query, active_terms, seen_keys, top_k=10, en
     return results[:top_k]
 
 
+def resolve_search_result_types():
+    if "result_type" in request.args:
+        selected = [
+            t for t in request.args.getlist("result_type") if t in VALID_SEARCH_RESULT_TYPES
+        ]
+        return selected or list(DEFAULT_SEARCH_RESULT_TYPES)
+    return list(DEFAULT_SEARCH_RESULT_TYPES)
+
+
+def requirement_match_rank(row, query, active_terms, exact_terms):
+    q = (query or "").lower().strip()
+    req_id = (row.requirement_id or "").lower()
+    title = (row.title or "").lower()
+    summary = (row.summary or "").lower()
+    full_text = (row.full_text or "").lower()
+    token_blob = (row.token_blob or "").lower()
+    combined = " ".join(part for part in [title, summary, full_text[:8000], req_id, token_blob] if part)
+
+    if not any(term_matches_text(term, combined) for term in active_terms):
+        if not q or not term_matches_text(q, combined):
+            return 0, 0
+
+    exact_hits = count_exact_term_hits(row, query, exact_terms)
+    rank = exact_hits * 100
+
+    if is_requirement_id_search(query):
+        normalized_query_id = normalize_requirement_id_key(normalize_requirement_lookup_id(query))
+        if normalize_requirement_id_key(req_id) == normalized_query_id:
+            rank += 5000
+
+    if q and term_matches_text(q, req_id):
+        rank += 800
+    if q and q in title:
+        rank += 300
+    if q and q in summary:
+        rank += 200
+    if q and q in full_text:
+        rank += 150
+
+    for term in exact_terms:
+        if term_matches_text(term, title):
+            rank += 60
+        if term_matches_text(term, full_text):
+            rank += 40
+
+    hit_pos = find_hit_position(full_text, active_terms, query)
+    if hit_pos >= 0:
+        rank += max(0, 40 - hit_pos // 200)
+
+    return rank, exact_hits
+
+
 def grouped_search_summary(results):
     category_counts = Counter(r["category"] for r in results if r.get("category"))
     top_categories = category_counts.most_common(5)
@@ -4679,9 +4771,11 @@ def grouped_search_summary(results):
     }
 
 
-def search_requirements(query, top_k=30, active_terms=None, enrich_results=True):
+def search_requirements(query, top_k=None, active_terms=None, enrich_results=True):
     if not query.strip():
         return [], []
+
+    max_results = top_k if top_k is not None else SEARCH_CANDIDATE_BLOCK_LIMIT
 
     all_expanded_terms = get_all_expanded_terms(query)
     exact_terms = default_exact_search_terms(query)
@@ -4705,25 +4799,22 @@ def search_requirements(query, top_k=30, active_terms=None, enrich_results=True)
 
     rows = fetch_requirement_blocks_for_search(query, active_terms)
 
-    scored = []
+    ranked = []
     for row in rows:
-        score = lexical_score(row, query, active_terms, exact_terms)
-
+        rank, exact_hits = requirement_match_rank(row, query, active_terms, exact_terms)
         if row.document_id in matched_doc_ids:
-            score += 120
+            rank += 120
+        if rank > 0:
+            ranked.append((row, rank, exact_hits))
 
-        score += semantic_score(query, row)
-
-        if score > 0:
-            exact_hits = count_exact_term_hits(row, query, exact_terms)
-            scored.append((row, score, exact_hits))
-
-    scored.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    ranked.sort(key=lambda x: (x[2], x[1]), reverse=True)
     results = []
     seen_keys = set()
 
-    for row, score, _exact_hits in scored[:top_k]:
-        item = build_lightweight_search_result(row, score, active_terms, query)
+    for row, rank, _exact_hits in ranked:
+        if len(results) >= max_results:
+            break
+        item = build_lightweight_search_result(row, rank, active_terms, query)
         if not item:
             continue
         doc = row.document
@@ -4733,12 +4824,12 @@ def search_requirements(query, top_k=30, active_terms=None, enrich_results=True)
         else:
             results.append(item)
 
-    if len(results) < top_k:
+    if len(results) < max_results:
         fallback = build_document_fallback_results(
             query,
             active_terms,
             seen_keys,
-            top_k=top_k - len(results),
+            top_k=max_results - len(results),
             enrich_results=enrich_results,
         )
         results.extend(fallback)
@@ -4746,7 +4837,7 @@ def search_requirements(query, top_k=30, active_terms=None, enrich_results=True)
     results.sort(
         key=lambda r: (
             count_exact_term_hits_simple(r, query, exact_terms),
-            r["relevance"],
+            r.get("relevance") or 0,
         ),
         reverse=True,
     )
@@ -4765,10 +4856,10 @@ def search_requirements(query, top_k=30, active_terms=None, enrich_results=True)
             )
         ]
 
-    return results[:top_k], all_expanded_terms
+    return results[:max_results], all_expanded_terms
 
 
-def search_table_results(query, top_k=20, active_terms=None):
+def search_table_results(query, top_k=SEARCH_TABLE_RESULT_TOP_K, active_terms=None):
     if not query.strip():
         return []
 
@@ -4779,8 +4870,20 @@ def search_table_results(query, top_k=20, active_terms=None):
         active_terms = resolve_active_search_terms(query, active_terms)
 
     q = query.lower().strip()
+    filters = _searchable_table_filters(active_terms, q)
+    if not filters:
+        return []
+
+    candidates = (
+        TablePreview.query.options(joinedload(TablePreview.document))
+        .join(DocumentRecord)
+        .filter(db.or_(*filters))
+        .limit(SEARCH_TABLE_CANDIDATE_LIMIT)
+        .all()
+    )
+
     results = []
-    for row in TablePreview.query.all():
+    for row in candidates:
         doc = row.document
         if not doc:
             continue
@@ -4788,10 +4891,8 @@ def search_table_results(query, top_k=20, active_terms=None):
         searchable_parts = [
             row.sheet_name or "",
             row.preview_title or "",
-            row.csv_text or "",
-            row.csv_text_en or "",
-            strip_html_legacy(row.html_table or ""),
-            strip_html_legacy(row.html_table_en or ""),
+            (row.csv_text or "")[:12000],
+            (row.csv_text_en or "")[:12000],
             doc.original_filename or "",
         ]
         combined = "\n".join(part for part in searchable_parts if part).lower()
@@ -4826,8 +4927,8 @@ def search_table_results(query, top_k=20, active_terms=None):
                 "sheet_name": row.sheet_name or "-",
                 "preview_title": row.preview_title or doc.original_filename,
                 "table_format": row.table_format or "xlsx",
-                "html_table": render_table_preview_html(row, "nl"),
-                "html_table_en": "" if should_skip_table_translation(doc) else render_table_preview_html(row, "en"),
+                "html_table": "",
+                "html_table_en": "",
                 "relevance": round(score, 2),
             }
         )
@@ -5737,6 +5838,7 @@ HOME_TEMPLATE = """
         Acronyms in requirement text (e.g. <strong>CDG</strong>, <strong>MMF</strong>) show <strong>Field explanations</strong> below each result.
         {% else %}
         Examples: <strong>aarding</strong>, <strong>grounding</strong>, <strong>earthing resistance</strong>, <strong>AM-Req-6165</strong>, or just <strong>5457</strong> for <strong>AM-Req-5457</strong>.
+        By default only <strong>Text</strong> results are searched (top {{ results_per_page }} per page). Tick <strong>related drawings</strong> or <strong>excel table</strong> below to include them.
         For abbreviations and reference text, use <a href="{{ url_for('dictionary_lookup') }}"><strong>Definitions</strong></a>
         (e.g. <strong>AC</strong>, <strong>declaration of performance</strong>).
         {% endif %}
@@ -6033,6 +6135,7 @@ HOME_TEMPLATE = """
                     <div class="meta-item">Format: <strong>{{ t.table_format }}</strong></div>
                 </div>
                 <div class="table-result-columns">
+                    {% if t.html_table %}
                     <div class="table-result-panel snippet-panel-original">
                         <strong>Table 1 / Dutch (Original)</strong>
                         <div class="table-scroll-wrap">
@@ -6047,9 +6150,15 @@ HOME_TEMPLATE = """
                         </div>
                     </div>
                     {% endif %}
+                    {% else %}
+                    <div class="notice compact-notice">
+                        Table preview is not embedded here to keep search fast on large Excel files.
+                    </div>
+                    {% endif %}
                 </div>
                 <div class="meta">
-                    <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open full table preview</a>
+                    <a href="{{ url_for('table_viewer', document_id=t.document_id) }}" target="_blank">Open table viewer</a>
+                    · <a href="{{ url_for('table_preview', document_id=t.document_id) }}" target="_blank">Open full table preview</a>
                 </div>
             </div>
             {% endfor %}
@@ -8400,7 +8509,7 @@ def _get_requirement_page_translation_text(doc, page_num):
         return ""
 
 
-def enrich_search_result_with_bilingual_fields(result_dict, doc):
+def enrich_search_result_with_bilingual_fields(result_dict, doc, lightweight=False):
     requirement_id = (result_dict.get("requirement_id") or "").strip()
     if not requirement_id:
         requirement_id = requirement_id_from_filename(result_dict.get("filename") or "")
@@ -8409,13 +8518,15 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
     page_num = int(result_dict.get("page") or 1)
     ext = (doc.extension or "").lower() if doc else ""
 
-    if doc and ext in {"pdf", "docx", "txt"}:
+    if doc and ext in {"pdf", "docx", "txt"} and not lightweight:
         if not full_text_nl:
             full_text_nl = (doc.text_preview or "").strip()
         if not full_text_nl:
             full_text_nl = get_document_full_text(doc)
 
-    translated_text = _get_requirement_page_translation_text(doc, page_num) if doc else ""
+    translated_text = ""
+    if doc and not lightweight:
+        translated_text = _get_requirement_page_translation_text(doc, page_num)
     fields = _build_requirement_content_fields(
         requirement_id,
         full_text_nl,
@@ -8423,7 +8534,12 @@ def enrich_search_result_with_bilingual_fields(result_dict, doc):
         summary_nl=(result_dict.get("summary") or "").strip(),
         definition_nl=(result_dict.get("definition") or "").strip(),
     )
-    if not fields.get("related_requirement_id") and doc and is_trackable_am_req_id(requirement_id):
+    if (
+        not lightweight
+        and not fields.get("related_requirement_id")
+        and doc
+        and is_trackable_am_req_id(requirement_id)
+    ):
         if ext == "pdf":
             layout_related = _extract_related_requirement_from_pdf_layout(
                 doc, page_num, requirement_id
@@ -9671,7 +9787,7 @@ def home():
         summary = {"top_categories": [], "top_requirement_ids": []}
         document_matches = []
         table_results = []
-        result_types = ["drawings", "text", "tables"]
+        result_types = resolve_search_result_types()
 
         if search_query:
             all_expanded_terms = get_all_expanded_terms(search_query)
@@ -9680,12 +9796,6 @@ def home():
                 selected_terms = resolve_active_search_terms(search_query, request.args.getlist("term"))
             else:
                 selected_terms = exact_terms
-
-            requested_result_types = [
-                t for t in request.args.getlist("result_type") if t in {"drawings", "text", "tables"}
-            ]
-            if requested_result_types:
-                result_types = requested_result_types
 
             if "drawings" in result_types:
                 document_matches = search_documents(search_query, active_terms=selected_terms)
@@ -9709,7 +9819,10 @@ def home():
                 current_page = min(current_page, total_pages)
                 start_idx = (current_page - 1) * RESULTS_PER_PAGE
                 end_idx = start_idx + RESULTS_PER_PAGE
-                results = enrich_search_results_batch(all_results[start_idx:end_idx])
+                results = enrich_search_results_batch(
+                    all_results[start_idx:end_idx],
+                    lightweight=True,
+                )
 
         return _db_recover_and_retry(
             lambda: render_template_string(
@@ -9770,7 +9883,7 @@ def home():
             all_expanded_terms=[],
             selected_terms=[],
             exact_terms=[],
-            result_types=["drawings", "text", "tables"],
+            result_types=["text"],
             summary={"top_categories": [], "top_requirement_ids": []},
             current_page=1,
             total_pages=1,
@@ -9834,7 +9947,7 @@ def requirement_browser():
         all_expanded_terms=[],
         selected_terms=[],
         exact_terms=[],
-        result_types=["drawings", "text", "tables"],
+        result_types=list(DEFAULT_SEARCH_RESULT_TYPES),
         summary={"top_categories": [], "top_requirement_ids": []},
         current_page=1,
         total_pages=1,
