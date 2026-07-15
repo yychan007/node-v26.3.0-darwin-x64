@@ -373,6 +373,7 @@ SEARCH_PREFILTER_TERM_LIMIT = 12
 SEARCH_PREFILTER_MIN_TERM_LEN = 2
 SEARCH_CANDIDATE_BLOCK_LIMIT = 120
 SEARCH_MAX_RESULTS = 120
+SEARCH_EXPORT_MAX_REQUIREMENTS = 150
 SEARCH_TABLE_CANDIDATE_LIMIT = 40
 SEARCH_TABLE_RESULT_TOP_K = 5
 VALID_SEARCH_RESULT_TYPES = {"drawings", "text", "tables"}
@@ -4840,6 +4841,109 @@ def grouped_search_summary(results):
     }
 
 
+def build_search_requirement_export_rows(results, max_items=SEARCH_EXPORT_MAX_REQUIREMENTS):
+    seen = set()
+    items = []
+    total_unique = 0
+    for row in results or []:
+        if row.get("is_document_fallback"):
+            continue
+        req_id = (row.get("requirement_id") or "").strip()
+        if not req_id or not is_trackable_am_req_id(req_id):
+            continue
+        req_key = normalize_requirement_id_key(req_id)
+        if req_key in seen:
+            continue
+        seen.add(req_key)
+        total_unique += 1
+        if len(items) >= max_items:
+            continue
+        title_nl = (row.get("title_nl") or row.get("title") or "").strip()
+        title_en = ""
+        if title_nl and translation.translation_enabled():
+            title_en = (translate_to_english(title_nl) or "").strip()
+        items.append(
+            {
+                "requirement_id": req_id,
+                "title_nl": title_nl,
+                "title_en": title_en,
+                "section": (row.get("major_section") or row.get("section") or row.get("category") or "").strip(),
+                "page": row.get("page") or 1,
+                "filename": row.get("filename") or "",
+                "document_id": row.get("document_id"),
+                "relevance": row.get("relevance") or 0,
+            }
+        )
+    items.sort(key=lambda item: (-float(item.get("relevance") or 0), item.get("requirement_id") or ""))
+    return items, total_unique
+
+
+def build_search_requirements_workbook(query, rows, total_unique, active_terms=None):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = safe_excel_sheet_name("Requirements")
+
+    info_font = Font(bold=True, size=12)
+    ws.cell(row=1, column=1, value="Matching requirements export").font = info_font
+    ws.cell(row=2, column=1, value=f"Search query: {query}")
+    row_cursor = 3
+    if active_terms:
+        ws.cell(row=row_cursor, column=1, value=f"Active terms: {', '.join(active_terms)}")
+        row_cursor += 1
+    if total_unique > len(rows):
+        ws.cell(
+            row=row_cursor,
+            column=1,
+            value=f"Showing top {len(rows)} unique requirements of {total_unique} matches.",
+        )
+        row_cursor += 1
+    ws.cell(
+        row=row_cursor,
+        column=1,
+        value=f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+    )
+    row_cursor += 2
+
+    headers = [
+        "Requirement",
+        "Title (NL)",
+        "Title (EN)",
+        "Section",
+        "Page",
+        "Source document",
+        "Requirement Browser URL",
+    ]
+    header_row = row_cursor
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col_idx, value=header)
+        cell.font = Font(bold=True)
+        cell.alignment = _EXCEL_WRAP_ALIGN
+
+    data_start = header_row + 1
+    for offset, item in enumerate(rows):
+        excel_row = data_start + offset
+        values = [
+            item.get("requirement_id") or "",
+            item.get("title_nl") or "",
+            item.get("title_en") or "",
+            item.get("section") or "",
+            item.get("page") or "",
+            item.get("filename") or "",
+            item.get("browse_url") or "",
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=excel_row, column=col_idx, value=_coerce_excel_cell_value(value))
+            cell.alignment = _EXCEL_WRAP_ALIGN
+
+    data_end = data_start + len(rows) - 1 if rows else header_row
+    if rows:
+        _format_excel_table_block(ws, header_row, data_end, 1, len(headers))
+        _auto_fit_excel_columns(ws, 1, len(headers), header_row, data_end)
+        ws.freeze_panes = ws.cell(row=data_start, column=1)
+
+    return wb
+
+
 def search_requirements(query, top_k=None, active_terms=None, enrich_results=True):
     if not query.strip():
         return [], []
@@ -6246,6 +6350,29 @@ HOME_TEMPLATE = """
         {% if 'text' in result_types %}
         <div class="search-results-text">
         <h3>Text results for "{{ query }}"{% if resolved_requirement_id and resolved_requirement_id|lower != query|lower %} <span class="small">(as <strong>{{ resolved_requirement_id }}</strong>)</span>{% endif %}</h3>
+
+        {% if show_search_export %}
+        <div class="search-meta-panel search-export-panel">
+            <div class="panel-title">Requirement summary export</div>
+            <div class="small" style="margin-bottom:10px;">
+                Download an Excel table of unique <strong>AM-Req</strong> numbers related to this keyword
+                (e.g. <strong>earthing</strong> / <strong>aarding</strong>).
+                {% if search_export_total %}
+                {% if search_export_total > search_export_cap %}
+                Up to {{ search_export_cap }} of {{ search_export_total }} unique requirements will be included.
+                {% else %}
+                {{ search_export_total }} unique requirement{{ 's' if search_export_total != 1 else '' }} found.
+                {% endif %}
+                {% endif %}
+            </div>
+            <a
+                class="btn btn-green btn-small"
+                href="{{ url_for('export_search_requirements', q=query, term=selected_terms, result_type=result_types) }}"
+            >
+                Export matching requirements (Excel)
+            </a>
+        </div>
+        {% endif %}
 
         {% if results %}
             {% for res in results %}
@@ -9848,6 +9975,9 @@ def home():
         document_matches = []
         table_results = []
         result_types = resolve_search_result_types()
+        show_search_export = False
+        search_export_total = 0
+        search_export_cap = SEARCH_EXPORT_MAX_REQUIREMENTS
 
         if search_query:
             all_expanded_terms = get_all_expanded_terms(search_query)
@@ -9875,6 +10005,12 @@ def home():
                     ]
                 summary = grouped_search_summary(all_results)
                 total_results = len(all_results)
+                export_rows, export_total = build_search_requirement_export_rows(all_results)
+                show_search_export = (
+                    not is_requirement_id_search(search_query)
+                    and export_total > 0
+                )
+                search_export_total = export_total
                 total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
                 current_page = min(current_page, total_pages)
                 start_idx = (current_page - 1) * RESULTS_PER_PAGE
@@ -9897,6 +10033,9 @@ def home():
             results=results,
             document_matches=document_matches,
             table_results=table_results,
+            show_search_export=show_search_export,
+            search_export_total=search_export_total,
+            search_export_cap=search_export_cap,
             all_expanded_terms=all_expanded_terms,
             selected_terms=selected_terms,
             exact_terms=exact_terms,
@@ -9943,6 +10082,9 @@ def home():
             results=[],
             document_matches=[],
             table_results=[],
+            show_search_export=False,
+            search_export_total=0,
+            search_export_cap=SEARCH_EXPORT_MAX_REQUIREMENTS,
             all_expanded_terms=[],
             selected_terms=[],
             exact_terms=[],
@@ -10007,6 +10149,9 @@ def requirement_browser():
         results=[],
         document_matches=[],
         table_results=[],
+        show_search_export=False,
+        search_export_total=0,
+        search_export_cap=SEARCH_EXPORT_MAX_REQUIREMENTS,
         all_expanded_terms=[],
         selected_terms=[],
         exact_terms=[],
@@ -11175,6 +11320,70 @@ def _append_dataframe_to_sheet(ws, df, start_row, title=None):
         _auto_fit_excel_columns(ws, 1, ncols, header_row, data_end)
 
     return data_end + 3
+
+
+@app.route("/export/search-requirements")
+def export_search_requirements():
+    query_input = request.args.get("q", "").strip()
+    if not query_input:
+        flash("Enter a search keyword first.", "warning")
+        return redirect(url_for("home"))
+
+    search_query, _resolved = resolve_requirement_search_query(query_input)
+    if is_requirement_id_search(search_query):
+        flash(
+            "Excel export is for keyword searches (e.g. earthing / aarding), not requirement ID lookups.",
+            "warning",
+        )
+        return redirect(url_for("home", q=query_input))
+
+    exact_terms = default_exact_search_terms(search_query)
+    if request.args.getlist("term"):
+        selected_terms = resolve_active_search_terms(search_query, request.args.getlist("term"))
+    else:
+        selected_terms = exact_terms
+
+    try:
+        all_results, _ = search_requirements(
+            search_query,
+            active_terms=selected_terms,
+            enrich_results=False,
+        )
+        rows, total_unique = build_search_requirement_export_rows(all_results)
+        if not rows:
+            flash(f"No trackable requirement IDs found for '{query_input}'.", "warning")
+            return redirect(url_for("home", q=query_input, term=selected_terms))
+
+        for item in rows:
+            item["browse_url"] = url_for(
+                "requirement_browser",
+                req_lookup=item["requirement_id"],
+                _external=True,
+            )
+
+        wb = build_search_requirements_workbook(
+            query_input,
+            rows,
+            total_unique,
+            active_terms=selected_terms,
+        )
+        xlsx_buffer = io.BytesIO()
+        wb.save(xlsx_buffer)
+        xlsx_buffer.seek(0)
+        safe_name = secure_filename(re.sub(r"[^\w\-]+", "_", query_input.lower())) or "search"
+        db.session.expunge_all()
+        return send_file(
+            xlsx_buffer,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"requirements_{safe_name}.xlsx",
+        )
+    except Exception as exc:
+        db.session.rollback()
+        db.session.expunge_all()
+        print(f"Search requirements export error for '{query_input}': {exc}")
+        flash(f"Could not export requirements: {exc}", "error")
+        return redirect(url_for("home", q=query_input))
 
 
 @app.route("/table/<int:document_id>/export-xlsx")
