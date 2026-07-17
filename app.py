@@ -55,6 +55,8 @@ import pdfplumber
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 
@@ -374,6 +376,7 @@ SEARCH_PREFILTER_MIN_TERM_LEN = 2
 SEARCH_CANDIDATE_BLOCK_LIMIT = 120
 SEARCH_MAX_RESULTS = 120
 SEARCH_EXPORT_MAX_REQUIREMENTS = 150
+SEARCH_RESULTS_EXPORT_MAX = 50
 SEARCH_TABLE_CANDIDATE_LIMIT = 40
 SEARCH_TABLE_RESULT_TOP_K = 5
 VALID_SEARCH_RESULT_TYPES = {"drawings", "text", "tables"}
@@ -830,6 +833,49 @@ def resolve_active_search_terms(query, selected_terms=None):
                 active.append(candidate)
                 break
     return list(dict.fromkeys(active)) or default_exact_search_terms(query)
+
+
+def get_mandatory_search_terms(query):
+    """Words typed in the search box that must appear in every Normal Search result."""
+    if is_requirement_id_search(query):
+        return []
+    tokens = preprocess(query)
+    if tokens:
+        return list(dict.fromkeys(tokens))
+    q = (query or "").strip().lower()
+    return [q] if q else []
+
+
+def text_matches_mandatory_terms(text, mandatory_terms):
+    if not mandatory_terms:
+        return True
+    return all(term_matches_text(term, text) for term in mandatory_terms)
+
+
+def block_matches_mandatory_terms(block, mandatory_terms, full_text=None):
+    if not mandatory_terms:
+        return True
+    combined = block_searchable_text(block, include_full_text=False)
+    extra = (full_text if full_text is not None else getattr(block, "full_text", None)) or ""
+    if extra:
+        combined = f"{combined} {extra}"
+    return text_matches_mandatory_terms(combined, mandatory_terms)
+
+
+def result_dict_matches_mandatory_terms(result_dict, mandatory_terms, full_text=None):
+    if not mandatory_terms:
+        return True
+    combined = " ".join(
+        [
+            result_dict.get("title") or "",
+            result_dict.get("summary") or "",
+            result_dict.get("definition") or "",
+            result_dict.get("requirement_id") or "",
+            result_dict.get("filename") or "",
+            full_text if full_text is not None else (result_dict.get("full_text") or ""),
+        ]
+    )
+    return text_matches_mandatory_terms(combined, mandatory_terms)
 
 
 def term_matches_text(term, text):
@@ -1697,20 +1743,39 @@ def translate_to_english(text):
     return translate_to_language(text, "en")
 
 
-def build_translated_snippet(snippet_html, target_lang="en"):
+def collect_snippet_highlight_terms(query, active_terms=None):
+    terms = []
+    for term in [query] + list(active_terms or []):
+        value = (term or "").strip()
+        if value and value not in terms:
+            terms.append(value)
+    return terms
+
+
+def build_translated_snippet(snippet_html, target_lang="en", terms_to_highlight=None):
     plain = strip_html(snippet_html)
     translated = translate_to_language(plain, target_lang)
-    if not translated or translated == plain:
-        return ""
-    return highlight_terms(translated, [])
+    terms = list(terms_to_highlight or [])
+    if not translated:
+        return highlight_terms(snippet_html, terms) if snippet_html else ""
+    if translated == plain:
+        if snippet_html and "<span" in snippet_html:
+            return snippet_html
+        return highlight_terms(translated, terms)
+    return highlight_terms(translated, terms)
 
 
-def build_english_snippet(snippet_html):
-    return build_translated_snippet(snippet_html, "en")
+def build_english_snippet(snippet_html, terms_to_highlight=None):
+    return build_translated_snippet(snippet_html, "en", terms_to_highlight=terms_to_highlight)
 
 
 def enrich_result_with_translation(result_dict):
-    result_dict["snippet_en"] = build_translated_snippet(result_dict.get("snippet", ""), "en")
+    highlight_terms = result_dict.get("highlight_terms") or []
+    result_dict["snippet_en"] = build_translated_snippet(
+        result_dict.get("snippet", ""),
+        "en",
+        terms_to_highlight=highlight_terms,
+    )
     return result_dict
 
 
@@ -4641,6 +4706,7 @@ def build_lightweight_search_result(row, score, active_terms, query):
         "summary": row.summary,
         "full_text": body_text,
         "snippet": get_result_snippet(snippet_source, active_terms, query),
+        "highlight_terms": collect_snippet_highlight_terms(query, active_terms),
         "relevance": round(score, 2),
         "is_pdf": doc.extension.lower() == "pdf",
         "is_docx": doc.extension.lower() == "docx",
@@ -4689,12 +4755,15 @@ def build_document_fallback_results(query, active_terms, seen_keys, top_k=10, en
         return []
 
     exact_terms = default_exact_search_terms(query)
+    mandatory_terms = get_mandatory_search_terms(query)
     results = []
     for doc in DocumentRecord.query.all():
         if is_spreadsheet_document(doc):
             continue
         score = score_document_text(doc, query, active_terms, exact_terms)
         if score <= 0:
+            continue
+        if mandatory_terms and not text_matches_mandatory_terms(doc.text_preview or "", mandatory_terms):
             continue
 
         page = resolve_result_page(
@@ -4814,7 +4883,9 @@ def hydrate_block_full_texts(block_ids):
 def apply_full_text_snippets(results, active_terms, query):
     block_ids = [item["block_id"] for item in results or [] if item.get("block_id")]
     full_text_map = hydrate_block_full_texts(block_ids)
+    highlight_terms = collect_snippet_highlight_terms(query, active_terms)
     for item in results or []:
+        item["highlight_terms"] = highlight_terms
         block_id = item.get("block_id")
         if not block_id or block_id not in full_text_map:
             continue
@@ -4942,6 +5013,121 @@ def build_search_requirements_workbook(query, rows, total_unique, active_terms=N
     return wb
 
 
+def excel_cell_with_highlights(text, highlight_terms):
+    plain = strip_html(text or "")
+    if not plain:
+        return ""
+    terms = [t for t in (highlight_terms or []) if t]
+    if not terms:
+        return plain
+    try:
+        pattern = re.compile(
+            "|".join(re.escape(t) for t in sorted(set(terms), key=len, reverse=True)),
+            re.IGNORECASE,
+        )
+        parts = []
+        last = 0
+        matched = False
+        for match in pattern.finditer(plain):
+            matched = True
+            if match.start() > last:
+                parts.append(plain[last:match.start()])
+            parts.append(TextBlock(InlineFont(b=True, color="008000"), match.group(0)))
+            last = match.end()
+        if last < len(plain):
+            parts.append(plain[last:])
+        if not matched:
+            return plain
+        return CellRichText(*parts)
+    except Exception:
+        return plain
+
+
+def build_search_results_workbook(query, rows, highlight_terms, active_terms=None, scope_label=""):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = safe_excel_sheet_name("Search results")
+
+    info_font = Font(bold=True, size=12)
+    ws.cell(row=1, column=1, value="Search results export").font = info_font
+    ws.cell(row=2, column=1, value=f"Search query: {query}")
+    row_cursor = 3
+    if active_terms:
+        ws.cell(row=row_cursor, column=1, value=f"Active terms: {', '.join(active_terms)}")
+        row_cursor += 1
+    if scope_label:
+        ws.cell(row=row_cursor, column=1, value=f"Scope: {scope_label}")
+        row_cursor += 1
+    ws.cell(
+        row=row_cursor,
+        column=1,
+        value="Matched keywords are highlighted in green in the Snippet columns.",
+    )
+    row_cursor += 1
+    ws.cell(
+        row=row_cursor,
+        column=1,
+        value=f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+    )
+    row_cursor += 2
+
+    headers = [
+        "Requirement",
+        "Title (NL)",
+        "Title (EN)",
+        "Section",
+        "Page",
+        "Source document",
+        "Snippet (NL)",
+        "Snippet (EN)",
+    ]
+    header_row = row_cursor
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col_idx, value=header)
+        cell.font = Font(bold=True)
+        cell.alignment = _EXCEL_WRAP_ALIGN
+
+    data_start = header_row + 1
+    for offset, item in enumerate(rows or []):
+        excel_row = data_start + offset
+        title_nl = (item.get("title_nl") or item.get("title") or "").strip()
+        title_en = (item.get("title_en") or "").strip()
+        if not title_en and title_nl and translation.translation_enabled():
+            title_en = (translate_to_english(title_nl) or "").strip()
+        plain_values = [
+            item.get("requirement_id") or "",
+            title_nl,
+            title_en,
+            (item.get("major_section") or item.get("section") or item.get("category") or "").strip(),
+            item.get("page") or "",
+            item.get("filename") or "",
+        ]
+        for col_idx, value in enumerate(plain_values, start=1):
+            cell = ws.cell(row=excel_row, column=col_idx, value=_coerce_excel_cell_value(value))
+            cell.alignment = _EXCEL_WRAP_ALIGN
+
+        snippet_nl_cell = ws.cell(
+            row=excel_row,
+            column=7,
+            value=excel_cell_with_highlights(item.get("snippet") or "", highlight_terms),
+        )
+        snippet_nl_cell.alignment = _EXCEL_WRAP_ALIGN
+        snippet_en_cell = ws.cell(
+            row=excel_row,
+            column=8,
+            value=excel_cell_with_highlights(item.get("snippet_en") or "", highlight_terms),
+        )
+        snippet_en_cell.alignment = _EXCEL_WRAP_ALIGN
+
+    data_end = data_start + len(rows) - 1 if rows else header_row
+    if rows:
+        _format_excel_table_block(ws, header_row, data_end, 1, len(headers))
+        _auto_fit_excel_columns(ws, 1, len(headers), header_row, data_end)
+        ws.freeze_panes = ws.cell(row=data_start, column=1)
+
+    return wb
+
+
 def search_requirements(query, top_k=None, active_terms=None, enrich_results=True):
     if not query.strip():
         return [], []
@@ -4990,6 +5176,20 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
         ranked.append((row, rank, exact_hits))
 
     ranked.sort(key=lambda x: (x[2], x[1]), reverse=True)
+
+    mandatory_terms = get_mandatory_search_terms(query)
+    if mandatory_terms:
+        full_text_map = hydrate_block_full_texts([row.id for row, _, _ in ranked])
+        ranked = [
+            (row, rank, exact_hits)
+            for row, rank, exact_hits in ranked
+            if block_matches_mandatory_terms(
+                row,
+                mandatory_terms,
+                full_text=full_text_map.get(row.id, ""),
+            )
+        ]
+
     ranked = ranked[:max_results]
 
     results = []
@@ -5037,6 +5237,18 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
                 or normalize_requirement_id_key(r["requirement_id"]) == normalized_query_id
             )
         ]
+    elif mandatory_terms:
+        block_ids = [r.get("block_id") for r in results if r.get("block_id")]
+        full_text_map = hydrate_block_full_texts(block_ids)
+        results = [
+            r
+            for r in results
+            if result_dict_matches_mandatory_terms(
+                r,
+                mandatory_terms,
+                full_text=full_text_map.get(r.get("block_id"), ""),
+            )
+        ]
 
     return results[:max_results], all_expanded_terms
 
@@ -5055,6 +5267,8 @@ def search_table_results(query, top_k=SEARCH_TABLE_RESULT_TOP_K, active_terms=No
     filters = _searchable_table_filters(active_terms, q)
     if not filters:
         return []
+
+    mandatory_terms = get_mandatory_search_terms(query)
 
     candidates = (
         TablePreview.query.options(joinedload(TablePreview.document))
@@ -5085,6 +5299,9 @@ def search_table_results(query, top_k=SEARCH_TABLE_RESULT_TOP_K, active_terms=No
             term_matches_text(term, combined)
             for term in active_terms
         ) and not (q and q in combined):
+            continue
+
+        if mandatory_terms and not text_matches_mandatory_terms(combined, mandatory_terms):
             continue
 
         score = 0.0
@@ -5131,6 +5348,7 @@ def search_documents(query, top_k=10, active_terms=None):
     if is_requirement_id_search(query):
         strict_requirement_id = normalize_requirement_lookup_id(query)
 
+    mandatory_terms = get_mandatory_search_terms(query)
     scored = []
 
     for doc in DocumentRecord.query.all():
@@ -5153,6 +5371,16 @@ def search_documents(query, top_k=10, active_terms=None):
             score += 35
 
         if score > 0:
+            if mandatory_terms:
+                doc_text = " ".join(
+                    [
+                        doc.original_filename or "",
+                        doc.stored_filename or "",
+                        doc.text_preview or "",
+                    ]
+                )
+                if not text_matches_mandatory_terms(doc_text, mandatory_terms):
+                    continue
             scored.append((doc, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -6045,7 +6273,11 @@ HOME_TEMPLATE = """
             <div class="panel-title">Term filters</div>
             <div class="panel-section">
                 <div class="panel-label">Select search terms</div>
-                <div class="small" style="margin-bottom:10px;">Exact search word is checked by default. Choose additional related terms if needed.</div>
+                <div class="small" style="margin-bottom:10px;">
+                    Exact search word is checked by default. Related terms are optional.
+                    Every Text result must still contain the word(s) you typed above
+                    (for example, searching <strong>aarding</strong> only shows results that contain <strong>aarding</strong>).
+                </div>
                 <div class="term-filter-row">
                     {% for term in all_expanded_terms %}
                     <label>
@@ -6376,6 +6608,31 @@ HOME_TEMPLATE = """
             >
                 Export matching requirements (Excel)
             </a>
+        </div>
+        {% endif %}
+
+        {% if show_search_results_export %}
+        <div class="search-meta-panel search-export-panel">
+            <div class="panel-title">Search results export</div>
+            <div class="small" style="margin-bottom:10px;">
+                Download the visible search results as Excel. Matched keywords such as
+                <strong>{{ query }}</strong> are highlighted in green in the snippet columns.
+            </div>
+            <a
+                class="btn btn-gray btn-small"
+                href="{{ url_for('export_search_results', q=query, term=selected_terms, result_type=result_types, page=current_page) }}"
+            >
+                Export this page (Excel, highlighted)
+            </a>
+            {% if total_results > results_per_page %}
+            <a
+                class="btn btn-gray btn-small"
+                href="{{ url_for('export_search_results', q=query, term=selected_terms, result_type=result_types, scope='all') }}"
+                style="margin-left:8px;"
+            >
+                Export top {{ search_results_export_cap }} (Excel, highlighted)
+            </a>
+            {% endif %}
         </div>
         {% endif %}
 
@@ -9983,6 +10240,8 @@ def home():
         show_search_export = False
         search_export_total = 0
         search_export_cap = SEARCH_EXPORT_MAX_REQUIREMENTS
+        show_search_results_export = False
+        search_results_export_cap = SEARCH_RESULTS_EXPORT_MAX
 
         if search_query:
             all_expanded_terms = get_all_expanded_terms(search_query)
@@ -10015,6 +10274,7 @@ def home():
                     not is_requirement_id_search(search_query)
                     and export_total > 0
                 )
+                show_search_results_export = total_results > 0
                 search_export_total = export_total
                 total_pages = max(1, math.ceil(total_results / RESULTS_PER_PAGE))
                 current_page = min(current_page, total_pages)
@@ -10041,6 +10301,8 @@ def home():
             show_search_export=show_search_export,
             search_export_total=search_export_total,
             search_export_cap=search_export_cap,
+            show_search_results_export=show_search_results_export,
+            search_results_export_cap=search_results_export_cap,
             all_expanded_terms=all_expanded_terms,
             selected_terms=selected_terms,
             exact_terms=exact_terms,
@@ -10090,6 +10352,8 @@ def home():
             show_search_export=False,
             search_export_total=0,
             search_export_cap=SEARCH_EXPORT_MAX_REQUIREMENTS,
+            show_search_results_export=False,
+            search_results_export_cap=SEARCH_RESULTS_EXPORT_MAX,
             all_expanded_terms=[],
             selected_terms=[],
             exact_terms=[],
@@ -10157,6 +10421,8 @@ def requirement_browser():
         show_search_export=False,
         search_export_total=0,
         search_export_cap=SEARCH_EXPORT_MAX_REQUIREMENTS,
+        show_search_results_export=False,
+        search_results_export_cap=SEARCH_RESULTS_EXPORT_MAX,
         all_expanded_terms=[],
         selected_terms=[],
         exact_terms=[],
@@ -11382,6 +11648,83 @@ def export_search_requirements():
         print(f"Search requirements export error for '{query_input}': {exc}")
         flash(f"Could not export requirements: {exc}", "error")
         return redirect(url_for("home", q=query_input))
+
+
+@app.route("/export/search-results")
+def export_search_results():
+    query_input = request.args.get("q", "").strip()
+    if not query_input:
+        flash("Enter a search keyword first.", "warning")
+        return redirect(url_for("home"))
+
+    search_query, _resolved = resolve_requirement_search_query(query_input)
+    exact_terms = default_exact_search_terms(search_query)
+    if request.args.getlist("term"):
+        selected_terms = resolve_active_search_terms(search_query, request.args.getlist("term"))
+    else:
+        selected_terms = exact_terms
+
+    scope = (request.args.get("scope") or "page").strip().lower()
+    page = max(1, request.args.get("page", 1, type=int) or 1)
+
+    try:
+        all_results, _ = search_requirements(
+            search_query,
+            active_terms=selected_terms,
+            enrich_results=False,
+        )
+        table_results = search_table_results(search_query, active_terms=selected_terms)
+        if table_results:
+            table_doc_ids = {t["document_id"] for t in table_results}
+            all_results = [
+                r for r in all_results
+                if r.get("document_id") not in table_doc_ids
+            ]
+
+        if not all_results:
+            flash(f"No search results found for '{query_input}'.", "warning")
+            return redirect(url_for("home", q=query_input, term=selected_terms))
+
+        if scope == "all":
+            export_items = all_results[:SEARCH_RESULTS_EXPORT_MAX]
+            scope_label = f"Top {len(export_items)} of {len(all_results)} results"
+            filename_suffix = "top"
+        else:
+            total_pages = max(1, math.ceil(len(all_results) / RESULTS_PER_PAGE))
+            page = min(page, total_pages)
+            start_idx = (page - 1) * RESULTS_PER_PAGE
+            export_items = all_results[start_idx:start_idx + RESULTS_PER_PAGE]
+            scope_label = f"Page {page} of {total_pages}"
+            filename_suffix = f"page{page}"
+
+        apply_full_text_snippets(export_items, selected_terms, search_query)
+        enriched_rows = enrich_search_results_batch(export_items, lightweight=True)
+        highlight_terms = collect_snippet_highlight_terms(search_query, selected_terms)
+
+        wb = build_search_results_workbook(
+            query_input,
+            enriched_rows,
+            highlight_terms,
+            active_terms=selected_terms,
+            scope_label=scope_label,
+        )
+        xlsx_buffer = io.BytesIO()
+        wb.save(xlsx_buffer)
+        xlsx_buffer.seek(0)
+        safe_name = secure_filename(re.sub(r"[^\w\-]+", "_", query_input.lower())) or "search"
+        db.session.expunge_all()
+        return send_file(
+            xlsx_buffer,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"search_results_{safe_name}_{filename_suffix}.xlsx",
+        )
+    except Exception as exc:
+        db.session.rollback()
+        db.session.expunge_all()
+        print(f"Search results export error for '{query_input}': {exc}")
+        flash(f"Could not export search results: {exc}", "error")
+        return redirect(url_for("home", q=query_input, term=selected_terms))
 
 
 @app.route("/table/<int:document_id>/export-xlsx")
