@@ -846,10 +846,19 @@ def get_mandatory_search_terms(query):
     return [q] if q else []
 
 
+def mandatory_term_in_text(term, text):
+    """Mandatory query words must appear in the text (substring match)."""
+    value = (term or "").strip().lower()
+    haystack = (text or "").lower()
+    if not value or not haystack:
+        return False
+    return value in haystack
+
+
 def text_matches_mandatory_terms(text, mandatory_terms):
     if not mandatory_terms:
         return True
-    return all(term_matches_text(term, text) for term in mandatory_terms)
+    return all(mandatory_term_in_text(term, text) for term in mandatory_terms)
 
 
 def block_matches_mandatory_terms(block, mandatory_terms, full_text=None):
@@ -4559,7 +4568,7 @@ def is_requirement_id_search(query):
     return is_trackable_am_req_id(normalized)
 
 
-def _searchable_term_filters(terms):
+def _searchable_term_filters(terms, include_document_fields=True):
     filters = []
     seen_patterns = set()
     for term in terms or []:
@@ -4583,12 +4592,15 @@ def _searchable_term_filters(terms):
             RequirementBlock.semantic_text.ilike(pattern),
             RequirementBlock.token_blob.ilike(pattern),
         )
-        doc_filters = db.or_(
-            DocumentRecord.original_filename.ilike(pattern),
-            DocumentRecord.stored_filename.ilike(pattern),
-            DocumentRecord.text_preview.ilike(pattern),
-        )
-        filters.append(db.or_(block_filters, doc_filters))
+        if include_document_fields:
+            doc_filters = db.or_(
+                DocumentRecord.original_filename.ilike(pattern),
+                DocumentRecord.stored_filename.ilike(pattern),
+                DocumentRecord.text_preview.ilike(pattern),
+            )
+            filters.append(db.or_(block_filters, doc_filters))
+        else:
+            filters.append(block_filters)
         if len(filters) >= SEARCH_PREFILTER_TERM_LIMIT:
             break
     return filters
@@ -4659,7 +4671,7 @@ def fetch_requirement_blocks_for_search(query, active_terms):
         return base_query.filter(db.or_(*id_filters)).all()
 
     terms = list(dict.fromkeys(list(active_terms or []) + ([q] if q else [])))
-    filters = _searchable_term_filters(terms)
+    filters = _searchable_term_filters(terms, include_document_fields=False)
     if not filters:
         return base_query.limit(SEARCH_CANDIDATE_BLOCK_LIMIT).all()
     return (
@@ -5162,6 +5174,20 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
     filter_terms = list(dict.fromkeys(list(active_terms or []) + ([q] if q else [])))
     has_sql_prefilter = bool(_searchable_term_filters(filter_terms)) or is_requirement_id_search(query)
 
+    mandatory_terms = get_mandatory_search_terms(query)
+    full_text_map = {}
+    if mandatory_terms and rows:
+        full_text_map = hydrate_block_full_texts([row.id for row in rows])
+        rows = [
+            row
+            for row in rows
+            if block_matches_mandatory_terms(
+                row,
+                mandatory_terms,
+                full_text=full_text_map.get(row.id, ""),
+            )
+        ]
+
     ranked = []
     for row in rows:
         rank, exact_hits = requirement_match_rank(row, query, active_terms, exact_terms)
@@ -5176,20 +5202,6 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
         ranked.append((row, rank, exact_hits))
 
     ranked.sort(key=lambda x: (x[2], x[1]), reverse=True)
-
-    mandatory_terms = get_mandatory_search_terms(query)
-    if mandatory_terms:
-        full_text_map = hydrate_block_full_texts([row.id for row, _, _ in ranked])
-        ranked = [
-            (row, rank, exact_hits)
-            for row, rank, exact_hits in ranked
-            if block_matches_mandatory_terms(
-                row,
-                mandatory_terms,
-                full_text=full_text_map.get(row.id, ""),
-            )
-        ]
-
     ranked = ranked[:max_results]
 
     results = []
@@ -5235,18 +5247,6 @@ def search_requirements(query, top_k=None, active_terms=None, enrich_results=Tru
             and (
                 not r.get("requirement_id")
                 or normalize_requirement_id_key(r["requirement_id"]) == normalized_query_id
-            )
-        ]
-    elif mandatory_terms:
-        block_ids = [r.get("block_id") for r in results if r.get("block_id")]
-        full_text_map = hydrate_block_full_texts(block_ids)
-        results = [
-            r
-            for r in results
-            if result_dict_matches_mandatory_terms(
-                r,
-                mandatory_terms,
-                full_text=full_text_map.get(r.get("block_id"), ""),
             )
         ]
 
@@ -6276,7 +6276,7 @@ HOME_TEMPLATE = """
                 <div class="small" style="margin-bottom:10px;">
                     Exact search word is checked by default. Related terms are optional.
                     Every Text result must still contain the word(s) you typed above
-                    (for example, searching <strong>aarding</strong> only shows results that contain <strong>aarding</strong>).
+                    (for example, searching <strong>aarding</strong> matches <strong>aarding</strong>, <strong>aardings</strong>, and similar text).
                 </div>
                 <div class="term-filter-row">
                     {% for term in all_expanded_terms %}
