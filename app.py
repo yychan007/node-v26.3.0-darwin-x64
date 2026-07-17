@@ -1753,12 +1753,64 @@ def translate_to_english(text):
 
 
 def collect_snippet_highlight_terms(query, active_terms=None):
+    """Green-highlight the user's query plus related synonyms (e.g. aarding / earthing / grounding)."""
     terms = []
-    for term in [query] + list(active_terms or []):
+    if is_requirement_id_search(query):
+        terms.extend(requirement_search_aliases(query))
+        q = (query or "").strip()
+        if q:
+            terms.append(q)
+    else:
+        terms.extend(get_all_expanded_terms(query))
+        for term in get_mandatory_search_terms(query):
+            if term not in terms:
+                terms.append(term)
+    for term in active_terms or []:
         value = (term or "").strip()
-        if value and value not in terms:
+        if value and value.lower() not in {t.lower() for t in terms}:
             terms.append(value)
-    return terms
+
+    seen = set()
+    ordered = []
+    for term in terms:
+        value = (term or "").strip()
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(value)
+    return ordered
+
+
+SEARCH_HIGHLIGHT_FIELD_NAMES = (
+    "title_nl",
+    "title_en",
+    "content_nl",
+    "content_en",
+    "applicable_nl",
+    "applicable_en",
+    "definition",
+    "summary",
+)
+
+
+def apply_result_highlights(result_dict, query=""):
+    terms = collect_snippet_highlight_terms(query, result_dict.get("highlight_terms"))
+    result_dict["highlight_terms"] = terms
+    for field in SEARCH_HIGHLIGHT_FIELD_NAMES:
+        value = result_dict.get(field)
+        if not value:
+            continue
+        text = str(value)
+        if "<span class=\"highlight\">" in text:
+            continue
+        result_dict[field] = highlight_terms(text, terms)
+    snippet = result_dict.get("snippet") or ""
+    if snippet and "<span class=\"highlight\">" not in snippet:
+        result_dict["snippet"] = highlight_terms(strip_html(snippet), terms)
+    return result_dict
 
 
 def build_translated_snippet(snippet_html, target_lang="en", terms_to_highlight=None):
@@ -1779,12 +1831,15 @@ def build_english_snippet(snippet_html, terms_to_highlight=None):
 
 
 def enrich_result_with_translation(result_dict):
-    highlight_terms = result_dict.get("highlight_terms") or []
+    query = (result_dict.get("_search_query") or "").strip()
+    apply_result_highlights(result_dict, query)
+    highlight_terms_list = result_dict.get("highlight_terms") or []
     result_dict["snippet_en"] = build_translated_snippet(
         result_dict.get("snippet", ""),
         "en",
-        terms_to_highlight=highlight_terms,
+        terms_to_highlight=highlight_terms_list,
     )
+    result_dict.pop("_search_query", None)
     return result_dict
 
 
@@ -4465,7 +4520,7 @@ def get_result_snippet(block, active_terms, query=""):
         if end < len(text):
             snippet = snippet + "..."
 
-    highlight = list(dict.fromkeys([query] + active_terms))
+    highlight = collect_snippet_highlight_terms(query, active_terms)
     return highlight_terms(snippet, highlight)
 
 
@@ -4488,7 +4543,7 @@ def get_text_snippet(text, expanded_tokens, query=""):
         if end < len(text):
             snippet += "..."
 
-    return highlight_terms(snippet, list(dict.fromkeys([query] + expanded_tokens)))
+    return highlight_terms(snippet, collect_snippet_highlight_terms(query, expanded_tokens))
 
 
 def score_document_text(doc, query, active_terms, exact_terms=None):
@@ -4719,6 +4774,7 @@ def build_lightweight_search_result(row, score, active_terms, query):
         "full_text": body_text,
         "snippet": get_result_snippet(snippet_source, active_terms, query),
         "highlight_terms": collect_snippet_highlight_terms(query, active_terms),
+        "_search_query": query,
         "relevance": round(score, 2),
         "is_pdf": doc.extension.lower() == "pdf",
         "is_docx": doc.extension.lower() == "docx",
@@ -4805,6 +4861,8 @@ def build_document_fallback_results(query, active_terms, seen_keys, top_k=10, en
             "summary": (doc.text_preview or "")[:240],
             "full_text": doc.text_preview or "",
             "snippet": get_text_snippet(doc.text_preview, active_terms, query),
+            "highlight_terms": collect_snippet_highlight_terms(query, active_terms),
+            "_search_query": query,
             "relevance": round(score, 2),
             "is_pdf": doc.extension.lower() == "pdf",
             "is_docx": doc.extension.lower() == "docx",
@@ -4898,6 +4956,7 @@ def apply_full_text_snippets(results, active_terms, query):
     highlight_terms = collect_snippet_highlight_terms(query, active_terms)
     for item in results or []:
         item["highlight_terms"] = highlight_terms
+        item["_search_query"] = query
         block_id = item.get("block_id")
         if not block_id or block_id not in full_text_map:
             continue
@@ -5728,7 +5787,8 @@ button { background:#0069d9; }
     grid-template-columns: 1fr;
   }
 }
-.highlight { color:green; font-weight:bold; background:#eaf7ea; padding:1px 2px; border-radius:2px; }
+.highlight { color:#0f7b0f; font-weight:700; background:#d4edda; padding:1px 3px; border-radius:3px; }
+.snippet .highlight, .requirement-bilingual-table .highlight { color:#0f7b0f; font-weight:700; background:#d4edda; }
 .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
 .data-table table, table.data-table { width:100%; border-collapse:collapse; }
 .data-table th, .data-table td, table.data-table th, table.data-table td { border:1px solid #ddd; padding:6px 8px; font-size:14px; vertical-align:top; }
@@ -5953,14 +6013,14 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
         <tr>
             <td>
                 {% if item.title_nl %}
-                <strong>Title:</strong> {{ item.title_nl }}
+                <strong>Title:</strong> {{ item.title_nl|safe }}
                 {% else %}
                 -
                 {% endif %}
             </td>
             <td>
                 {% if item.title_en %}
-                {{ item.title_en }}
+                {{ item.title_en|safe }}
                 {% else %}
                 -
                 {% endif %}
@@ -5969,14 +6029,14 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
         <tr>
             <td>
                 {% if item.applicable_nl %}
-                <strong>Attributes:</strong> {{ item.applicable_nl }}
+                <strong>Attributes:</strong> {{ item.applicable_nl|safe }}
                 {% else %}
                 -
                 {% endif %}
             </td>
             <td>
                 {% if item.applicable_en %}
-                {{ item.applicable_en }}
+                {{ item.applicable_en|safe }}
                 {% else %}
                 -
                 {% endif %}
@@ -5985,14 +6045,14 @@ REQUIREMENT_BILINGUAL_TABLE_MACRO = """
         <tr>
             <td>
                 {% if item.content_nl %}
-                <strong>Content:</strong> {{ item.content_nl }}
+                <strong>Content:</strong> {{ item.content_nl|safe }}
                 {% else %}
                 -
                 {% endif %}
             </td>
             <td>
                 {% if item.content_en %}
-                {{ item.content_en }}
+                {{ item.content_en|safe }}
                 {% else %}
                 -
                 {% endif %}
@@ -6616,7 +6676,8 @@ HOME_TEMPLATE = """
             <div class="panel-title">Search results export</div>
             <div class="small" style="margin-bottom:10px;">
                 Download the visible search results as Excel. Matched keywords such as
-                <strong>{{ query }}</strong> are highlighted in green in the snippet columns.
+                <strong>{{ query }}</strong> and related terms (e.g. <strong>earthing</strong>, <strong>grounding</strong>)
+                are highlighted in green in the snippet columns.
             </div>
             <a
                 class="btn btn-gray btn-small"
